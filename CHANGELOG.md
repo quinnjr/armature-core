@@ -10,6 +10,8 @@ Changes at or before `0.6.0` are recorded in the workspace
 
 ## [Unreleased]
 
+## [0.8.1] - 2026-08-03
+
 ### Changed
 
 - **Behaviour — static assets:** a pre-compressed sibling (`.gz`, `.br`, …) is

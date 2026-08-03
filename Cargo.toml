@@ -101,6 +101,7 @@ http3 = ["quinn", "h3", "h3-quinn"]
 io-uring = ["dep:io-uring"]
 
 [dev-dependencies]
+cargo-husky = { version = "1.5", default-features = false, features = ["user-hooks"] }
 tokio-test = "0.4"
 criterion = { version = "0.8", features = ["html_reports"] }
 

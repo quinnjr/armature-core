@@ -3,6 +3,7 @@ name = "armature-core"
 version = "0.8.1"
 edition.workspace = true
 rust-version.workspace = true
+autobenches = false  # Disable auto-discovery, use explicit [[bench]] only
 authors.workspace = true
 license.workspace = true
 repository = "https://github.com/quinnjr/armature-core"
@@ -103,9 +104,47 @@ io-uring = ["dep:io-uring"]
 [dev-dependencies]
 cargo-husky = { version = "1.5", default-features = false, features = ["user-hooks"] }
 tokio-test = "0.4"
-criterion = { version = "0.8", features = ["html_reports"] }
+criterion = { version = "0.8", features = ["html_reports", "async_tokio"] }
 
+# Explicit bench targets only: a stray file under benches/ should not silently
+# become a target.
 [[bench]]
 name = "router"
+harness = false
+
+[[bench]]
+name = "core"
+harness = false
+
+[[bench]]
+name = "arena"
+harness = false
+
+[[bench]]
+name = "body"
+harness = false
+
+[[bench]]
+name = "json"
+harness = false
+
+[[bench]]
+name = "micro"
+harness = false
+
+[[bench]]
+name = "pipeline"
+harness = false
+
+[[bench]]
+name = "resilience"
+harness = false
+
+[[bench]]
+name = "simd_parser"
+harness = false
+
+[[bench]]
+name = "internal_overhead"
 harness = false
 

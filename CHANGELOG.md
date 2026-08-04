@@ -14,6 +14,29 @@ Changes at or before `0.6.0` are recorded in the workspace
 
 - Adopted the framework's criterion benchmarks that measure this crate: `core`, `arena`, `body`, `json`, `micro`, `pipeline`, `resilience`, `simd_parser` and `internal_overhead` moved here from the root package's `benches/`. Run them with `cargo bench -p armature-core --bench <name>`. The crate now sets `autobenches = false`, so a new file under `benches/` needs an explicit `[[bench]]` entry. `criterion` also gains the `async_tokio` feature: `internal_overhead`, `micro` and `resilience` drive async work through `Bencher::to_async`, which is feature-gated, so without it these benches do not compile outside the workspace.
 
+## [0.8.2] - 2026-08-04
+
+### Fixed
+
+- **Registration order decides between two overlapping parameterized routes
+  again.** Both went into the same `matchit` tree, where the winner is chosen
+  by specificity — static beats parameter beats catch-all — which is the
+  opposite of this framework's first-registered-wins rule, and the fallback
+  rescan could not correct it because it only considers routes the tree does
+  not hold. Registering `/:x/:y` and then `/a/:z` handed `/a/q` to the *later*
+  route. A parameterized pattern that overlaps an earlier one is now answered
+  by the linear scan instead, which restores the order while leaving it in sole
+  charge of everything the earlier pattern does not describe. Affects 0.8.0 and
+  0.8.1.
+- **Registering a route with 26 or more parameters no longer aborts the
+  process.** `matchit` rewrites each non-catch-all parameter to a single letter
+  starting at `a` and *panics* — it does not return an error — once a route
+  needs one past `z`, so the `insert(..).is_err()` arm that exists to divert
+  awkward patterns to the linear scan could not catch it. The count is checked
+  before the insert, on the translated pattern, since a segment written with
+  braces is a parameter to `matchit` while being invisible to `param_names`.
+  Affects 0.8.0 and 0.8.1.
+
 ## [0.8.1] - 2026-08-03
 
 ### Changed

@@ -306,6 +306,23 @@ fn split_segments(path: &str) -> impl Iterator<Item = &str> {
 
 /// Rewrite an armature route pattern into `matchit` syntax.
 ///
+/// How many parameters one route may carry before `matchit` refuses it.
+///
+/// It rewrites each non-catch-all parameter to a single letter while
+/// normalizing a route and starts at `a`, so the 26th exhausts the alphabet —
+/// and it announces that by panicking rather than returning an error, which no
+/// `is_err` arm can turn into a fallback. 25 is therefore the most a route may
+/// carry; anything above is kept out of the tree and answered by the linear
+/// scan instead.
+///
+/// The `{`-byte count this is compared against is deliberately an upper bound,
+/// not the exact figure `matchit` uses: a trailing catch-all is exempt from the
+/// rewrite and consumes no letter, and an escaped `{{` is collapsed before the
+/// wildcards are found. Over-counting costs one route a linear scan it did not
+/// strictly need; under-counting would leave the panic reachable, so the bound
+/// is kept on the safe side rather than tightened to match.
+const MATCHIT_MAX_PARAMS: usize = 25;
+
 /// `:id` becomes `{id}` and `*rest` becomes `{*rest}`. User-facing pattern
 /// syntax does not change — this is the seam that keeps it from having to.
 /// Segments that are already braced pass through untouched.
@@ -389,6 +406,47 @@ fn method_slot(method: &Method) -> Option<usize> {
     })
 }
 
+/// Whether two patterns can both match the same path.
+///
+/// Deliberately over-approximate: when the answer is not obviously "no" it
+/// says yes. A false yes costs one route a place in the tree and nothing else,
+/// while a false no would put two overlapping routes in the same tree and let
+/// `matchit`'s specificity order override registration order.
+fn patterns_overlap(a: &str, b: &str) -> bool {
+    fn is_param(segment: &str) -> bool {
+        segment.starts_with(':') || segment.starts_with('*') || segment.starts_with('{')
+    }
+
+    let pa: SmallVec<[&str; 8]> = split_segments(a).collect();
+    let pb: SmallVec<[&str; 8]> = split_segments(b).collect();
+
+    let a_catch = pa.last().is_some_and(|s| s.starts_with('*'));
+    let b_catch = pb.last().is_some_and(|s| s.starts_with('*'));
+
+    // A catch-all absorbs any number of trailing segments; without one on
+    // either side the two patterns describe paths of exactly one length.
+    if !a_catch && !b_catch && pa.len() != pb.len() {
+        return false;
+    }
+
+    let fixed_a = pa.len() - usize::from(a_catch);
+    let fixed_b = pb.len() - usize::from(b_catch);
+
+    // A catch-all still has to get past its own fixed prefix, so a pattern
+    // shorter than that prefix cannot reach it.
+    if a_catch && !b_catch && pb.len() < fixed_a {
+        return false;
+    }
+    if b_catch && !a_catch && pa.len() < fixed_b {
+        return false;
+    }
+
+    // Two static segments in the same position that differ are the only thing
+    // that can rule an overlap out; a parameter on either side accepts
+    // whatever the other names.
+    (0..fixed_a.min(fixed_b)).all(|i| is_param(pa[i]) || is_param(pb[i]) || pa[i] == pb[i])
+}
+
 /// One `matchit` tree per routable method, plus a linear fallback.
 ///
 /// The fallback exists because `matchit` rejects conflicting patterns while the
@@ -421,7 +479,31 @@ impl MethodIndex {
             };
 
             if route.path.contains(':') || route.path.contains('*') {
+                // A parameterized pattern that overlaps an earlier one must not
+                // share the tree with it. Inside a single `matchit` tree the
+                // winner is decided by specificity — static beats parameter
+                // beats catch-all — which is the opposite rule to this
+                // framework's first-registered-wins, and the fallback rescan
+                // below cannot help because it only looks at routes the tree
+                // does not hold. Registering `/:x/:y` and then `/a/:z` used to
+                // hand `/a/q` to the *later* route for exactly that reason.
+                //
+                // Sending the later one to the fallback list restores the
+                // order: a path both describe hits the earlier route in the
+                // tree and stops there, while a path only the later one
+                // describes misses the tree and reaches it through the full
+                // scan. Unlike the static case below it cannot simply be
+                // dropped — it is still the only route for everything the
+                // earlier pattern does not cover.
+                let overlapped = patterns[slot]
+                    .iter()
+                    .copied()
+                    .any(|earlier| patterns_overlap(earlier, &route.path));
                 patterns[slot].push(&route.path);
+                if overlapped {
+                    fallback.push(idx);
+                    continue;
+                }
             } else {
                 // A static pattern names exactly one concrete path, so an
                 // earlier route matching that path makes this one unreachable
@@ -441,9 +523,27 @@ impl MethodIndex {
                 }
             }
 
+            // `matchit` renames parameters to single letters starting at `a`
+            // while normalizing, and *panics* — it does not return an error —
+            // once a route needs one past `z`. A panic is not something the
+            // `is_err` arm below can turn into a fallback, so the count is
+            // checked first. Such a route is pathological, but registering one
+            // should cost a linear scan, not abort the process.
+            //
+            // Counted on the *translated* pattern rather than on
+            // `param_names`, which sees only this crate's `:name` and `*name`
+            // spellings. A pattern written with braces directly is passed
+            // through untouched, so it is a parameter to `matchit` while being
+            // invisible here — and 26 of those panic just the same.
+            let translated = translate_pattern(&route.path);
             let tree = trees[slot].get_or_insert_with(matchit::Router::new);
+            if translated.bytes().filter(|&b| b == b'{').count() > MATCHIT_MAX_PARAMS {
+                fallback.push(idx);
+                continue;
+            }
+
             let value = (idx, param_names(&route.path));
-            if tree.insert(translate_pattern(&route.path), value).is_err() {
+            if tree.insert(translated, value).is_err() {
                 // A conflict, an unsupported pattern, or a duplicate. Preserve
                 // first-registered-wins by scanning instead.
                 fallback.push(idx);
@@ -1118,6 +1218,159 @@ mod tests {
             Route::new(HttpMethod::GET, "/users/:id", test_handler).with_constraints(constraints);
 
         assert!(route.constraints.is_some());
+    }
+
+    /// Registration order decides, even when the later route is the one
+    /// `matchit` would prefer.
+    ///
+    /// Inside a single tree the winner is chosen by specificity — static beats
+    /// parameter beats catch-all — which is the opposite of this framework's
+    /// rule. `/a/q` is described by both patterns here, and `matchit` picks the
+    /// second because its first segment is static, so keeping both in the tree
+    /// silently hands the path to the later route.
+    #[tokio::test]
+    async fn an_earlier_pattern_beats_a_later_more_specific_one() {
+        async fn first(_req: HttpRequest) -> Result<HttpResponse, Error> {
+            Ok(HttpResponse::ok().with_body(b"first".to_vec()))
+        }
+        async fn second(_req: HttpRequest) -> Result<HttpResponse, Error> {
+            Ok(HttpResponse::ok().with_body(b"second".to_vec()))
+        }
+
+        let mut router = Router::new();
+        router.add_route(Route::new(HttpMethod::GET, "/:x/:y", first));
+        router.add_route(Route::new(HttpMethod::GET, "/a/:z", second));
+
+        let response = router
+            .route(HttpRequest::new("GET", "/a/q".to_string()))
+            .await
+            .expect("a path both patterns describe must route");
+        assert_eq!(
+            response.body.as_ref(),
+            b"first",
+            "the later, more specific route answered a path the earlier one already described"
+        );
+
+        // The later route is not merely shadowed away: it still owns everything
+        // the earlier pattern does not describe.
+        let response = router
+            .route(HttpRequest::new("GET", "/a/b/c".to_string()))
+            .await;
+        assert!(
+            response.is_err(),
+            "neither pattern describes a three-segment path"
+        );
+    }
+
+    #[test]
+    fn overlap_detection_only_rules_out_what_it_can_prove_disjoint() {
+        // Same shape, a parameter facing anything: overlapping.
+        assert!(patterns_overlap("/:x/:y", "/a/:z"));
+        assert!(patterns_overlap("/a/:z", "/:x/:y"));
+        assert!(patterns_overlap("/:x", "/a"));
+
+        // Two static segments that differ in the same position: disjoint, and
+        // this is the only thing that proves it.
+        assert!(!patterns_overlap("/a/:z", "/b/:z"));
+
+        // Different lengths with no catch-all to absorb the difference.
+        assert!(!patterns_overlap("/:x/:y", "/:x"));
+
+        // A catch-all reaches any depth at or past its fixed prefix.
+        assert!(patterns_overlap("/a/*rest", "/a/:x/:y"));
+        assert!(!patterns_overlap("/a/b/*rest", "/a"));
+    }
+
+    /// `matchit` panics rather than erroring once a route needs a 27th
+    /// parameter letter, and a panic during index construction takes down
+    /// whatever was registering the route. Such a route has to fall back to the
+    /// linear scan, and — the part worth asserting — still match.
+    #[tokio::test]
+    async fn a_route_past_matchits_parameter_ceiling_still_matches() {
+        async fn last_handler(req: HttpRequest) -> Result<HttpResponse, Error> {
+            let v = req.param("p29").unwrap_or_default().to_owned();
+            Ok(HttpResponse::ok().with_body(v.into_bytes()))
+        }
+
+        // 30 parameters: comfortably past the 25 `matchit` can normalize.
+        let pattern: String = (0..30).map(|i| format!("/:p{i}")).collect();
+        let target: String = (0..30).map(|i| format!("/v{i}")).collect();
+
+        let mut router = Router::new();
+        router.get(&pattern, last_handler);
+
+        let response = router
+            .route(HttpRequest::new("GET", target))
+            .await
+            .expect("an over-parameterized route must route, not panic");
+        assert_eq!(response.status, 200);
+        assert_eq!(
+            response.body.as_ref(),
+            b"v29",
+            "the fallback scan must still bind parameters"
+        );
+    }
+
+    /// The ceiling itself, rather than a value comfortably past it. The other
+    /// tests use 30 parameters, which would still pass if the constant were off
+    /// by a few; only routes at exactly 25 and exactly 26 pin it down. Both must
+    /// match — 25 through the tree, 26 through the linear scan — and neither may
+    /// panic.
+    #[tokio::test]
+    async fn routes_on_either_side_of_the_parameter_ceiling_both_match() {
+        async fn last_handler(req: HttpRequest) -> Result<HttpResponse, Error> {
+            // The last parameter differs between the two patterns, and the
+            // 26-parameter one carries both names — so the longer route's
+            // parameter has to be checked first.
+            let v = req
+                .param("p25")
+                .or_else(|| req.param("p24"))
+                .unwrap_or_default()
+                .to_owned();
+            Ok(HttpResponse::ok().with_body(v.into_bytes()))
+        }
+
+        for count in [MATCHIT_MAX_PARAMS, MATCHIT_MAX_PARAMS + 1] {
+            let pattern: String = (0..count).map(|i| format!("/:p{i}")).collect();
+            let target: String = (0..count).map(|i| format!("/v{i}")).collect();
+
+            let mut router = Router::new();
+            router.get(&pattern, last_handler);
+
+            let response = router
+                .route(HttpRequest::new("GET", target))
+                .await
+                .unwrap_or_else(|_| panic!("a {count}-parameter route must match"));
+            assert_eq!(response.status, 200);
+            assert_eq!(
+                response.body.as_ref(),
+                format!("v{}", count - 1).as_bytes(),
+                "a {count}-parameter route must still bind its last parameter"
+            );
+        }
+    }
+
+    /// The same ceiling, reached through brace syntax instead of `:name`.
+    /// `translate_pattern` passes an already-braced segment through untouched,
+    /// so those parameters never appear in `param_names` — counting there
+    /// rather than on the translated pattern leaves the panic reachable.
+    ///
+    /// Only the absence of a panic is asserted. Such a route is answered by the
+    /// linear scan, and `match_path_spans` understands `:name` and `*name` but
+    /// not braces, so it does not match — brace spelling has only ever worked
+    /// by reaching `matchit`. Turning a process-killing panic into a route that
+    /// does not match is the fix; making brace syntax work in the fallback is a
+    /// separate question about whether it is a supported spelling at all.
+    #[tokio::test]
+    async fn brace_spelled_parameters_do_not_panic_past_the_ceiling() {
+        let pattern: String = (0..30).map(|i| format!("/{{p{i}}}")).collect();
+        let target: String = (0..30).map(|i| format!("/v{i}")).collect();
+
+        let mut router = Router::new();
+        router.get(&pattern, test_handler);
+
+        // `route` returning `Err(RouteNotFound)` is a result; a panic is not.
+        let _ = router.route(HttpRequest::new("GET", target)).await;
     }
 
     #[tokio::test]

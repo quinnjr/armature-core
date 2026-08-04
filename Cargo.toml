@@ -1,6 +1,6 @@
 [package]
 name = "armature-core"
-version = "0.8.3"
+version = "0.8.4"
 edition = "2024"
 rust-version = "1.94.1"
 autobenches = false  # Disable auto-discovery, use explicit [[bench]] only
@@ -20,7 +20,7 @@ matchit = "0.9"  # High-performance router (same as Axum)
 # The HTTP/1.1 layer. armature-core adopts its Bytes-backed types (Method,
 # ByteStr, HeaderId) as canonical rather than defining a parallel set; the
 # serve-path swap onto it is Plan 4, not this one.
-armature-h1 = { version = "0.1" }
+armature-h1 = { version = "0.2" }
 tokio = { version = "1.52", features = ["rt", "rt-multi-thread", "macros", "sync", "time", "net", "io-util", "fs", "signal"] }
 hyper = { version = "1.10", features = ["full"] }
 hyper-util = { version = "0.1", features = ["server", "http1", "http2", "tokio"] }

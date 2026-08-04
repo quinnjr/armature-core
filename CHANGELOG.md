@@ -14,6 +14,24 @@ Changes at or before `0.6.0` are recorded in the workspace
 
 - Adopted the framework's criterion benchmarks that measure this crate: `core`, `arena`, `body`, `json`, `micro`, `pipeline`, `resilience`, `simd_parser` and `internal_overhead` moved here from the root package's `benches/`. Run them with `cargo bench -p armature-core --bench <name>`. The crate now sets `autobenches = false`, so a new file under `benches/` needs an explicit `[[bench]]` entry. `criterion` also gains the `async_tokio` feature: `internal_overhead`, `micro` and `resilience` drive async work through `Bencher::to_async`, which is feature-gated, so without it these benches do not compile outside the workspace.
 
+## [0.8.4] - 2026-08-04
+
+### Changed
+
+- The `armature-h1` requirement names `0.2`. That release seals `Head` behind
+  `Head::new` and `Head::target()`, which this crate never constructed or
+  reassigned, so nothing here changes: the re-exported `ByteStr`, `HeaderId`
+  and `Method` are the same types they were. It also carries the framing and
+  deadline fixes that release documents — a handler `Transfer-Encoding` that
+  does not frame its body no longer suppresses the writer's own framing, and
+  a streamed response flushes when its source goes idle rather than waiting
+  for a byte threshold.
+
+  Note for anyone depending on both crates directly: `armature-core` now
+  re-exports those types from `armature-h1 0.2`, so a direct
+  `armature-h1 = "0.1"` alongside this release resolves two copies and the
+  types will not be interchangeable. Move the direct requirement to `0.2`.
+
 ## [0.8.3] - 2026-08-04
 
 ### Fixed

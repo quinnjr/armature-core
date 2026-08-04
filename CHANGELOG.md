@@ -14,6 +14,20 @@ Changes at or before `0.6.0` are recorded in the workspace
 
 - Adopted the framework's criterion benchmarks that measure this crate: `core`, `arena`, `body`, `json`, `micro`, `pipeline`, `resilience`, `simd_parser` and `internal_overhead` moved here from the root package's `benches/`. Run them with `cargo bench -p armature-core --bench <name>`. The crate now sets `autobenches = false`, so a new file under `benches/` needs an explicit `[[bench]]` entry. `criterion` also gains the `async_tokio` feature: `internal_overhead`, `micro` and `resilience` drive async work through `Bencher::to_async`, which is feature-gated, so without it these benches do not compile outside the workspace.
 
+## [0.8.3] - 2026-08-04
+
+### Fixed
+
+- Requirements on sibling armature crates name a minor instead of `0`. Under
+  Cargo's 0.x rules `version = "0"` matches any release ever made, and edition
+  2024 selects the MSRV-aware resolver, so a consumer declaring an older
+  `rust-version` was handed the oldest version satisfying it — resolving
+  `armature-core = "0"` on Rust 1.89 produced `armature-core 0.2.3` while an
+  explicit `armature-core = "0.8"` elsewhere in the same graph pulled 0.8.2.
+  Two copies of core, and a build failing on symbols the older one lacks. Each
+  0.x minor in this family is a breaking change, so the requirement now names
+  one. No API change.
+
 ## [0.8.2] - 2026-08-04
 
 ### Fixed

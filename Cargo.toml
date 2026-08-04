@@ -1,6 +1,6 @@
 [package]
 name = "armature-core"
-version = "0.8.2"
+version = "0.8.3"
 edition = "2024"
 rust-version = "1.94.1"
 autobenches = false  # Disable auto-discovery, use explicit [[bench]] only
@@ -13,7 +13,7 @@ keywords = ["http", "async", "web", "framework"]
 categories = ["web-programming::http-server", "asynchronous"]
 
 [dependencies]
-armature-log = { version = "0" }
+armature-log = { version = "0.2" }
 inventory = "0.3"
 dependency-injector = "2.1.0"
 matchit = "0.9"  # High-performance router (same as Axum)

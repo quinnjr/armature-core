@@ -80,8 +80,9 @@ pub struct HttpRequest {
     /// The raw request target, query string included.
     ///
     /// Was a `String`. A `ByteStr` so it can be a slice of the connection read
-    /// buffer once the serve path moves onto `armature-h1`; `Deref<Target = str>`
-    /// keeps `&req.path` working wherever a `&str` is wanted.
+    /// buffer, which it is under the default `h1-backend` feature;
+    /// `Deref<Target = str>` keeps `&req.path` working wherever a `&str` is
+    /// wanted.
     pub path: ByteStr,
     /// Request headers stored in a SmallVec-backed `HeaderMap`.
     ///

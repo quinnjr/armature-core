@@ -101,7 +101,7 @@ impl ScopedGuard {
 /// [`Application::serve_state`]). The linear router remains the registration
 /// target; only per-request dispatch is accelerated.
 #[derive(Clone)]
-struct ServeState {
+pub(crate) struct ServeState {
     router: Arc<OptimizedRouter>,
     cors: Option<Arc<CorsConfig>>,
     guards: Arc<[ScopedGuard]>,
@@ -121,6 +121,29 @@ struct ServeState {
 }
 
 impl ServeState {
+    /// A state with only a router and a body cap, for tests.
+    ///
+    /// The serve path's own tests need a `ServeState` without an `Application`
+    /// behind it; every other field takes the value it has when nothing is
+    /// configured, which is what those tests want to hold constant.
+    #[cfg(all(test, feature = "h1-backend"))]
+    pub(crate) fn for_test(router: Arc<OptimizedRouter>, max_body_size: usize) -> Self {
+        Self {
+            router,
+            cors: None,
+            guards: Vec::new().into(),
+            max_body_size,
+            filter_chain: None,
+            peer: None,
+        }
+    }
+
+    /// The configured body cap, for tests that must build a matching config.
+    #[cfg(all(test, feature = "h1-backend"))]
+    pub(crate) fn max_body_size_for_test(&self) -> usize {
+        self.max_body_size
+    }
+
     /// The same state, serving one connection whose peer is known.
     fn for_peer(&self, peer: SocketAddr) -> Self {
         Self {
@@ -862,6 +885,46 @@ impl Application {
     pub async fn listen_on(self, addr: impl Into<SocketAddr>) -> Result<(), Error> {
         let addr = addr.into();
 
+        // Which backend serves HTTP/1.1 is a compile-time choice, so it is made
+        // with a `cfg`-selected binding rather than a branch: exactly one of
+        // these two lines exists in any given build.
+        #[cfg(feature = "h1-backend")]
+        let served = self.listen_on_h1(addr).await;
+        #[cfg(not(feature = "h1-backend"))]
+        let served = self.listen_on_hyper(addr).await;
+        served
+    }
+
+    /// `listen_on` over `armature-h1`'s thread-per-core server.
+    ///
+    /// Binding, accepting, TLS, and the per-connection loop all move into
+    /// `armature-h1`, so the hyper version's accept loop has no counterpart
+    /// here: what is left is configuration.
+    ///
+    /// Note what is *not* carried over. `PipelineStats` counted connections and
+    /// requests from inside the accept loop; `armature-h1` owns that loop and
+    /// exposes no hook, so those counters stay at zero on this path. They were
+    /// observability, not behaviour — but a dashboard reading them will go flat,
+    /// which is worth knowing before the upgrade rather than after.
+    ///
+    /// The `epoll_config` socket tuning is likewise not applied: it reaches for
+    /// the raw fd of a listener this process no longer owns. `armature-h1`'s
+    /// own `TcpConfig` covers the part that matters (`nodelay`, backlog,
+    /// `SO_REUSEPORT`).
+    #[cfg(feature = "h1-backend")]
+    async fn listen_on_h1(self, addr: SocketAddr) -> Result<(), Error> {
+        let state = self.serve_state(self.cors_config.clone());
+        let cfg =
+            crate::h1_backend::h1_config(addr, &self.pipeline_config, self.max_body_size, None);
+        crate::h1_backend::serve(cfg, state, None).await
+    }
+
+    /// `listen_on` over `hyper::server::conn::http1`.
+    ///
+    /// The path taken with the `h1-backend` feature off, unchanged from before
+    /// that feature existed.
+    #[cfg_attr(feature = "h1-backend", allow(dead_code))]
+    async fn listen_on_hyper(self, addr: SocketAddr) -> Result<(), Error> {
         debug!(address = %addr, "Binding to address");
         let listener = TcpListener::bind(addr).await?;
 
@@ -959,6 +1022,49 @@ impl Application {
     pub async fn listen_https(self, port: u16, tls_config: TlsConfig) -> Result<(), Error> {
         let addr = SocketAddr::from(([0, 0, 0, 0], port));
 
+        #[cfg(feature = "h1-backend")]
+        let served = self.listen_https_h1(addr, tls_config, false).await;
+        #[cfg(not(feature = "h1-backend"))]
+        let served = self.listen_https_hyper(addr, tls_config).await;
+        served
+    }
+
+    /// The `armature-h1` implementation behind [`listen_https`](Self::listen_https)
+    /// and [`listen_https_h2`](Self::listen_https_h2).
+    ///
+    /// `armature-h1`'s dispatch does the ALPN check itself: it hands a
+    /// connection that negotiated `h2` to the fallback and serves everything
+    /// else as HTTP/1.1. `with_h2` decides whether that fallback is hyper's
+    /// HTTP/2 driver or a close — which is the entire difference between the
+    /// two public methods, since `listen_https` promises HTTP/1.1 only.
+    ///
+    /// See [`listen_on_h1`](Self::listen_on_h1) for what this path drops
+    /// (pipeline/HTTP-2 connection counters, `epoll_config` socket tuning).
+    #[cfg(feature = "h1-backend")]
+    async fn listen_https_h1(
+        self,
+        addr: SocketAddr,
+        tls_config: TlsConfig,
+        with_h2: bool,
+    ) -> Result<(), Error> {
+        let state = self.serve_state(self.cors_config.clone());
+        let cfg =
+            crate::h1_backend::h1_config(addr, &self.pipeline_config, self.max_body_size, None)
+                .with_tls(tls_config.server_config);
+        let h2 = with_h2.then(|| {
+            Http2Builder::with_stats(self.http2_config.clone(), Arc::clone(&self.http2_stats))
+                .configure_hyper_builder()
+        });
+        crate::h1_backend::serve(cfg, state, h2).await
+    }
+
+    /// `listen_https` over `hyper::server::conn::http1`.
+    #[cfg_attr(feature = "h1-backend", allow(dead_code))]
+    async fn listen_https_hyper(
+        self,
+        addr: SocketAddr,
+        tls_config: TlsConfig,
+    ) -> Result<(), Error> {
         debug!(address = %addr, "Binding to address (HTTPS)");
         let listener = TcpListener::bind(addr).await?;
 
@@ -1087,57 +1193,109 @@ impl Application {
             .parse()
             .map_err(|e| Error::Internal(format!("Invalid HTTPS address: {}", e)))?;
 
-        let listener = TcpListener::bind(https_addr).await?;
+        #[cfg(feature = "h1-backend")]
+        let served = self.listen_with_config_h1(https_addr, config, state).await;
+        #[cfg(not(feature = "h1-backend"))]
+        let served = self
+            .listen_with_config_hyper(https_addr, config, state)
+            .await;
+        served
+    }
 
-        #[cfg(unix)]
-        let socket_tuning = self.epoll_config.clone();
-        #[cfg(unix)]
-        if let Some(ref tuning) = socket_tuning {
-            use std::os::unix::io::AsRawFd;
-            apply_socket_tuning(listener.as_raw_fd(), tuning, "listener");
-        }
-
+    /// The `armature-h1` half of [`listen_with_config`](Self::listen_with_config).
+    ///
+    /// The HTTP-to-HTTPS redirect server is already spawned by the caller and
+    /// keeps running on the caller's runtime; only the HTTPS listener moves
+    /// onto `armature-h1`.
+    ///
+    /// HTTP/2 is deliberately not offered here. The hyper version of this
+    /// method served HTTP/1.1 only, with a bare `http1::Builder`, so routing an
+    /// ALPN `h2` negotiation to hyper would add a protocol this listener never
+    /// had — a behaviour change smuggled in under a backend swap. An `h2`
+    /// negotiation is closed, exactly as before.
+    #[cfg(feature = "h1-backend")]
+    async fn listen_with_config_h1(
+        self,
+        https_addr: SocketAddr,
+        config: HttpsConfig,
+        state: ServeState,
+    ) -> Result<(), Error> {
         println!("🔒 HTTPS Server listening on https://{}", https_addr);
         if config.http_redirect_addr.is_some() {
             println!("↪️  HTTP redirect server enabled");
         }
+        let cfg = crate::h1_backend::h1_config(
+            https_addr,
+            &self.pipeline_config,
+            self.max_body_size,
+            None,
+        )
+        .with_tls(config.tls.server_config);
+        crate::h1_backend::serve(cfg, state, None).await
+    }
 
-        let acceptor = TlsAcceptor::from(config.tls.server_config);
+    /// The hyper half of [`listen_with_config`](Self::listen_with_config).
+    #[cfg_attr(feature = "h1-backend", allow(dead_code))]
+    async fn listen_with_config_hyper(
+        self,
+        https_addr: SocketAddr,
+        config: HttpsConfig,
+        state: ServeState,
+    ) -> Result<(), Error> {
+        {
+            let listener = TcpListener::bind(https_addr).await?;
 
-        loop {
-            let (stream, client_addr) = listener.accept().await?;
-            trace!(client_address = %client_addr, "TLS connection accepted");
-
-            // Apply opt-in socket tuning to the accepted socket
+            #[cfg(unix)]
+            let socket_tuning = self.epoll_config.clone();
             #[cfg(unix)]
             if let Some(ref tuning) = socket_tuning {
                 use std::os::unix::io::AsRawFd;
-                apply_socket_tuning(stream.as_raw_fd(), tuning, "accepted connection");
+                apply_socket_tuning(listener.as_raw_fd(), tuning, "listener");
             }
 
-            let acceptor = acceptor.clone();
-            let state = state.for_peer(client_addr);
+            println!("🔒 HTTPS Server listening on https://{}", https_addr);
+            if config.http_redirect_addr.is_some() {
+                println!("↪️  HTTP redirect server enabled");
+            }
 
-            tokio::spawn(async move {
-                match acceptor.accept(stream).await {
-                    Ok(tls_stream) => {
-                        let io = TokioIo::new(tls_stream);
+            let acceptor = TlsAcceptor::from(config.tls.server_config);
 
-                        let service = service_fn(move |req: Request<IncomingBody>| {
-                            let state = state.clone();
-                            async move { handle_request(req, state).await }
-                        });
+            loop {
+                let (stream, client_addr) = listener.accept().await?;
+                trace!(client_address = %client_addr, "TLS connection accepted");
 
-                        if let Err(err) = http1::Builder::new().serve_connection(io, service).await
-                        {
-                            eprintln!("Error serving HTTPS connection: {:?}", err);
+                // Apply opt-in socket tuning to the accepted socket
+                #[cfg(unix)]
+                if let Some(ref tuning) = socket_tuning {
+                    use std::os::unix::io::AsRawFd;
+                    apply_socket_tuning(stream.as_raw_fd(), tuning, "accepted connection");
+                }
+
+                let acceptor = acceptor.clone();
+                let state = state.for_peer(client_addr);
+
+                tokio::spawn(async move {
+                    match acceptor.accept(stream).await {
+                        Ok(tls_stream) => {
+                            let io = TokioIo::new(tls_stream);
+
+                            let service = service_fn(move |req: Request<IncomingBody>| {
+                                let state = state.clone();
+                                async move { handle_request(req, state).await }
+                            });
+
+                            if let Err(err) =
+                                http1::Builder::new().serve_connection(io, service).await
+                            {
+                                eprintln!("Error serving HTTPS connection: {:?}", err);
+                            }
+                        }
+                        Err(err) => {
+                            eprintln!("TLS handshake failed: {:?}", err);
                         }
                     }
-                    Err(err) => {
-                        eprintln!("TLS handshake failed: {:?}", err);
-                    }
-                }
-            });
+                });
+            }
         }
     }
 
@@ -1244,6 +1402,22 @@ impl Application {
     pub async fn listen_https_h2(self, port: u16, tls_config: TlsConfig) -> Result<(), Error> {
         let addr = SocketAddr::from(([0, 0, 0, 0], port));
 
+        // `true`: connections that negotiate `h2` over ALPN go to hyper's
+        // HTTP/2 driver rather than being closed.
+        #[cfg(feature = "h1-backend")]
+        let served = self.listen_https_h1(addr, tls_config, true).await;
+        #[cfg(not(feature = "h1-backend"))]
+        let served = self.listen_https_h2_hyper(addr, tls_config).await;
+        served
+    }
+
+    /// `listen_https_h2` with both protocols served by hyper.
+    #[cfg_attr(feature = "h1-backend", allow(dead_code))]
+    async fn listen_https_h2_hyper(
+        self,
+        addr: SocketAddr,
+        tls_config: TlsConfig,
+    ) -> Result<(), Error> {
         debug!(address = %addr, "Binding to address (HTTPS with HTTP/2)");
         let listener = TcpListener::bind(addr).await?;
 
@@ -1539,7 +1713,7 @@ async fn start_http_redirect_server(addr: &str, https_port: u16) -> Result<(), E
 }
 
 /// Handle an incoming HTTP request
-async fn handle_request(
+pub(crate) async fn handle_request(
     req: Request<IncomingBody>,
     state: ServeState,
 ) -> Result<Response<Full<bytes::Bytes>>, hyper::Error> {
@@ -1570,18 +1744,8 @@ async fn handle_request(
 
     trace!(method = %method, path = %path, "Incoming request");
 
-    if method == "OPTIONS"
-        && let Some(ref cors) = state.cors
-    {
-        let mut builder = Response::builder().status(204);
-        builder = builder.header("Access-Control-Allow-Origin", &cors.allow_origin);
-        builder = builder.header("Access-Control-Allow-Methods", &cors.allow_methods);
-        builder = builder.header("Access-Control-Allow-Headers", &cors.allow_headers);
-        builder = builder.header("Access-Control-Max-Age", cors.max_age.to_string());
-        if cors.allow_credentials {
-            builder = builder.header("Access-Control-Allow-Credentials", "true");
-        }
-        return Ok(builder.body(Full::new(bytes::Bytes::new())).unwrap());
+    if let Some(preflight) = cors_preflight(&method, &state) {
+        return Ok(to_hyper_response_raw(preflight));
     }
 
     // Copy headers. One copy per value, because hyper's `HeaderValue` owns its
@@ -1655,6 +1819,160 @@ async fn handle_request(
         trace!(body_size = body_size, "Request body received (zero-copy)");
     }
 
+    Ok(to_hyper_response(
+        dispatch_request(armature_req, &state, start).await,
+        state.cors.as_deref(),
+    ))
+}
+
+/// Serve one request that arrived over `armature-h1`.
+///
+/// The counterpart to [`handle_request`], and deliberately the same shape: both
+/// build an [`HttpRequest`], answer a CORS preflight before touching the body,
+/// enforce the body limit, and then hand off to [`dispatch_request`], which is
+/// where all the actual policy lives. Only the transport-facing edges differ.
+///
+/// Returns an `armature_h1::Response` rather than a `Result`, because there is
+/// no error to report to: `armature-h1` owns the connection and every failure
+/// this function can encounter has a status code that belongs on the wire.
+#[cfg(feature = "h1-backend")]
+pub(crate) async fn dispatch_via_h1(
+    req: armature_h1::Request,
+    state: ServeState,
+) -> armature_h1::Response {
+    use crate::h1_backend::bridge::{request_from_head, to_h1_response};
+    use std::time::Instant;
+
+    let start = Instant::now();
+    let armature_h1::Request {
+        head,
+        mut body,
+        peer,
+    } = req;
+    let method = head.method.clone();
+
+    if let Some(preflight) = cors_preflight(&method, &state) {
+        // No CORS argument: the preflight answer already carries the full
+        // preflight header set, and appending the per-response origin pair on
+        // top of it would duplicate `Access-Control-Allow-Origin`.
+        return to_h1_response(preflight, None);
+    }
+
+    // Fast-path rejection, before any body byte is buffered — the same check
+    // the hyper path makes, for the same reason. `armature-h1` independently
+    // caps the body at `Limits::max_body_bytes`, but that cap produces a bare
+    // 413 from the connection loop; going through `payload_too_large_response`
+    // here keeps the body this framework's other transports return.
+    let declared_len = head
+        .get_str(&armature_h1::HeaderId::ContentLength)
+        .and_then(|v| v.parse::<usize>().ok());
+    if let Some(len) = declared_len
+        && !body_within_limit(len, state.max_body_size)
+    {
+        warn!(
+            method = %method,
+            path = head.path(),
+            limit = state.max_body_size,
+            declared_len = len,
+            "Request Content-Length exceeds configured limit"
+        );
+        return to_h1_response(payload_too_large_response(), state.cors.as_deref());
+    }
+
+    // `collect` enforces the cap while reading rather than after, so an
+    // undeclared or chunked body over the limit is refused mid-stream instead
+    // of being buffered whole first.
+    let body_bytes = match body.collect(state.max_body_size as u64).await {
+        Ok(b) => b,
+        Err(err) => {
+            let status = err.status();
+            warn!(
+                method = %method,
+                path = head.path(),
+                error = %err,
+                status,
+                "Failed to read request body"
+            );
+            let response = if status == 413 {
+                payload_too_large_response()
+            } else {
+                HttpResponse::new(status)
+            };
+            return to_h1_response(response, state.cors.as_deref());
+        }
+    };
+
+    let mut armature_req = request_from_head(head, peer);
+    if !body_bytes.is_empty() {
+        let body_size = body_bytes.len();
+        armature_req.set_body_bytes(body_bytes);
+        trace!(body_size = body_size, "Request body received (zero-copy)");
+    }
+
+    to_h1_response(
+        dispatch_request(armature_req, &state, start).await,
+        state.cors.as_deref(),
+    )
+}
+
+/// The CORS preflight answer for this request, if one is owed.
+///
+/// Split out of [`handle_request`] because both serve paths owe it, and both owe
+/// it at the same point: before the body is read. Moving it after the read would
+/// have an `OPTIONS` carrying a body pay for that body before being answered
+/// with a response that never looks at it.
+fn cors_preflight(method: &crate::Method, state: &ServeState) -> Option<HttpResponse> {
+    let cors = state.cors.as_deref()?;
+    if method != "OPTIONS" {
+        return None;
+    }
+    let mut response = HttpResponse::new(204);
+    response.headers.insert(
+        "Access-Control-Allow-Origin".into(),
+        cors.allow_origin.clone(),
+    );
+    response.headers.insert(
+        "Access-Control-Allow-Methods".into(),
+        cors.allow_methods.clone(),
+    );
+    response.headers.insert(
+        "Access-Control-Allow-Headers".into(),
+        cors.allow_headers.clone(),
+    );
+    response
+        .headers
+        .insert("Access-Control-Max-Age".into(), cors.max_age.to_string());
+    if cors.allow_credentials {
+        response.headers.insert(
+            "Access-Control-Allow-Credentials".into(),
+            "true".to_string(),
+        );
+    }
+    Some(response)
+}
+
+/// Guards, routing, and error mapping for a fully-formed request.
+///
+/// Everything between "an [`HttpRequest`] exists, body included" and "an
+/// [`HttpResponse`] is ready", with no transport type in the signature. Both
+/// serve paths — hyper and `armature-h1` — funnel through here, so the guard
+/// ordering, the filter-chain snapshot, and the error mapping have exactly one
+/// implementation rather than two that drift.
+///
+/// `start` is passed in rather than taken here because the duration that
+/// matters is measured from the point the transport handed the request over,
+/// which is upstream of this call.
+async fn dispatch_request(
+    mut armature_req: HttpRequest,
+    state: &ServeState,
+    start: std::time::Instant,
+) -> HttpResponse {
+    let method = armature_req.method.clone();
+    let target_handle = armature_req.path.clone();
+    let path = target_handle
+        .split_once('?')
+        .map_or(target_handle.as_str(), |(p, _)| p);
+
     // Only needed when a global exception filter chain is configured: a
     // filter's `catch()` receives the original request for context (path,
     // headers, request id, ...), matching `ExceptionContext::from_request`.
@@ -1684,16 +2002,13 @@ async fn handle_request(
                     "error": "Forbidden",
                     "status": 403,
                 });
-                let response = HttpResponse::new(403)
+                return HttpResponse::new(403)
                     .with_json(&body)
                     .unwrap_or_else(|_| HttpResponse::new(403));
-                return Ok(to_hyper_response(response, state.cors.as_deref()));
             }
             Err(GuardRejection::Error(err)) => {
                 warn!(method = %method, path = %path, error = %err, "Guard returned an error");
-                let response =
-                    respond_to_error(err, filter_ctx_request, state.filter_chain.clone()).await;
-                return Ok(to_hyper_response(response, state.cors.as_deref()));
+                return respond_to_error(err, filter_ctx_request, state.filter_chain.clone()).await;
             }
         }
     }
@@ -1720,7 +2035,7 @@ async fn handle_request(
         "Request completed"
     );
 
-    Ok(to_hyper_response(response, state.cors.as_deref()))
+    response
 }
 
 /// Convert a handler error into a client-safe HTTP response.
@@ -1897,6 +2212,15 @@ async fn evaluate_scoped_guards(
         }
     }
     Ok(context.request)
+}
+
+/// Convert our HttpResponse to a hyper Response, adding no CORS headers.
+///
+/// For a response that already carries every header it should — the CORS
+/// preflight answer, which sets the full preflight set itself and must not have
+/// the per-response `Allow-Origin` pair appended on top.
+fn to_hyper_response_raw(response: HttpResponse) -> Response<Full<bytes::Bytes>> {
+    to_hyper_response(response, None)
 }
 
 /// Convert our HttpResponse to a hyper Response, applying CORS headers.

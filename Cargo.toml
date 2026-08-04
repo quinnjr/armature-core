@@ -17,10 +17,12 @@ armature-log = { version = "0.2" }
 inventory = "0.3"
 dependency-injector = "2.1.0"
 matchit = "0.9"  # High-performance router (same as Axum)
-# The HTTP/1.1 layer. armature-core adopts its Bytes-backed types (Method,
-# ByteStr, HeaderId) as canonical rather than defining a parallel set; the
-# serve-path swap onto it is Plan 4, not this one.
-armature-h1 = { version = "0.2" }
+# The HTTP/1.1 layer, in both senses: armature-core adopts its Bytes-backed
+# types (Method, ByteStr, HeaderId) as canonical rather than defining a
+# parallel set, and — under the default `h1-backend` feature — serves HTTP/1.1
+# through it rather than through hyper. The `tls` feature is what lets the
+# HTTPS listeners hand it a rustls config; hyper still serves HTTP/2.
+armature-h1 = { version = "0.3", features = ["tls"] }
 tokio = { version = "1.52", features = ["rt", "rt-multi-thread", "macros", "sync", "time", "net", "io-util", "fs", "signal"] }
 hyper = { version = "1.10", features = ["full"] }
 hyper-util = { version = "0.1", features = ["server", "http1", "http2", "tokio"] }
@@ -89,7 +91,17 @@ libc = "0.2"
 io-uring = { version = "0.7", optional = true }
 
 [features]
-default = []
+# `h1-backend` is on by default: `armature-h1` is this framework's HTTP/1.1
+# implementation. Turn it off (`default-features = false`) to serve HTTP/1.1
+# through hyper instead, which is what every release before this one did.
+# HTTP/2 is served by hyper either way.
+default = ["h1-backend"]
+
+# Serve HTTP/1.1 with `armature-h1` instead of `hyper::server::conn::http1`.
+# See `src/h1_backend/mod.rs` for what changes, and `armature-h1`'s README for
+# the protocol strictness this opts into.
+h1-backend = []
+
 self-signed-certs = ["rcgen"]
 simd-json = ["dep:simd-json"]
 

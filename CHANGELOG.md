@@ -10,6 +10,53 @@ Changes at or before `0.6.0` are recorded in the workspace
 
 ## [Unreleased]
 
+### Added
+
+- `h1-backend` cargo feature, **on by default**: HTTP/1.1 is served by
+  `armature-h1` rather than `hyper::server::conn::http1`. HTTP/2 is unchanged —
+  hyper still serves it, reached through `armature-h1`'s `H2Fallback` hook when
+  a connection negotiates ALPN `h2`. HTTP/3 is untouched. Turn the feature off
+  (`default-features = false`) to keep the previous hyper HTTP/1.1 path.
+- `HeaderMap::insert_id` and `HeaderMap::append_id`: insert a header whose name
+  is already interned. This is what makes the new serve path zero-copy —
+  `armature-h1` parses names straight into `HeaderId` and values into `Bytes`
+  slices of the connection's read buffer, so a head crosses into `HttpRequest`
+  as a sequence of moves rather than a copy per value and a re-intern per name.
+
+### Changed
+
+- **Breaking (behaviour, not signature)**: with default features, HTTP/1.1
+  parsing is `armature-h1`'s and is stricter than hyper's. A bare LF as a line
+  terminator, a `#` fragment in the request target, and an unsupported transfer
+  coding are refused rather than accepted or silently repaired, and every
+  framing rejection closes the connection. That strictness is the reason for
+  the swap — leniency that differs from a peer's leniency is the request
+  smuggling vector — but a client that relied on hyper's permissiveness will
+  now be refused. See `armature-h1`'s `BACKENDS.md`.
+- `PipelineConfig::keep_alive_timeout` and `PipelineConfig::max_header_size`
+  are now wired on the `h1-backend` path, to `Limits::idle_timeout` and
+  `Limits::max_head_bytes`. Both documented themselves as unwired because
+  hyper's H1 builder had no knob for them; `armature-h1` does. Configurations
+  that set them and saw no effect will now see one.
+- `Application::listen_on`, `listen_https`, `listen_https_h2`,
+  `listen_with_config` and `listen_dual_stack` keep their signatures. Serving
+  moves onto `armature-h1`'s thread-per-core worker threads, run from a
+  blocking-pool thread so the caller's runtime is not blocked.
+- **A handler must not block on the `h1-backend` path.** One thread serves
+  every connection on its core, so a blocking handler stalls all of them. The
+  hyper path's work-stealing runtime hid this; this one does not. Move
+  genuinely blocking work to a shared pool.
+
+### Removed
+
+- On the `h1-backend` path, `PipelineStats` and `Http2Stats` connection and
+  request counters stay at zero: `armature-h1` owns the accept loop and exposes
+  no hook to count from. This is observability, not behaviour — but a dashboard
+  reading them will go flat. The same applies to `with_socket_tuning`
+  (`EpollConfig`), which reaches for the raw fd of a listener this process no
+  longer owns; `armature-h1`'s own `TcpConfig` covers `nodelay`, backlog and
+  `SO_REUSEPORT`.
+
 ## [0.8.5] - 2026-08-04
 
 ### Added

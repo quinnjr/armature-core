@@ -151,6 +151,13 @@ pub mod extractors;
 pub mod fast_response;
 pub mod form;
 pub mod guard;
+/// Serving HTTP/1.1 through `armature-h1` rather than hyper.
+///
+/// Internal: it names [`ServeState`](crate::application::ServeState) and other
+/// crate-private serve-path types, and `Application`'s `listen_*` methods are
+/// the supported way to reach it.
+#[cfg(feature = "h1-backend")]
+pub(crate) mod h1_backend;
 pub mod handler;
 pub mod headers;
 pub mod health;

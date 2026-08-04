@@ -7,9 +7,10 @@
 //! case-insensitive string compare. A custom name (`x-request-id` and friends)
 //! still costs an ASCII-insensitive compare per stored header, but no
 //! allocation: by-name lookups resolve the needle borrowed rather than
-//! materializing a `HeaderId::Other` per call. Values are [`Bytes`], so once
-//! Plan 4 wires the serve path through `armature-h1` they become slices of the
-//! connection read buffer rather than copies.
+//! materializing a `HeaderId::Other` per call. Values are [`Bytes`], and under
+//! the default `h1-backend` feature they are slices of the connection's read
+//! buffer rather than copies — see [`insert_id`](HeaderMap::insert_id), which
+//! is the serve path's entry point.
 //!
 //! ## Case normalization
 //!
@@ -310,6 +311,34 @@ impl HeaderMap {
         }
         self.inner.push(Header { id, value });
         None
+    }
+
+    /// Insert a header whose name is already interned.
+    ///
+    /// The serve path's entry point. `armature-h1` parses field names straight
+    /// into [`HeaderId`], so re-deriving one here via [`insert`](Self::insert)
+    /// would lowercase and re-intern a name that is already in its final form —
+    /// an allocation per unknown header, per request, to arrive back where the
+    /// parser started.
+    ///
+    /// Replaces an existing header with the same name, like `insert`, and
+    /// returns the value it replaced.
+    #[inline]
+    pub fn insert_id(&mut self, id: HeaderId, value: Bytes) -> Option<Bytes> {
+        if let Some(existing) = self.inner.iter_mut().find(|h| h.id == id) {
+            return Some(std::mem::replace(&mut existing.value, value));
+        }
+        self.inner.push(Header { id, value });
+        None
+    }
+
+    /// Append a header whose name is already interned, allowing duplicates.
+    ///
+    /// The repeating-field counterpart to [`insert_id`](Self::insert_id); see
+    /// there for why the pre-interned name matters.
+    #[inline]
+    pub fn append_id(&mut self, id: HeaderId, value: Bytes) {
+        self.inner.push(Header { id, value });
     }
 
     /// Append a header, allowing duplicates.

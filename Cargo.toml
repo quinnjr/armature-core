@@ -1,26 +1,26 @@
 [package]
 name = "armature-core"
 version = "0.8.2"
-edition.workspace = true
-rust-version.workspace = true
+edition = "2024"
+rust-version = "1.94.1"
 autobenches = false  # Disable auto-discovery, use explicit [[bench]] only
-authors.workspace = true
-license.workspace = true
+authors = ["Joseph Quinn <quinn.josephr@proton.me>"]
+license = "Apache-2.0"
 repository = "https://github.com/quinnjr/armature-core"
-homepage.workspace = true
+homepage = "https://quinnjr.github.io/armature"
 description = "High-performance async HTTP framework core - routing, handlers, middleware"
 keywords = ["http", "async", "web", "framework"]
 categories = ["web-programming::http-server", "asynchronous"]
 
 [dependencies]
-armature-log = { path = "../armature-log", version = "0" }
+armature-log = { version = "0" }
 inventory = "0.3"
 dependency-injector = "2.1.0"
 matchit = "0.9"  # High-performance router (same as Axum)
 # The HTTP/1.1 layer. armature-core adopts its Bytes-backed types (Method,
 # ByteStr, HeaderId) as canonical rather than defining a parallel set; the
 # serve-path swap onto it is Plan 4, not this one.
-armature-h1 = { path = "../armature-h1", version = "0.1" }
+armature-h1 = { version = "0.1" }
 tokio = { version = "1.52", features = ["rt", "rt-multi-thread", "macros", "sync", "time", "net", "io-util", "fs", "signal"] }
 hyper = { version = "1.10", features = ["full"] }
 hyper-util = { version = "0.1", features = ["server", "http1", "http2", "tokio"] }

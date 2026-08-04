@@ -9,6 +9,7 @@ use bytes::Bytes;
 use serde::{Deserialize, Serialize};
 use smallvec::SmallVec;
 use std::collections::HashMap;
+use std::net::{IpAddr, SocketAddr};
 use std::sync::{Arc, OnceLock};
 
 /// Route parameters captured from the request target.
@@ -100,6 +101,29 @@ pub struct HttpRequest {
     /// Use this to pass typed data to handlers without DI container lookups.
     /// Access via the `State<T>` extractor for zero-cost state retrieval.
     pub extensions: Extensions,
+    /// The address of the socket this request arrived on, when the serve path
+    /// knows it.
+    ///
+    /// This is the only client identifier a handler can trust. Every address in
+    /// a header — `X-Forwarded-For`, `X-Real-IP`, `Forwarded` — is set by the
+    /// caller, so an application that rate-limits, deduplicates, or logs by
+    /// "client address" without this field is keyed on a value the client
+    /// chooses.
+    ///
+    /// Behind a proxy the peer is the proxy, so this is usually the input to a
+    /// decision rather than the answer. [`HttpRequest::client_address`] makes
+    /// that decision; prefer it over reading this field and a header directly,
+    /// because the direction the forwarded chain grows in is easy to get
+    /// backwards.
+    ///
+    /// `None` means the address is genuinely unknown, not `0.0.0.0`: a request
+    /// built by hand, by [`HttpRequest::new`], by a test, or by a transport that
+    /// has no socket. Callers must handle it rather than be handed a plausible
+    /// lie — an unwrap-shaped default is how a fabricated address ends up in an
+    /// audit log.
+    ///
+    /// Populated by the HTTP/1.1, HTTP/2 and HTTP/3 serve paths.
+    pub peer: Option<SocketAddr>,
     /// Parsed lazily by [`HttpRequest::query`].
     query_cache: QueryCache,
 }
@@ -118,8 +142,92 @@ impl HttpRequest {
             body: Bytes::new(),
             path_params: RouteParams::new(),
             extensions: Extensions::new(),
+            peer: None,
             query_cache: QueryCache::default(),
         }
+    }
+
+    /// Set the socket peer address.
+    ///
+    /// Serve paths call this; handlers read [`HttpRequest::peer`]. Taking
+    /// `Option` rather than `SocketAddr` so a transport that only sometimes
+    /// knows the address does not have to branch at the call site.
+    #[inline]
+    pub fn with_peer(mut self, peer: Option<SocketAddr>) -> Self {
+        self.peer = peer;
+        self
+    }
+
+    /// The client address to attribute this request to, given how many reverse
+    /// proxies sit in front of the process.
+    ///
+    /// `X-Forwarded-For` is a comma-separated list `client, proxy1, proxy2, …`
+    /// that each proxy **appends** to. So the rightmost hops are the ones your
+    /// own infrastructure added and the only ones worth believing; everything to
+    /// the left of them is whatever the client sent, including entries it
+    /// invented. The client is therefore selected `depth`-from-the-right
+    /// (1-indexed): with one trusted proxy, the rightmost hop is the address
+    /// that proxy actually observed.
+    ///
+    /// Taking the *leftmost* entry instead — the obvious reading of "the first
+    /// one is the client" — is a spoof: a caller sends
+    /// `X-Forwarded-For: 198.51.100.9`, the real proxy appends the true address,
+    /// and the leftmost entry is the fabricated one. That defeats rate limiting
+    /// (rotate it per request for a fresh bucket) and abuse attribution (name a
+    /// victim and let them absorb it).
+    ///
+    /// `trusted_proxy_depth` of `0` means no proxy is trusted, so the header is
+    /// ignored entirely and the socket peer is used. That is the correct default
+    /// for a process reachable directly.
+    ///
+    /// Returns `None` when the address is genuinely unknown: no peer and no
+    /// usable header, or a `depth` deeper than the chain actually present, which
+    /// means the deployment does not match the configuration and no entry in the
+    /// list can be trusted. Callers must handle it rather than be handed a
+    /// plausible lie.
+    ///
+    /// Mirrors `forwarded_ip_at_depth` in `armature-ratelimit`, which needs the
+    /// same rule; this is the shared implementation now that the peer is
+    /// available here.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use armature_core::HttpRequest;
+    /// use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+    ///
+    /// let proxy = SocketAddr::from(([10, 0, 0, 1], 5555));
+    /// let mut req = HttpRequest::new("GET", "/").with_peer(Some(proxy));
+    /// // A client that tried to pass itself off as 198.51.100.9; the real proxy
+    /// // appended what it actually saw.
+    /// req.headers.insert("X-Forwarded-For", "198.51.100.9, 203.0.113.7");
+    ///
+    /// // One trusted proxy: the rightmost hop is what it observed.
+    /// assert_eq!(
+    ///     req.client_address(1),
+    ///     Some(IpAddr::V4(Ipv4Addr::new(203, 0, 113, 7)))
+    /// );
+    ///
+    /// // No proxy trusted: the header is ignored and the socket wins.
+    /// assert_eq!(req.client_address(0), Some(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1))));
+    /// ```
+    pub fn client_address(&self, trusted_proxy_depth: usize) -> Option<IpAddr> {
+        if trusted_proxy_depth == 0 {
+            return self.peer.map(|peer| peer.ip());
+        }
+
+        let forwarded = self.headers.get("X-Forwarded-For")?;
+        let hops: Vec<&str> = forwarded
+            .split(',')
+            .map(str::trim)
+            .filter(|hop| !hop.is_empty())
+            .collect();
+
+        // Counting from the right. A depth deeper than the chain present means
+        // the request did not traverse the proxies it was configured to, so
+        // there is no entry here anyone put there on purpose.
+        let index = hops.len().checked_sub(trusted_proxy_depth)?;
+        hops.get(index)?.parse().ok()
     }
 
     /// Create a new request with pre-allocated extensions capacity.
@@ -136,6 +244,7 @@ impl HttpRequest {
             body: Bytes::new(),
             path_params: RouteParams::new(),
             extensions: Extensions::with_capacity(capacity),
+            peer: None,
             query_cache: QueryCache::default(),
         }
     }
@@ -157,6 +266,7 @@ impl HttpRequest {
             body,
             path_params: RouteParams::new(),
             extensions: Extensions::new(),
+            peer: None,
             query_cache: QueryCache::default(),
         }
     }
@@ -258,6 +368,9 @@ impl HttpRequest {
             body: Bytes::from(body),
             path_params,
             extensions: Extensions::new(),
+            // This constructor builds a request from parts a caller supplies,
+            // so there is no socket to name. `with_peer` sets one.
+            peer: None,
             query_cache: QueryCache::default(),
         }
     }
@@ -1039,6 +1152,120 @@ impl<T: Serialize> Json<T> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `10.0.0.1:5555` — stands in for a reverse proxy.
+    fn proxy() -> SocketAddr {
+        SocketAddr::from(([10, 0, 0, 1], 5555))
+    }
+
+    #[test]
+    fn a_hand_built_request_has_no_peer() {
+        // `None` rather than an unspecified address: a caller must be able to
+        // tell "nobody told me" from "the client is 0.0.0.0".
+        assert_eq!(HttpRequest::new("GET", "/").peer, None);
+        assert_eq!(
+            HttpRequest::with_extensions_capacity("GET", "/", 4).peer,
+            None
+        );
+    }
+
+    #[test]
+    fn with_peer_survives_a_clone() {
+        // Requests are cloned freely on the serve path; an attribution that
+        // silently reset would be worse than none.
+        let req = HttpRequest::new("GET", "/").with_peer(Some(proxy()));
+        assert_eq!(req.clone().peer, Some(proxy()));
+    }
+
+    fn ip(s: &str) -> Option<IpAddr> {
+        Some(s.parse().unwrap())
+    }
+
+    #[test]
+    fn a_prepended_forwarded_entry_cannot_impersonate_the_client() {
+        // The attack the depth-from-the-right rule exists to stop: the caller
+        // sent the first entry itself, and the real proxy appended the second.
+        // Reading left-to-right would return the fabrication.
+        let mut req = HttpRequest::new("GET", "/").with_peer(Some(proxy()));
+        req.headers
+            .insert("X-Forwarded-For", "198.51.100.9, 203.0.113.7");
+
+        assert_eq!(req.client_address(1), ip("203.0.113.7"));
+    }
+
+    #[test]
+    fn depth_counts_proxies_from_the_right() {
+        let mut req = HttpRequest::new("GET", "/").with_peer(Some(proxy()));
+        req.headers.insert(
+            "X-Forwarded-For",
+            "198.51.100.9, 203.0.113.7, 192.0.2.4, 192.0.2.5",
+        );
+
+        assert_eq!(req.client_address(1), ip("192.0.2.5"));
+        assert_eq!(req.client_address(2), ip("192.0.2.4"));
+        assert_eq!(req.client_address(3), ip("203.0.113.7"));
+    }
+
+    #[test]
+    fn depth_zero_ignores_the_header_entirely() {
+        // A process reachable directly. Anything in the header is the caller's
+        // invention, so the socket is the only answer.
+        let mut req = HttpRequest::new("GET", "/").with_peer(Some(proxy()));
+        req.headers.insert("X-Forwarded-For", "198.51.100.9");
+
+        assert_eq!(req.client_address(0), ip("10.0.0.1"));
+    }
+
+    #[test]
+    fn a_depth_deeper_than_the_chain_trusts_nothing() {
+        // Configured for two proxies, one hop present: the request did not come
+        // the way the deployment says it does. Every entry is then suspect, and
+        // falling back to the peer would attribute every client to the proxy.
+        let mut req = HttpRequest::new("GET", "/").with_peer(Some(proxy()));
+        req.headers.insert("X-Forwarded-For", "198.51.100.9");
+
+        assert_eq!(req.client_address(2), None);
+    }
+
+    #[test]
+    fn a_missing_or_empty_header_at_depth_is_unknown() {
+        for value in ["", "   ", " , "] {
+            let mut req = HttpRequest::new("GET", "/").with_peer(Some(proxy()));
+            req.headers.insert("X-Forwarded-For", value);
+
+            assert_eq!(
+                req.client_address(1),
+                None,
+                "{value:?} names no hop, so there is nothing to attribute to"
+            );
+        }
+
+        let bare = HttpRequest::new("GET", "/").with_peer(Some(proxy()));
+        assert_eq!(bare.client_address(1), None);
+    }
+
+    #[test]
+    fn a_hop_that_is_not_an_address_is_unknown_rather_than_guessed() {
+        let mut req = HttpRequest::new("GET", "/").with_peer(Some(proxy()));
+        req.headers.insert("X-Forwarded-For", "not-an-address");
+
+        assert_eq!(req.client_address(1), None);
+    }
+
+    #[test]
+    fn nothing_to_go_on_is_none_rather_than_a_placeholder() {
+        assert_eq!(HttpRequest::new("GET", "/").client_address(0), None);
+    }
+
+    #[test]
+    fn an_ipv6_peer_survives_the_round_trip() {
+        let req = HttpRequest::new("GET", "/").with_peer(Some(SocketAddr::from((
+            [0x2001, 0xdb8, 0, 0, 0, 0, 0, 1],
+            443,
+        ))));
+
+        assert_eq!(req.client_address(0), ip("2001:db8::1"));
+    }
 
     #[test]
     fn new_accepts_str_and_string_and_method() {

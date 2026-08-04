@@ -110,6 +110,24 @@ struct ServeState {
     /// `None` preserves the original behavior: errors go straight to
     /// [`Error::to_client_response`] via [`error_response`].
     filter_chain: Option<Arc<ExceptionFilterChain>>,
+    /// The peer of the connection this state is serving, stamped onto every
+    /// request that arrives on it (see [`HttpRequest::peer`]).
+    ///
+    /// Carried here rather than passed to `handle_request` because the state is
+    /// already cloned once per connection, which is exactly the scope a peer
+    /// address has: it is a property of the connection, not of the request.
+    /// `None` on a path that does not know the address.
+    peer: Option<SocketAddr>,
+}
+
+impl ServeState {
+    /// The same state, serving one connection whose peer is known.
+    fn for_peer(&self, peer: SocketAddr) -> Self {
+        Self {
+            peer: Some(peer),
+            ..self.clone()
+        }
+    }
 }
 
 /// CORS configuration for the application.
@@ -306,6 +324,8 @@ impl Application {
             guards: self.guards.clone().into(),
             max_body_size: self.max_body_size,
             filter_chain: self.filter_chain.clone().map(Arc::new),
+            // Set per connection by the accept loops; this is the template.
+            peer: None,
         }
     }
 
@@ -887,7 +907,7 @@ impl Application {
             }
 
             let io = TokioIo::new(stream);
-            let state = state.clone();
+            let state = state.for_peer(client_addr);
             let http_builder = pipeline_builder.configure_hyper_builder();
             let stats = Arc::clone(&pipeline_stats);
 
@@ -984,7 +1004,7 @@ impl Application {
             }
 
             let acceptor = acceptor.clone();
-            let state = state.clone();
+            let state = state.for_peer(client_addr);
             let http_builder = pipeline_builder.configure_hyper_builder();
             let stats = Arc::clone(&pipeline_stats);
 
@@ -1085,7 +1105,8 @@ impl Application {
         let acceptor = TlsAcceptor::from(config.tls.server_config);
 
         loop {
-            let (stream, _) = listener.accept().await?;
+            let (stream, client_addr) = listener.accept().await?;
+            trace!(client_address = %client_addr, "TLS connection accepted");
 
             // Apply opt-in socket tuning to the accepted socket
             #[cfg(unix)]
@@ -1095,7 +1116,7 @@ impl Application {
             }
 
             let acceptor = acceptor.clone();
-            let state = state.clone();
+            let state = state.for_peer(client_addr);
 
             tokio::spawn(async move {
                 match acceptor.accept(stream).await {
@@ -1174,7 +1195,7 @@ impl Application {
             }
 
             let io = TokioIo::new(stream);
-            let state = state.clone();
+            let state = state.for_peer(client_addr);
             let http_builder = h2_builder.configure_hyper_builder();
             let stats = Arc::clone(&h2_stats);
 
@@ -1264,7 +1285,7 @@ impl Application {
             }
 
             let acceptor = acceptor.clone();
-            let state = state.clone();
+            let state = state.for_peer(client_addr);
             let h1_builder_ref = h1_builder.configure_hyper_builder();
             let h2_builder_ref = h2_builder.configure_hyper_builder();
             let h1_stats = Arc::clone(&h1_stats);
@@ -1536,7 +1557,7 @@ async fn handle_request(
         .path_and_query()
         .map_or_else(|| req.uri().path().to_owned(), |pq| pq.as_str().to_owned());
 
-    let mut armature_req = HttpRequest::new(method.clone(), target);
+    let mut armature_req = HttpRequest::new(method.clone(), target).with_peer(state.peer);
 
     // Guards and routing each consume `armature_req` by value, so the target
     // has to be kept separately for logging and guard-scope prefix matching.
@@ -2821,6 +2842,7 @@ mod tests {
             .into(),
             max_body_size: DEFAULT_MAX_BODY_SIZE,
             filter_chain: Some(filter_chain),
+            peer: None,
         };
 
         let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
@@ -2907,6 +2929,7 @@ mod tests {
             guards: Vec::new().into(),
             max_body_size: DEFAULT_MAX_BODY_SIZE,
             filter_chain: Some(filter_chain),
+            peer: None,
         };
 
         let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();

@@ -1204,6 +1204,7 @@ fn to_hyper_response(resp: HttpResponse) -> hyper::Response<http_body_util::Full
 async fn handle_micro_request(
     req: hyper::Request<hyper::body::Incoming>,
     app: Arc<BuiltApp>,
+    peer: Option<std::net::SocketAddr>,
 ) -> Result<hyper::Response<http_body_util::Full<bytes::Bytes>>, std::convert::Infallible> {
     use http_body_util::{BodyExt, Limited};
 
@@ -1217,7 +1218,7 @@ async fn handle_micro_request(
         .map(|pq| pq.to_string())
         .unwrap_or_else(|| "/".to_string());
 
-    let mut http_req = HttpRequest::new(method.clone(), path.clone());
+    let mut http_req = HttpRequest::new(method.clone(), path.clone()).with_peer(peer);
 
     // Copy headers. One copy per value, because hyper's `HeaderValue` owns its
     // own buffer and cannot be projected into our `Bytes`; the name goes in as
@@ -1309,13 +1310,13 @@ async fn serve(listener: tokio::net::TcpListener, app: Arc<BuiltApp>) -> std::io
     use hyper_util::rt::TokioIo;
 
     loop {
-        let (stream, _) = listener.accept().await?;
+        let (stream, client_addr) = listener.accept().await?;
         let io = TokioIo::new(stream);
         let app = app.clone();
 
         tokio::spawn(async move {
             let service = service_fn(move |req: hyper::Request<hyper::body::Incoming>| {
-                handle_micro_request(req, app.clone())
+                handle_micro_request(req, app.clone(), Some(client_addr))
             });
 
             if let Err(err) = http1::Builder::new().serve_connection(io, service).await {

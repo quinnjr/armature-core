@@ -601,9 +601,17 @@ mod server {
                     let stats = Arc::clone(&stats);
 
                     tokio::spawn(async move {
-                        if let Err(e) =
-                            handle_request_resolver(resolver, router, stats, max_request_body_size)
-                                .await
+                        if let Err(e) = handle_request_resolver(
+                            resolver,
+                            router,
+                            stats,
+                            max_request_body_size,
+                            // Known here and nowhere downstream: QUIC gives
+                            // the address on the connection, and a stream
+                            // has no notion of one.
+                            Some(remote_addr),
+                        )
+                        .await
                         {
                             error!(error = %e, "HTTP/3 request error");
                         }
@@ -633,7 +641,10 @@ mod server {
     ///
     /// Split out from [`handle_request_resolver`] so the conversion is
     /// unit-testable without a live QUIC connection.
-    pub(super) fn build_armature_request(request: &http::Request<()>) -> HttpRequest {
+    pub(super) fn build_armature_request(
+        request: &http::Request<()>,
+        peer: Option<SocketAddr>,
+    ) -> HttpRequest {
         // `Method::from` matches the token against the well-known set, so the
         // common case is a unit variant rather than a per-request `String`.
         let method = crate::Method::from(request.method().as_str());
@@ -645,7 +656,7 @@ mod server {
             Some(q) => format!("{}?{}", request.uri().path(), q),
             None => request.uri().path().to_string(),
         };
-        let mut armature_req = HttpRequest::new(method, target);
+        let mut armature_req = HttpRequest::new(method, target).with_peer(peer);
 
         // Copy headers. One copy per value, because `HeaderValue` owns its own
         // buffer; the name goes in as a `&str`, so a well-known header name
@@ -665,6 +676,7 @@ mod server {
         router: Arc<OptimizedRouter>,
         stats: Arc<Http3Stats>,
         max_request_body_size: usize,
+        peer: Option<SocketAddr>,
     ) -> Result<(), Error> {
         // Resolve the request to get the request and stream
         let (request, mut stream) = resolver
@@ -676,7 +688,7 @@ mod server {
 
         // Convert to Armature request, including percent-decoded query
         // parameters (see `build_armature_request`).
-        let mut armature_req = build_armature_request(&request);
+        let mut armature_req = build_armature_request(&request, peer);
 
         // Read body if present (using Buf trait), enforcing the configured size limit
         let mut body: Vec<u8> = Vec::new();
@@ -958,7 +970,7 @@ mod tests {
             .body(())
             .unwrap();
 
-        let armature_req = super::server::build_armature_request(&request);
+        let armature_req = super::server::build_armature_request(&request, None);
 
         assert_eq!(armature_req.method, "GET");
         assert_eq!(armature_req.path_only(), "/search");
@@ -976,7 +988,7 @@ mod tests {
             .body(())
             .unwrap();
 
-        let armature_req = super::server::build_armature_request(&request);
+        let armature_req = super::server::build_armature_request(&request, None);
 
         assert!(armature_req.query().is_empty());
         assert_eq!(armature_req.query_string(), None);
@@ -997,7 +1009,7 @@ mod tests {
 
         assert_eq!(request.uri().query(), Some(""));
 
-        let armature_req = super::server::build_armature_request(&request);
+        let armature_req = super::server::build_armature_request(&request, None);
 
         assert_eq!(armature_req.path_only(), "/search");
         assert!(armature_req.query().is_empty());
@@ -1015,7 +1027,7 @@ mod tests {
             .body(())
             .unwrap();
 
-        let armature_req = super::server::build_armature_request(&request);
+        let armature_req = super::server::build_armature_request(&request, None);
 
         assert_eq!(armature_req.query().len(), 2);
         assert_eq!(armature_req.query_param("a"), Some("1"));

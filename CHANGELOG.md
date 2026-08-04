@@ -10,7 +10,51 @@ Changes at or before `0.6.0` are recorded in the workspace
 
 ## [Unreleased]
 
+## [0.8.5] - 2026-08-04
+
 ### Added
+
+- `HttpRequest::peer: Option<SocketAddr>` — the address of the socket a request
+  arrived on. This is the only client identifier a handler can trust: every
+  address in a header (`X-Forwarded-For`, `X-Real-IP`, `Forwarded`) is set by the
+  caller, so anything that rate-limits, deduplicates, or logs by "client address"
+  without it is keyed on a value the client chooses. `None` means genuinely
+  unknown rather than a plausible-looking `0.0.0.0`, so a fabricated address
+  cannot reach an audit log through an unwrap-shaped default.
+
+  Populated by every serve path: HTTP/1.1, HTTPS, HTTP/2 and the ALPN-multiplexed
+  listener carry it on the per-connection `ServeState`; HTTP/3 takes it from the
+  QUIC connection's `remote_address()`; `micro` takes it from its accept loop.
+  Two accept loops previously discarded the address outright.
+
+  Additive, and not a breaking change: `HttpRequest` has a private field, so it
+  was never constructible outside this crate by struct literal.
+
+- `HttpRequest::with_peer` and `HttpRequest::client_address(trusted_proxy_depth)`.
+  The latter answers "which address do I attribute this request to", given how
+  many reverse proxies sit in front of the process, and exists so applications
+  stop reimplementing the rule — which is easy to state and easy to get exactly
+  backwards.
+
+  `X-Forwarded-For` is *appended* to by each proxy, so the rightmost hops are the
+  ones your own infrastructure added and the only ones worth believing. The
+  client is selected `depth`-from-the-right (1-indexed). Taking the leftmost
+  entry — the obvious reading of "the first one is the client" — is a spoof: a
+  caller sends `X-Forwarded-For: 198.51.100.9`, the real proxy appends what it
+  actually saw, and the leftmost entry is the fabrication. That defeats rate
+  limiting (rotate it per request for a fresh bucket) and abuse attribution (name
+  a victim and let them absorb it).
+
+  A `depth` of `0` trusts no proxy, ignores the header, and uses the socket peer;
+  that is the right default for a directly reachable process. A `depth` deeper
+  than the chain actually present returns `None` rather than falling back to the
+  peer, because the request did not traverse the proxies the deployment is
+  configured for, and attributing it to the proxy would collapse every client
+  into one bucket.
+
+  This matches `forwarded_ip_at_depth` in `armature-ratelimit`, whose
+  implementation of the same rule previously had to note that this crate exposed
+  no peer to fall back to.
 
 - Adopted the framework's criterion benchmarks that measure this crate: `core`, `arena`, `body`, `json`, `micro`, `pipeline`, `resilience`, `simd_parser` and `internal_overhead` moved here from the root package's `benches/`. Run them with `cargo bench -p armature-core --bench <name>`. The crate now sets `autobenches = false`, so a new file under `benches/` needs an explicit `[[bench]]` entry. `criterion` also gains the `async_tokio` feature: `internal_overhead`, `micro` and `resilience` drive async work through `Bencher::to_async`, which is feature-gated, so without it these benches do not compile outside the workspace.
 

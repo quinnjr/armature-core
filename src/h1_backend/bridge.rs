@@ -16,6 +16,7 @@
 use crate::http::{HttpRequest, HttpResponse};
 use armature_h1::{HeaderId, Response as H1Response, ResponseBody, header as header_id};
 use bytes::Bytes;
+use std::collections::HashMap;
 
 /// Build an [`HttpRequest`] from a parsed `armature-h1` head.
 ///
@@ -40,8 +41,10 @@ pub(crate) fn request_from_head(
     //
     // `append_id` rather than `insert_id` to preserve a repeated field's
     // occurrences, which the wire allows and which `insert` would collapse to
-    // the last one. `HeaderMap::get` returns the first match, so single-valued
-    // lookups are unaffected.
+    // the last one. `HeaderMap::get` then returns the *first* occurrence, so any
+    // reader of a field that may legitimately repeat has to ask for all of them
+    // — see `HttpRequest::client_address`, where taking the first line of a
+    // two-line `X-Forwarded-For` would return the client's own entry.
     for (id, value) in head.headers {
         req.headers.append_id(id, value);
     }
@@ -58,37 +61,54 @@ pub(crate) fn to_h1_response(
     response: HttpResponse,
     cors: Option<&crate::CorsConfig>,
 ) -> H1Response {
-    let status = response.status;
+    // Destructured rather than read through `&response`, so each header value's
+    // `String` buffer becomes the `Bytes` instead of being copied into a fresh
+    // one — `response` is consumed a few lines further down anyway, so the
+    // borrow was buying nothing.
+    let HttpResponse {
+        status,
+        headers,
+        cookies,
+        body,
+    } = response;
     let mut out = H1Response::new(status);
 
-    for (key, value) in &response.headers {
-        out = out.header(header_id::intern(key), Bytes::from(value.clone()));
+    // Pushed in place rather than through `Response::header`, which takes and
+    // returns `self` by value: `Response` embeds a `SmallVec<[(HeaderId,
+    // Bytes); 16]>`, so a builder chain moves about a kilobyte of inline
+    // storage per field for no gain in a loop that already owns the response.
+    for (key, value) in HashMap::from(headers) {
+        out.headers
+            .push((header_id::intern(&key), Bytes::from(value)));
     }
     // `Set-Cookie` is the canonical repeating field: a response setting two
-    // cookies must emit two fields, so this appends rather than replacing.
-    for cookie in &response.cookies {
-        out.headers
-            .push((HeaderId::SetCookie, Bytes::from(cookie.clone())));
+    // cookies must emit two fields rather than one comma-joined one. Nothing on
+    // this side collapses duplicates — `Response::header` appends too, so the
+    // loop above preserves a repeated field exactly as this one does — the two
+    // loops differ only in where their values come from.
+    for cookie in cookies {
+        out.headers.push((HeaderId::SetCookie, Bytes::from(cookie)));
     }
     if let Some(cors) = cors {
-        out = out.header(
+        out.headers.push((
             header_id::intern("access-control-allow-origin"),
             Bytes::from(cors.allow_origin.clone()),
-        );
+        ));
         if cors.allow_credentials {
-            out = out.header(
+            out.headers.push((
                 header_id::intern("access-control-allow-credentials"),
                 Bytes::from_static(b"true"),
-            );
+            ));
         }
     }
 
-    let body = response.into_body_bytes();
     if body.is_empty() {
-        // Distinct from `Full(empty)`: the writer frames `Empty` without a
-        // `Content-Length: 0` on responses that must not carry one (204, 304),
-        // which is the difference between a valid response and one a strict
-        // proxy rejects.
+        // Wire-identical to `Full(empty)`, not a correctness fix: `write_head`
+        // gates framing on the status rather than on the variant, so a 204 or
+        // 304 gets no `Content-Length` either way and a 200 gets
+        // `content-length: 0` either way. The variant is chosen to say what is
+        // meant — there is no body — where `Full` would claim a body that
+        // happens to be zero bytes long.
         out.with_body(ResponseBody::Empty)
     } else {
         out.with_body(ResponseBody::Full(body))
@@ -164,13 +184,13 @@ mod tests {
     }
 
     #[test]
-    fn an_empty_body_is_framed_as_empty_not_as_a_zero_length_full() {
+    fn an_empty_body_is_named_empty_rather_than_a_zero_length_full() {
         let out = to_h1_response(HttpResponse::new(204), None);
         assert_eq!(out.status, 204);
         assert!(
             matches!(out.body, ResponseBody::Empty),
-            "an empty body must not become Full(0), which would frame a \
-             Content-Length onto a 204"
+            "an absent body must be spelled Empty, not Full(0) — the wire is \
+             the same either way, so the variant is what carries the intent"
         );
     }
 

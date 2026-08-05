@@ -9,7 +9,7 @@
 //! allocation: by-name lookups resolve the needle borrowed rather than
 //! materializing a `HeaderId::Other` per call. Values are [`Bytes`], and under
 //! the default `h1-backend` feature they are slices of the connection's read
-//! buffer rather than copies — see [`insert_id`](HeaderMap::insert_id), which
+//! buffer rather than copies — see [`append_id`](HeaderMap::append_id), which
 //! is the serve path's entry point.
 //!
 //! ## Case normalization
@@ -315,14 +315,35 @@ impl HeaderMap {
 
     /// Insert a header whose name is already interned.
     ///
-    /// The serve path's entry point. `armature-h1` parses field names straight
-    /// into [`HeaderId`], so re-deriving one here via [`insert`](Self::insert)
-    /// would lowercase and re-intern a name that is already in its final form —
-    /// an allocation per unknown header, per request, to arrive back where the
+    /// The pre-interned counterpart to [`insert`](Self::insert): `armature-h1`
+    /// parses field names straight into [`HeaderId`], so re-deriving one here
+    /// would lowercase and re-intern a name already in its final form — an
+    /// allocation per unknown header, per request, to arrive back where the
     /// parser started.
     ///
     /// Replaces an existing header with the same name, like `insert`, and
-    /// returns the value it replaced.
+    /// returns the value it replaced. The serve path uses
+    /// [`append_id`](Self::append_id) rather than this, because a field the wire
+    /// repeated must not collapse to its last occurrence.
+    ///
+    /// ```
+    /// use armature_core::headers::HeaderMap;
+    /// use armature_core::{HeaderId, header_id};
+    /// use bytes::Bytes;
+    ///
+    /// let mut headers = HeaderMap::new();
+    /// assert_eq!(headers.insert_id(HeaderId::Accept, Bytes::from_static(b"a")), None);
+    /// // The second insert replaces, handing back what it displaced.
+    /// let replaced = headers.insert_id(HeaderId::Accept, Bytes::from_static(b"b"));
+    /// assert_eq!(replaced.as_deref(), Some(&b"a"[..]));
+    /// assert_eq!(headers.get("accept"), Some("b"));
+    /// assert_eq!(headers.len(), 1);
+    ///
+    /// // A name outside the well-known table interns to the same value the
+    /// // parser produces, so it is found by name afterwards.
+    /// headers.insert_id(header_id::intern("x-trace-id"), Bytes::from_static(b"t"));
+    /// assert_eq!(headers.get("X-Trace-Id"), Some("t"));
+    /// ```
     #[inline]
     pub fn insert_id(&mut self, id: HeaderId, value: Bytes) -> Option<Bytes> {
         if let Some(existing) = self.inner.iter_mut().find(|h| h.id == id) {
@@ -334,8 +355,27 @@ impl HeaderMap {
 
     /// Append a header whose name is already interned, allowing duplicates.
     ///
-    /// The repeating-field counterpart to [`insert_id`](Self::insert_id); see
-    /// there for why the pre-interned name matters.
+    /// The serve path's entry point, and the repeating-field counterpart to
+    /// [`insert_id`](Self::insert_id); see there for why the pre-interned name
+    /// matters. Appending rather than replacing is what keeps a field the wire
+    /// sent twice from collapsing to its last occurrence — which matters for
+    /// `X-Forwarded-For`, where the occurrences a proxy appended are the
+    /// trustworthy ones (see
+    /// [`HttpRequest::client_address`](crate::HttpRequest::client_address)).
+    ///
+    /// ```
+    /// use armature_core::headers::HeaderMap;
+    /// use armature_core::HeaderId;
+    /// use bytes::Bytes;
+    ///
+    /// let mut headers = HeaderMap::new();
+    /// headers.append_id(HeaderId::Accept, Bytes::from_static(b"text/html"));
+    /// headers.append_id(HeaderId::Accept, Bytes::from_static(b"text/plain"));
+    ///
+    /// // Both occurrences are kept; a single-valued lookup sees the first.
+    /// assert_eq!(headers.get_all("accept").len(), 2);
+    /// assert_eq!(headers.get("accept"), Some("text/html"));
+    /// ```
     #[inline]
     pub fn append_id(&mut self, id: HeaderId, value: Bytes) {
         self.inner.push(Header { id, value });
@@ -787,6 +827,83 @@ mod tests {
 
         let pairs: Vec<_> = headers.iter().collect();
         assert_eq!(pairs.len(), 2);
+    }
+
+    /// The zero-copy serve path hands `HeaderMap` a [`HeaderId`] produced by a
+    /// *different crate* — `armature-h1`'s parser — and never re-interns it. If
+    /// that id were not byte-identical to what `header_id::intern` produces for
+    /// the same name, every by-name lookup of a custom header would silently
+    /// miss: `get` would return `None` for a header that is demonstrably
+    /// present, which is the kind of bug that looks like a client problem.
+    #[test]
+    fn a_parser_produced_id_equals_an_interned_one() {
+        use armature_h1::{Limits, parse_head};
+        use bytes::Bytes;
+
+        // Mixed case on the wire, since that is the case that forces the
+        // parser down its lowercasing path rather than a borrowed slice.
+        let raw = Bytes::from_static(b"GET / HTTP/1.1\r\nHost: a\r\nX-Trace-Id: abc\r\n\r\n");
+        let head = parse_head(&raw, &Limits::default())
+            .expect("parse")
+            .expect("complete")
+            .0;
+
+        let (parsed_id, value) = head
+            .headers
+            .iter()
+            .find(|(id, _)| id.as_str() == "x-trace-id")
+            .cloned()
+            .expect("the custom header is present in the parsed head");
+
+        assert_eq!(
+            parsed_id,
+            header_id::intern("x-trace-id"),
+            "a parser-produced id must equal an interned one, or the serve \
+             path's stored headers are unreachable by name"
+        );
+
+        let mut headers = HeaderMap::new();
+        headers.append_id(parsed_id, value);
+
+        // Found by the wire casing and by lowercase alike.
+        assert_eq!(headers.get("X-Trace-Id"), Some("abc"));
+        assert_eq!(headers.get("x-trace-id"), Some("abc"));
+
+        // And the case-normalization invariant this module documents holds for
+        // a name it never interned itself.
+        assert!(headers.iter().any(|(k, _)| k == "x-trace-id"));
+        assert!(headers.keys().any(|k| k == "x-trace-id"));
+        assert!(headers.to_hash_map().contains_key("x-trace-id"));
+    }
+
+    /// `insert_id` is the pre-interned `insert`, so it must behave as `insert`
+    /// does in the one place they could plausibly differ: what happens to an
+    /// existing field of the same name.
+    #[test]
+    fn insert_id_replaces_the_first_match_like_insert() {
+        use bytes::Bytes;
+
+        let mut by_id = HeaderMap::new();
+        assert_eq!(
+            by_id.insert_id(HeaderId::Accept, Bytes::from_static(b"first")),
+            None,
+            "the first insert replaces nothing"
+        );
+        let replaced = by_id.insert_id(HeaderId::Accept, Bytes::from_static(b"second"));
+        assert_eq!(replaced.as_deref(), Some(&b"first"[..]));
+        assert_eq!(by_id.len(), 1, "replacing must not grow the map");
+
+        let mut by_name = HeaderMap::new();
+        by_name.insert("Accept", "first");
+        let replaced_by_name = by_name.insert("Accept", "second");
+
+        assert_eq!(
+            replaced_by_name.as_deref(),
+            Some(&b"first"[..]),
+            "insert and insert_id must return the same displaced value"
+        );
+        assert_eq!(by_id.get("accept"), by_name.get("accept"));
+        assert_eq!(by_id.len(), by_name.len());
     }
 
     #[test]

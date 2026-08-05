@@ -177,6 +177,16 @@ impl HttpRequest {
     /// (rotate it per request for a fresh bucket) and abuse attribution (name a
     /// victim and let them absorb it).
     ///
+    /// Every `X-Forwarded-For` field line is joined, in order, before the list
+    /// is split. RFC 9110 §5.3 makes a field that appears twice identical to one
+    /// field carrying both values comma-joined, and proxies do emit the
+    /// two-line form — HAProxy's `option forwardfor` and several ingress
+    /// configurations add their own field line rather than extending the
+    /// client's. Reading only the first line there would return the line the
+    /// *client* wrote, which is the spoof above reached by a different route:
+    /// the entries your infrastructure added would be on the second line and
+    /// never looked at.
+    ///
     /// `trusted_proxy_depth` of `0` means no proxy is trusted, so the header is
     /// ignored entirely and the socket peer is used. That is the correct default
     /// for a process reachable directly.
@@ -217,9 +227,17 @@ impl HttpRequest {
             return self.peer.map(|peer| peer.ip());
         }
 
-        let forwarded = self.headers.get("X-Forwarded-For")?;
-        let hops: Vec<&str> = forwarded
-            .split(',')
+        // Across every field line, not just the first. A repeated field is one
+        // list (RFC 9110 §5.3), and a proxy that adds its own line instead of
+        // extending the client's puts the only entries worth believing on a
+        // line `get` would never reach. Splitting each line and chaining them is
+        // the same sequence joining them with commas would produce, without the
+        // intermediate `String`.
+        let hops: Vec<&str> = self
+            .headers
+            .get_all("X-Forwarded-For")
+            .into_iter()
+            .flat_map(|line| line.split(','))
             .map(str::trim)
             .filter(|hop| !hop.is_empty())
             .collect();
@@ -1205,6 +1223,52 @@ mod tests {
         assert_eq!(req.client_address(1), ip("192.0.2.5"));
         assert_eq!(req.client_address(2), ip("192.0.2.4"));
         assert_eq!(req.client_address(3), ip("203.0.113.7"));
+    }
+
+    #[test]
+    fn a_chain_split_across_two_field_lines_is_still_one_chain() {
+        // The h1 serve path appends repeated fields rather than collapsing them
+        // to the last, and a proxy that runs HAProxy's `option forwardfor` adds
+        // its own `X-Forwarded-For` line instead of extending the client's. Both
+        // lines are one list (RFC 9110 §5.3): reading only the first would hand
+        // back the entry the client invented.
+        let mut req = HttpRequest::new("GET", "/").with_peer(Some(proxy()));
+        req.headers.append("X-Forwarded-For", "198.51.100.9");
+        req.headers.append("X-Forwarded-For", "203.0.113.7");
+
+        assert_eq!(req.client_address(1), ip("203.0.113.7"));
+        assert_eq!(req.client_address(2), ip("198.51.100.9"));
+        // Two hops present, three configured: the deployment disagrees with
+        // itself and nothing here is trustworthy.
+        assert_eq!(req.client_address(3), None);
+    }
+
+    #[test]
+    fn the_joined_and_the_split_form_select_identically() {
+        // The other half of §5.3. The single-line form must keep behaving
+        // exactly as it always has, and the two forms must not disagree at any
+        // depth — otherwise attribution depends on how a proxy happened to
+        // write the field.
+        let mut one = HttpRequest::new("GET", "/").with_peer(Some(proxy()));
+        one.headers
+            .insert("X-Forwarded-For", "198.51.100.9, 203.0.113.7, 192.0.2.4");
+
+        let mut split = HttpRequest::new("GET", "/").with_peer(Some(proxy()));
+        split.headers.append("X-Forwarded-For", "198.51.100.9");
+        split
+            .headers
+            .append("X-Forwarded-For", "203.0.113.7, 192.0.2.4");
+
+        for depth in 0..=4 {
+            assert_eq!(
+                one.client_address(depth),
+                split.client_address(depth),
+                "the two spellings of one chain disagree at depth {depth}"
+            );
+        }
+        assert_eq!(one.client_address(1), ip("192.0.2.4"));
+        assert_eq!(one.client_address(2), ip("203.0.113.7"));
+        assert_eq!(one.client_address(3), ip("198.51.100.9"));
     }
 
     #[test]

@@ -127,6 +127,11 @@ pub struct PipelineConfig {
     ///
     /// **Wired**: forwarded to
     /// [`hyper::server::conn::http1::Builder::pipeline_flush`].
+    ///
+    /// Applies only on the hyper path. With the `h1-backend` feature on — the
+    /// default — HTTP/1.1 is served by `armature-h1`, which writes each
+    /// response as it is produced and has no batching knob to attach this to;
+    /// the field then reaches only the HTTP/2 connections hyper still serves.
     pub pipeline_flush: bool,
 
     /// Maximum number of pipelined requests to buffer.
@@ -137,11 +142,14 @@ pub struct PipelineConfig {
 
     /// Keep-alive timeout for idle connections.
     ///
-    /// **Not currently wired**: hyper's H1 builder only exposes
+    /// **Wired on the `h1-backend` path**, to `armature-h1`'s
+    /// `Limits::idle_timeout` — the deadline for the next request to begin on
+    /// an idle keep-alive connection, which is what this field always meant.
+    ///
+    /// Not wired on the hyper path: hyper's H1 builder only exposes
     /// `keep_alive(bool)` (used, hardcoded `true`) and a header-read timeout
     /// with different semantics that requires a [`hyper::rt::Timer`] this
-    /// crate does not currently supply. There is no direct idle-timeout
-    /// knob to wire this field into.
+    /// crate does not currently supply.
     pub keep_alive_timeout: Duration,
 
     /// Maximum requests per connection before forcing close.
@@ -163,6 +171,11 @@ pub struct PipelineConfig {
     ///
     /// **Wired**: forwarded to
     /// [`hyper::server::conn::http1::Builder::max_buf_size`].
+    ///
+    /// Applies only on the hyper path. With the `h1-backend` feature on — the
+    /// default — HTTP/1.1 is served by `armature-h1`, which grows its read
+    /// buffer from a fixed chunk size and takes no size hint; the field then
+    /// reaches only the HTTP/2 connections hyper still serves.
     pub read_buffer_size: usize,
 
     /// Write buffer size hint (bytes).
@@ -174,7 +187,11 @@ pub struct PipelineConfig {
 
     /// Maximum header size (bytes).
     ///
-    /// **Not currently wired**: hyper's H1 builder exposes
+    /// **Wired on the `h1-backend` path**, to `armature-h1`'s
+    /// `Limits::max_head_bytes` — a byte cap on the request line plus header
+    /// section, which is what this field always meant.
+    ///
+    /// Not wired on the hyper path: hyper's H1 builder exposes
     /// [`hyper::server::conn::http1::Builder::max_headers`], but that
     /// method limits a *count* of headers (default 100), not a byte size,
     /// so this field cannot be applied to it without changing its meaning.

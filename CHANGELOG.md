@@ -13,15 +13,20 @@ Changes at or before `0.6.0` are recorded in the workspace
 ### Added
 
 - `h1-backend` cargo feature, **on by default**: HTTP/1.1 is served by
-  `armature-h1` rather than `hyper::server::conn::http1`. HTTP/2 is unchanged —
-  hyper still serves it, reached through `armature-h1`'s `H2Fallback` hook when
-  a connection negotiates ALPN `h2`. HTTP/3 is untouched. Turn the feature off
+  `armature-h1` rather than `hyper::server::conn::http1`. HTTP/2 is still
+  hyper's, reached through `armature-h1`'s `H2Fallback` hook when a connection
+  negotiates ALPN `h2` — but see the HTTP/2 entries below, because it is not
+  wholly unchanged. HTTP/3 is untouched. Turn the feature off
   (`default-features = false`) to keep the previous hyper HTTP/1.1 path.
-- `HeaderMap::insert_id` and `HeaderMap::append_id`: insert a header whose name
-  is already interned. This is what makes the new serve path zero-copy —
-  `armature-h1` parses names straight into `HeaderId` and values into `Bytes`
-  slices of the connection's read buffer, so a head crosses into `HttpRequest`
-  as a sequence of moves rather than a copy per value and a re-intern per name.
+  Note that Cargo unifies features across a whole dependency graph, so
+  `default-features = false` is only reliable if *nothing* else in the build
+  enables this crate's defaults.
+- `HeaderMap::insert_id` and `HeaderMap::append_id`: insert or append a header
+  whose name is already interned. `append_id` is the serve path's entry point
+  and is what makes it zero-copy — `armature-h1` parses names straight into
+  `HeaderId` and values into `Bytes` slices of the connection's read buffer, so
+  a head crosses into `HttpRequest` as a sequence of moves rather than a copy
+  per value and a re-intern per name.
 
 ### Changed
 
@@ -46,6 +51,49 @@ Changes at or before `0.6.0` are recorded in the workspace
   every connection on its core, so a blocking handler stalls all of them. The
   hyper path's work-stealing runtime hid this; this one does not. Move
   genuinely blocking work to a shared pool.
+- Repeated header fields are preserved rather than collapsed. The hyper path
+  stored headers with `HeaderMap::insert`, which replaces, so a field the wire
+  sent twice survived only as its last occurrence; the serve path now appends,
+  and a single-valued lookup returns the first. See the `client_address` entry
+  under **Fixed** for why this mattered.
+- The per-request `trace!("Incoming request")` record now comes from the shared
+  dispatch path, so both backends emit it. It was previously written only by
+  the hyper adapter, which would have left HTTP/1.1 with no arrival record at
+  all — and none whatsoever for a request rejected at CORS preflight or the
+  body limit, which are decided before routing.
+
+### Fixed
+
+- **`with_cors` was silently ignored by every TLS listener.** `listen_https`,
+  `listen_https_h2`, `listen_with_config`, `listen_h2c` and `listen_dual_stack`
+  all built their serve state with no CORS configuration, so an HTTPS server
+  configured with `with_cors` sent no CORS headers at all. Only `listen_on`
+  honoured it. Every listener now does. **This changes behaviour for existing
+  HTTPS deployments**: CORS headers now appear on their responses, and because
+  the preflight handler answers *every* `OPTIONS` request with 204 before the
+  router is consulted, an `OPTIONS` route registered on an HTTPS listener stops
+  being reachable while CORS is configured. See `Application::with_cors`.
+- **HTTP/2 lost the client's address on the `h1-backend` path.** `H2Fallback`
+  had no way to report which peer a connection came from, so every HTTP/2
+  request arrived with `HttpRequest::peer` of `None` while HTTP/1.1 on the same
+  socket kept a real one — silently sending `client_address` to the
+  caller-controlled `X-Forwarded-For` header for rate limiting, deduplication
+  and audit attribution. Fixed by passing the peer through the hook, which is a
+  **breaking change to `armature-h1`'s `H2Fallback` trait** (see that crate's
+  changelog).
+- **`HttpRequest::client_address` could be spoofed via a repeated
+  `X-Forwarded-For`.** It read a single field line, so where a proxy appends
+  its own line rather than extending the client's — HAProxy's `option
+  forwardfor` and several ingress configurations do this — the client's line
+  won and `client_address` returned an address the caller chose. Repeated field
+  lines are now joined per RFC 9110 §5.3 before the rightmost hop is selected,
+  which is also the only reading that makes both backends agree.
+- A declared `Content-Length` over the configured limit now returns this
+  framework's `{"error":"Payload Too Large","status":413}` envelope with CORS
+  headers, as every other transport does. `armature-h1`'s own body cap was
+  configured with the same value and is evaluated before the service runs, so
+  it answered first with a bare status line — leaving a browser doing a CORS
+  upload with an opaque CORS failure instead of a 413.
 
 ### Removed
 
@@ -55,7 +103,14 @@ Changes at or before `0.6.0` are recorded in the workspace
   reading them will go flat. The same applies to `with_socket_tuning`
   (`EpollConfig`), which reaches for the raw fd of a listener this process no
   longer owns; `armature-h1`'s own `TcpConfig` covers `nodelay`, backlog and
-  `SO_REUSEPORT`.
+  `SO_REUSEPORT` (and sets the last of those *before* bind, where it actually
+  takes effect). `with_socket_tuning` still applies on `listen_h2c`, which
+  remains a hyper listener.
+- `PipelineConfig::pipeline_flush` and `PipelineConfig::read_buffer_size`, both
+  documented as wired, are not honoured on the `h1-backend` path: `armature-h1`
+  writes each response as it is produced and grows its read buffer from a fixed
+  chunk size, so it exposes no knob for either. They still reach the HTTP/2
+  connections hyper serves.
 
 ## [0.8.5] - 2026-08-04
 

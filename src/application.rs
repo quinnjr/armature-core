@@ -138,14 +138,29 @@ impl ServeState {
         }
     }
 
-    /// The configured body cap, for tests that must build a matching config.
+    /// Serve with CORS configured, for tests.
     #[cfg(all(test, feature = "h1-backend"))]
-    pub(crate) fn max_body_size_for_test(&self) -> usize {
-        self.max_body_size
+    pub(crate) fn with_cors_for_test(mut self, cors: CorsConfig) -> Self {
+        self.cors = Some(Arc::new(cors));
+        self
+    }
+
+    /// Serve with one globally-scoped guard, for tests.
+    ///
+    /// An empty prefix, matching [`Application::with_guard`], so the guard runs
+    /// for every request path.
+    #[cfg(all(test, feature = "h1-backend"))]
+    pub(crate) fn with_guard_for_test(mut self, guard: Arc<dyn Guard>) -> Self {
+        self.guards = vec![ScopedGuard {
+            prefix: String::new(),
+            guard,
+        }]
+        .into();
+        self
     }
 
     /// The same state, serving one connection whose peer is known.
-    fn for_peer(&self, peer: SocketAddr) -> Self {
+    pub(crate) fn for_peer(&self, peer: SocketAddr) -> Self {
         Self {
             peer: Some(peer),
             ..self.clone()
@@ -261,6 +276,14 @@ impl Application {
     /// other method. A handler registered with `Router::options` is therefore
     /// unreachable while CORS is configured. If you need to serve `OPTIONS`
     /// yourself, leave CORS off here and add it as middleware you control.
+    ///
+    /// This applies to **every** listener. Before `0.9`, only
+    /// [`listen_on`](Self::listen_on) consulted this configuration and every
+    /// TLS listener silently ignored it, so an HTTPS server got no CORS headers
+    /// and served its own `OPTIONS` routes. That was a bug in those listeners,
+    /// not a documented exemption — but fixing it means an HTTPS deployment
+    /// that called `with_cors` and relied on reaching an `OPTIONS` handler will
+    /// stop reaching it.
     pub fn with_cors(mut self, config: CorsConfig) -> Self {
         self.cors_config = Some(Arc::new(config));
         self
@@ -316,6 +339,15 @@ impl Application {
     /// The epoll flag settings in the config (`edge_triggered`, `oneshot`,
     /// `exclusive`) are advisory and are not applied by the built-in server
     /// (tokio owns its epoll registration).
+    ///
+    /// **With the default `h1-backend` feature this applies only to
+    /// [`listen_h2c`](Self::listen_h2c).** Every other listener hands binding
+    /// and accepting to `armature-h1`, so there is no listener fd in this
+    /// process to configure and no accept loop to configure accepted sockets
+    /// from. `armature-h1`'s own `TcpConfig` covers the part that survives
+    /// — `TCP_NODELAY`, backlog, and `SO_REUSEPORT` (which it sets *before*
+    /// bind, so it actually works there). Build with `default-features = false`
+    /// to get the hyper serve path and this method's full effect back.
     ///
     /// See also [`crate::connection_tuning::TcpConfig`] for the related
     /// per-workload TCP tuning API.
@@ -914,8 +946,7 @@ impl Application {
     #[cfg(feature = "h1-backend")]
     async fn listen_on_h1(self, addr: SocketAddr) -> Result<(), Error> {
         let state = self.serve_state(self.cors_config.clone());
-        let cfg =
-            crate::h1_backend::h1_config(addr, &self.pipeline_config, self.max_body_size, None);
+        let cfg = crate::h1_backend::h1_config(addr, &self.pipeline_config, None);
         crate::h1_backend::serve(cfg, state, None).await
     }
 
@@ -1048,9 +1079,8 @@ impl Application {
         with_h2: bool,
     ) -> Result<(), Error> {
         let state = self.serve_state(self.cors_config.clone());
-        let cfg =
-            crate::h1_backend::h1_config(addr, &self.pipeline_config, self.max_body_size, None)
-                .with_tls(tls_config.server_config);
+        let cfg = crate::h1_backend::h1_config(addr, &self.pipeline_config, None)
+            .with_tls(tls_config.server_config);
         let h2 = with_h2.then(|| {
             Http2Builder::with_stats(self.http2_config.clone(), Arc::clone(&self.http2_stats))
                 .configure_hyper_builder()
@@ -1084,7 +1114,13 @@ impl Application {
         );
 
         let acceptor = TlsAcceptor::from(tls_config.server_config);
-        let state = self.serve_state(None);
+        // CORS applies to every listener, not just the plaintext one. Passing
+        // `None` here — as this and every other TLS listener did before — made
+        // `with_cors` silently inert on HTTPS: a builder method that accepts
+        // configuration and drops it. See `with_cors` for the consequence a
+        // caller has to know about, which is that a registered `OPTIONS` route
+        // becomes unreachable once CORS is configured.
+        let state = self.serve_state(self.cors_config.clone());
         let pipeline_builder = PipelinedHttp1Builder::with_stats(
             self.pipeline_config.clone(),
             Arc::clone(&self.pipeline_stats),
@@ -1168,7 +1204,13 @@ impl Application {
     /// # }
     /// ```
     pub async fn listen_with_config(self, config: HttpsConfig) -> Result<(), Error> {
-        let state = self.serve_state(None);
+        // CORS applies to every listener, not just the plaintext one. Passing
+        // `None` here — as this and every other TLS listener did before — made
+        // `with_cors` silently inert on HTTPS: a builder method that accepts
+        // configuration and drops it. See `with_cors` for the consequence a
+        // caller has to know about, which is that a registered `OPTIONS` route
+        // becomes unreachable once CORS is configured.
+        let state = self.serve_state(self.cors_config.clone());
 
         // Start HTTP redirect server if configured
         if let Some(ref http_addr) = config.http_redirect_addr {
@@ -1220,18 +1262,21 @@ impl Application {
         config: HttpsConfig,
         state: ServeState,
     ) -> Result<(), Error> {
-        println!("🔒 HTTPS Server listening on https://{}", https_addr);
-        if config.http_redirect_addr.is_some() {
-            println!("↪️  HTTP redirect server enabled");
-        }
-        let cfg = crate::h1_backend::h1_config(
-            https_addr,
-            &self.pipeline_config,
-            self.max_body_size,
-            None,
-        )
-        .with_tls(config.tls.server_config);
-        crate::h1_backend::serve(cfg, state, None).await
+        let redirecting = config.http_redirect_addr.is_some();
+        let cfg = crate::h1_backend::h1_config(https_addr, &self.pipeline_config, None)
+            .with_tls(config.tls.server_config);
+        // Announced from `on_bound`, which runs once the listener exists.
+        // Printing before the bind means a port conflict shows the operator
+        // "listening on https://…" and then the error that says it never
+        // listened — and the address printed would be the requested one rather
+        // than the resolved one, which differ whenever the port is 0.
+        crate::h1_backend::serve::serve_bound(cfg, state, None, move |addr, _| {
+            println!("🔒 HTTPS Server listening on https://{}", addr);
+            if redirecting {
+                println!("↪️  HTTP redirect server enabled");
+            }
+        })
+        .await
     }
 
     /// The hyper half of [`listen_with_config`](Self::listen_with_config).
@@ -1336,7 +1381,13 @@ impl Application {
         );
         warn!("HTTP/2 cleartext (h2c) is not recommended for production. Use HTTPS.");
 
-        let state = self.serve_state(None);
+        // CORS applies to every listener, not just the plaintext one. Passing
+        // `None` here — as this and every other TLS listener did before — made
+        // `with_cors` silently inert on HTTPS: a builder method that accepts
+        // configuration and drops it. See `with_cors` for the consequence a
+        // caller has to know about, which is that a registered `OPTIONS` route
+        // becomes unreachable once CORS is configured.
+        let state = self.serve_state(self.cors_config.clone());
         let h2_builder =
             Http2Builder::with_stats(self.http2_config.clone(), Arc::clone(&self.http2_stats));
         let h2_stats = Arc::clone(&self.http2_stats);
@@ -1437,7 +1488,13 @@ impl Application {
         );
 
         let acceptor = TlsAcceptor::from(tls_config.server_config);
-        let state = self.serve_state(None);
+        // CORS applies to every listener, not just the plaintext one. Passing
+        // `None` here — as this and every other TLS listener did before — made
+        // `with_cors` silently inert on HTTPS: a builder method that accepts
+        // configuration and drops it. See `with_cors` for the consequence a
+        // caller has to know about, which is that a registered `OPTIONS` route
+        // becomes unreachable once CORS is configured.
+        let state = self.serve_state(self.cors_config.clone());
         let h1_builder = PipelinedHttp1Builder::with_stats(
             self.pipeline_config.clone(),
             Arc::clone(&self.pipeline_stats),
@@ -1742,8 +1799,6 @@ pub(crate) async fn handle_request(
         .split_once('?')
         .map_or(target_handle.as_str(), |(p, _)| p);
 
-    trace!(method = %method, path = %path, "Incoming request");
-
     if let Some(preflight) = cors_preflight(&method, &state) {
         return Ok(to_hyper_response_raw(preflight));
     }
@@ -1751,14 +1806,12 @@ pub(crate) async fn handle_request(
     // Copy headers. One copy per value, because hyper's `HeaderValue` owns its
     // own buffer and cannot be projected into our `Bytes`; the name goes in as
     // a `&str`, so it costs nothing for a well-known header.
-    let header_count = req.headers().len();
     for (name, value) in req.headers() {
         armature_req.headers.insert(
             name.as_str(),
             bytes::Bytes::copy_from_slice(value.as_bytes()),
         );
     }
-    trace!(header_count = header_count, "Headers parsed");
 
     // Fast-path rejection: if the client declares a Content-Length larger than
     // the configured limit, reject with 413 before buffering any body bytes.
@@ -1972,6 +2025,19 @@ async fn dispatch_request(
     let path = target_handle
         .split_once('?')
         .map_or(target_handle.as_str(), |(p, _)| p);
+
+    // The arrival record, emitted here rather than in each adapter so both
+    // transports produce it. It was previously written only by the hyper
+    // adapter, so moving the serve path onto `armature-h1` silently removed
+    // every per-request trace for HTTP/1.1 — the first record for a request
+    // became "Routing request", which is emitted after body handling and never
+    // at all for one rejected before that.
+    trace!(
+        method = %method,
+        path = %path,
+        header_count = armature_req.headers.len(),
+        "Incoming request"
+    );
 
     // Only needed when a global exception filter chain is configured: a
     // filter's `catch()` receives the original request for context (path,

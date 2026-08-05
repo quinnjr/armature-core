@@ -7,11 +7,15 @@
 //! driver, which is what served these connections before the swap and still
 //! does.
 //!
-//! The `buffered` contract is the whole risk here. For h2c, the bytes
-//! `armature-h1` read to *recognise* the preface are part of the HTTP/2 stream
-//! and cannot be re-read from the socket, so they must be replayed ahead of it
-//! or hyper sees a stream missing its opening frames. [`Replay`] does that
-//! splice.
+//! The `buffered` contract is one this fallback satisfies without currently
+//! exercising. Bytes only accompany a connection on the h2c path, and h2c
+//! detection is `armature-h1`'s `Config::detect_h2c`, which is opt-in and which
+//! [`h1_config`](super::serve::h1_config) does not enable — plaintext h2c has
+//! its own hyper-only listener. So `buffered` is empty on every connection that
+//! reaches here today. [`Replay`] exists anyway: the bytes read to *recognise*
+//! a preface are part of the HTTP/2 stream and cannot be re-read from the
+//! socket, so the day detection is turned on, anything that does not replay
+//! them ahead of the transport hands hyper a stream missing its opening frames.
 
 use crate::application::ServeState;
 use armature_h1::{H2Fallback, Transport};
@@ -20,6 +24,8 @@ use hyper::body::Incoming as IncomingBody;
 use hyper::service::service_fn;
 use hyper_util::rt::{TokioExecutor, TokioIo};
 use std::future::Future;
+use std::io::IoSlice;
+use std::net::SocketAddr;
 use std::pin::Pin;
 use std::task::{Context, Poll};
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
@@ -47,7 +53,12 @@ impl AsyncRead for Replay {
         cx: &mut Context<'_>,
         buf: &mut ReadBuf<'_>,
     ) -> Poll<std::io::Result<()>> {
-        if !self.head.is_empty() {
+        // `buf.remaining() > 0` is not redundant with the emptiness check:
+        // filling nothing and returning `Ready(Ok(()))` is how a reader signals
+        // EOF, so a zero-capacity poll answered from the replay buffer would
+        // announce end-of-stream on a connection that has not even begun. Fall
+        // through and let `inner` say whatever it says about a read of nothing.
+        if !self.head.is_empty() && buf.remaining() > 0 {
             // A short read is a legal read, so there is no need to also pull
             // from `inner` in the same call — and doing so would reorder bytes
             // if `inner` were ready and the replay buffer did not fit.
@@ -76,6 +87,25 @@ impl AsyncWrite for Replay {
     fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
         Pin::new(&mut self.inner).poll_shutdown(cx)
     }
+
+    // Both of these must be forwarded, not defaulted. hyper's HTTP/2 writer
+    // asks `is_write_vectored` whether it may hand the socket a list of frame
+    // slices or must first coalesce them into a scratch buffer, and the default
+    // answer is `false` — so leaving it to the default would make every HTTP/2
+    // response on this path pay a copy the transport underneath is perfectly
+    // capable of avoiding. `Replay` wraps unconditionally, so "every" is
+    // literal.
+    fn is_write_vectored(&self) -> bool {
+        self.inner.is_write_vectored()
+    }
+
+    fn poll_write_vectored(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        bufs: &[IoSlice<'_>],
+    ) -> Poll<std::io::Result<usize>> {
+        Pin::new(&mut self.inner).poll_write_vectored(cx, bufs)
+    }
 }
 
 /// Serves HTTP/2 connections through hyper, with this application's state.
@@ -98,8 +128,23 @@ impl HyperH2 {
 }
 
 impl H2Fallback for HyperH2 {
-    fn handle(&self, io: Box<dyn Transport>, buffered: Bytes) -> Pin<Box<dyn Future<Output = ()>>> {
-        let state = self.state.clone();
+    fn handle(
+        &self,
+        io: Box<dyn Transport>,
+        buffered: Bytes,
+        peer: Option<SocketAddr>,
+    ) -> Pin<Box<dyn Future<Output = ()>>> {
+        // Stamped here for the same reason the hyper listener stamped it on the
+        // accepted socket: the peer address is the one client identifier a
+        // handler can trust, and without it `HttpRequest::client_address` falls
+        // back to `X-Forwarded-For` — a header the client writes. This fallback
+        // holds one state per worker, not per connection, so serving from it
+        // unstamped would give every HTTP/2 request on the socket a forgeable
+        // origin while HTTP/1.1 on that same socket kept a real one.
+        let state = match peer {
+            Some(peer) => self.state.for_peer(peer),
+            None => self.state.clone(),
+        };
         let builder = self.builder.clone();
         Box::pin(async move {
             let io = TokioIo::new(Replay::new(io, buffered));

@@ -31,9 +31,28 @@ use armature_h1::{Config, Limits, Server, ServerHandle, TcpConfig};
 use hyper_util::rt::TokioExecutor;
 use std::net::SocketAddr;
 
+/// Signals shutdown when dropped.
+///
+/// The bridge between two ownership models. Tokio's is that dropping a future
+/// releases everything it was doing; `armature-h1`'s is that the server owns OS
+/// threads which no future's drop can reach. Held inside the serve future, this
+/// makes the first imply the second — so a cancelled `listen_on` closes the
+/// listener rather than leaving a bound socket and a runtime that hangs at drop
+/// waiting on a blocking task nothing will ever end.
+///
+/// Dropping it after a clean exit signals a server that has already stopped,
+/// which [`ServerHandle::shutdown`] treats as the no-op it is.
+struct ShutdownOnDrop(ServerHandle);
+
+impl Drop for ShutdownOnDrop {
+    fn drop(&mut self) {
+        self.0.shutdown();
+    }
+}
+
 /// Build `armature-h1`'s server configuration from this application's.
 ///
-/// Three of `PipelineConfig`'s fields document themselves as "not currently
+/// Seven of `PipelineConfig`'s fields document themselves as "not currently
 /// wired" because hyper's H1 builder has no knob for them. Two of those become
 /// wired here, because `armature-h1` does:
 ///
@@ -49,15 +68,44 @@ use std::net::SocketAddr;
 /// not read again until that request's response is written, so there is never
 /// more than one request in flight per connection to limit. `mode` and
 /// `write_buffer_size` likewise have nothing to attach to.
+///
+/// It takes no body-size argument, deliberately: armature-core enforces that
+/// cap itself, for the reason spelled out on `max_body_bytes` below.
+///
+/// Two fields go the other way, and `PipelineConfig` does not warn about them
+/// because under hyper there was nothing to warn about: `pipeline_flush` and
+/// `read_buffer_size` are wired to hyper's `pipeline_flush` and `max_buf_size`
+/// and are silently dropped here. `armature-h1` writes each response as it is
+/// produced and grows its read buffer from a fixed chunk size, so it exposes no
+/// knob for either. With the `h1-backend` feature on — the default — both are
+/// honoured only on connections hyper still serves, which is HTTP/2.
 pub(crate) fn h1_config(
     addr: SocketAddr,
     pipeline: &PipelineConfig,
-    max_body_size: usize,
     workers: Option<usize>,
 ) -> Config {
     let limits = Limits {
         max_head_bytes: pipeline.max_header_size,
-        max_body_bytes: max_body_size as u64,
+        // Unbounded here on purpose: armature-core is the sole enforcer of the
+        // body cap on this path, and it has to be.
+        //
+        // `armature-h1` evaluates `max_body_bytes` in `framing::decide`, before
+        // the service is ever called, and answers a bare status-line 413 — no
+        // body, no CORS headers, connection closed. Configuring it with the
+        // framework's own cap therefore made `dispatch_via_h1`'s check
+        // unreachable for any declared `Content-Length`, and with it this
+        // framework's `{"error":"Payload Too Large","status":413}` envelope,
+        // which every other transport returns. A browser doing a CORS upload
+        // over the limit saw an opaque CORS failure rather than a 413. Nor does
+        // a headroom constant fix it: whatever the margin, a declaration past it
+        // trips armature-h1 first.
+        //
+        // Nothing is unprotected as a result. `dispatch_via_h1` rejects an
+        // over-limit declared length before a body byte is buffered, and reads
+        // the body through `Body::collect(max_body_size)`, which fails mid-read
+        // on an undeclared or chunked body that runs past the cap. Both answer
+        // with the envelope.
+        max_body_bytes: u64::MAX,
         idle_timeout: pipeline.keep_alive_timeout,
         ..Limits::default()
     };
@@ -80,6 +128,15 @@ pub(crate) fn h1_config(
 /// HTTP/2 — reached via ALPN when TLS is configured on `cfg`, or via the h2c
 /// preface when `cfg.detect_h2c` is set. Pass `None` to close them instead,
 /// which is what a plain HTTP/1 listener wants.
+///
+/// Dropping this future stops the server. That is worth stating because it is
+/// not what cancelling a future normally achieves here: `armature-h1`'s workers
+/// are OS threads it owns, not tasks, and the future being dropped is only
+/// awaiting the blocking-pool thread they were launched from — cancelling it
+/// reaches none of them. So the future carries a guard that signals shutdown on
+/// drop, which is what makes the idiom every caller already writes
+/// (`select! { _ = app.listen_on(addr) => {}, _ = ctrl_c() => {} }`) actually
+/// close the listener instead of leaving it bound and the workers serving.
 pub(crate) async fn serve(
     cfg: Config,
     state: ServeState,
@@ -94,10 +151,9 @@ pub(crate) async fn serve(
 /// `on_bound` runs once, after the listener exists and before the first accept.
 /// Both of its arguments are unobtainable at any later moment: `Server::bind`
 /// resolves `:0` to a real port here, and this function does not return until
-/// the server stops — so without the [`ServerHandle`] there is nothing that
-/// could ever stop it. A caller that drops this future instead leaks the
-/// worker threads: they are OS threads owned by `armature-h1`, not tasks, and
-/// cancelling the future that is awaiting them does not reach them.
+/// the server stops — so without the [`ServerHandle`] there is nothing a caller
+/// could ever stop it *deliberately* with. Dropping this future stops it too,
+/// via [`ShutdownOnDrop`]; see [`serve`] for why that needs arranging.
 pub(crate) async fn serve_bound(
     cfg: Config,
     state: ServeState,
@@ -109,23 +165,26 @@ pub(crate) async fn serve_bound(
     info!(address = %addr, "HTTP server listening (armature-h1 backend)");
     on_bound(addr, server.handle());
 
+    // Held across the await below, which is the whole point: it is the drop of
+    // this local that turns "the caller stopped caring about this future" into
+    // "the workers stop accepting". Taken before `server` moves into the
+    // closure, and safe even in the window before serving begins.
+    let _stop = ShutdownOnDrop(server.handle());
+
     // The whole server, threads and all, moves onto a blocking-pool thread:
     // `Server::serve` blocks until shutdown, and blocking a runtime worker
     // would stall every other task the caller has running.
     let joined = tokio::task::spawn_blocking(move || match h2 {
-        Some(builder) => {
-            let state = state.clone();
-            server.serve_with_fallback(
-                {
+        Some(builder) => server.serve_with_fallback(
+            {
+                let state = state.clone();
+                move || {
                     let state = state.clone();
-                    move || {
-                        let state = state.clone();
-                        move |req| dispatch_via_h1(req, state.clone())
-                    }
-                },
-                move || HyperH2::new(state.clone(), builder.clone()),
-            )
-        }
+                    move |req| dispatch_via_h1(req, state.clone())
+                }
+            },
+            move || HyperH2::new(state.clone(), builder.clone()),
+        ),
         None => server.serve({
             let state = state.clone();
             move || {
@@ -165,7 +224,7 @@ mod tests {
             tcp_nodelay: false,
             ..PipelineConfig::default()
         };
-        let cfg = h1_config(addr(), &pipeline, 1234, Some(2));
+        let cfg = h1_config(addr(), &pipeline, Some(2));
 
         assert_eq!(
             cfg.limits.idle_timeout,
@@ -176,7 +235,13 @@ mod tests {
             cfg.limits.max_head_bytes, 4096,
             "max_header_size is a byte cap and armature-h1 takes one"
         );
-        assert_eq!(cfg.limits.max_body_bytes, 1234);
+        assert_eq!(
+            cfg.limits.max_body_bytes,
+            u64::MAX,
+            "armature-core enforces the body cap on this path, so armature-h1 \
+             must not reject first with its bare status line and cost the \
+             client the framework's JSON envelope"
+        );
         assert!(!cfg.tcp.nodelay);
         assert_eq!(cfg.workers, 2);
     }
@@ -187,7 +252,7 @@ mod tests {
         // ceiling. Going through it (rather than setting `cfg.limits`
         // directly) is what makes that clamp apply, so this pins that
         // `h1_config` uses the builder.
-        let cfg = h1_config(addr(), &PipelineConfig::default(), 1, None);
+        let cfg = h1_config(addr(), &PipelineConfig::default(), None);
         assert!(cfg.limits.max_headers <= armature_h1::limits::MAX_HEADERS_CEILING);
     }
 }

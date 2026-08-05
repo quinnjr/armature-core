@@ -63,7 +63,6 @@ where
     let cfg = h1_config(
         "127.0.0.1:0".parse().expect("addr"),
         &PipelineConfig::default(),
-        state.max_body_size_for_test(),
         // One worker: the test asserts on responses, not on load balancing, and
         // a worker per core would open N listeners for no added coverage.
         Some(1),
@@ -254,6 +253,17 @@ async fn a_declared_content_length_over_the_limit_is_refused_before_the_body() {
         response.starts_with("HTTP/1.1 413"),
         "an over-limit declaration must be refused with 413: {response:?}"
     );
+    // The status line alone does not distinguish the producers: `armature-h1`
+    // answers a bare 413 from `framing::decide` before the service runs, and
+    // armature-core answers one with this envelope. `h1_config` gives its cap a
+    // byte of headroom precisely so the framework's answer wins, and asserting
+    // the body is what pins that — otherwise the two are indistinguishable and
+    // a regression is invisible.
+    assert!(
+        response.contains("\"status\":413"),
+        "the framework's own 413 envelope must reach the client, not \
+         armature-h1's bare status line: {response:?}"
+    );
 }
 
 #[tokio::test]
@@ -298,5 +308,317 @@ async fn a_smuggling_shaped_request_is_rejected_rather_than_served() {
         response.starts_with("HTTP/1.1 400"),
         "Content-Length together with Transfer-Encoding must be refused: \
          {response:?}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Guards, CORS, routing semantics, and response framing.
+//
+// The module doc above claims this suite drives "routes, guards, CORS, body
+// limits". Until `ServeState` grew test builders it could only ever drive the
+// first and last of those, so everything below was asserted nowhere on the
+// serve path — including two things AGENTS.md names explicitly: that guards
+// fail closed, and that routing semantics (param extraction, unknown-method →
+// 404) are preserved exactly.
+// ---------------------------------------------------------------------------
+
+use crate::guard::{Guard, GuardContext};
+
+/// Reports the path parameter it was routed with, so extraction is observable
+/// from the wire rather than inferred.
+async fn echo_param(req: HttpRequest) -> Result<HttpResponse, Error> {
+    use crate::http::RouteParamsExt;
+    let id = req.path_params.get_str("id").unwrap_or("-").to_string();
+    Ok(HttpResponse::ok().with_body(format!("id={id}").into_bytes()))
+}
+
+/// A 200 with no body at all, for the framing assertions.
+async fn empty_ok(_req: HttpRequest) -> Result<HttpResponse, Error> {
+    Ok(HttpResponse::ok())
+}
+
+/// A 204, which must not carry a `Content-Length` at all.
+async fn no_content(_req: HttpRequest) -> Result<HttpResponse, Error> {
+    Ok(HttpResponse::new(204))
+}
+
+fn routed_state() -> ServeState {
+    let mut router = Router::new();
+    router.add_route(Route::new(HttpMethod::GET, "/echo", echo));
+    router.add_route(Route::new(HttpMethod::POST, "/echo", echo));
+    router.add_route(Route::new(HttpMethod::GET, "/u/:id", echo_param));
+    router.add_route(Route::new(HttpMethod::GET, "/empty", empty_ok));
+    router.add_route(Route::new(HttpMethod::GET, "/nothing", no_content));
+    router.add_route(Route::new(HttpMethod::HEAD, "/head", echo));
+    ServeState::for_test(
+        Arc::new(OptimizedRouter::from_router(&router)),
+        DEFAULT_MAX_BODY_SIZE,
+    )
+}
+
+/// Refuses everything, to prove a guard's verdict reaches the wire.
+struct DenyAll;
+
+#[async_trait::async_trait]
+impl Guard for DenyAll {
+    async fn can_activate(&self, _ctx: &GuardContext) -> Result<bool, Error> {
+        Ok(false)
+    }
+}
+
+/// Fails rather than refusing — a different path through `dispatch_request`,
+/// which maps the error rather than emitting the canned 403.
+struct ExplodingGuard;
+
+#[async_trait::async_trait]
+impl Guard for ExplodingGuard {
+    async fn can_activate(&self, _ctx: &GuardContext) -> Result<bool, Error> {
+        Err(Error::Unauthorized("no credentials".to_string()))
+    }
+}
+
+/// How many times `name` appears as a header field in a raw response.
+///
+/// Counted rather than merely detected: the response path adds the CORS origin
+/// in `to_h1_response` while the preflight path builds its own complete set, so
+/// the failure worth guarding against is two of them, not zero.
+fn header_count(response: &str, name: &str) -> usize {
+    let head = response.split("\r\n\r\n").next().unwrap_or(response);
+    head.lines()
+        .filter(|line| {
+            line.split_once(':')
+                .is_some_and(|(k, _)| k.trim().eq_ignore_ascii_case(name))
+        })
+        .count()
+}
+
+#[tokio::test]
+async fn a_cors_configured_response_carries_exactly_one_allow_origin() {
+    let state = routed_state().with_cors_for_test(crate::CorsConfig::new("https://example.test"));
+
+    let response = with_server(state, |addr| async move {
+        roundtrip(
+            addr,
+            b"GET /echo HTTP/1.1\r\nHost: a\r\nConnection: close\r\n\r\n",
+        )
+        .await
+    })
+    .await;
+
+    assert!(response.starts_with("HTTP/1.1 200 OK"), "{response:?}");
+    assert_eq!(
+        header_count(&response, "access-control-allow-origin"),
+        1,
+        "exactly one origin header — zero means CORS never reached the serve \
+         path, two means both the response path and something upstream added \
+         it: {response:?}"
+    );
+}
+
+#[tokio::test]
+async fn an_options_preflight_is_answered_before_routing() {
+    let state = routed_state().with_cors_for_test(crate::CorsConfig::new("https://example.test"));
+
+    let response = with_server(state, |addr| async move {
+        // A path with no registered OPTIONS route: a preflight is sent for a
+        // path the browser is about to call with some other method, so it must
+        // be answered without consulting the router.
+        roundtrip(
+            addr,
+            b"OPTIONS /echo HTTP/1.1\r\nHost: a\r\nConnection: close\r\n\r\n",
+        )
+        .await
+    })
+    .await;
+
+    assert!(
+        response.starts_with("HTTP/1.1 204"),
+        "a preflight is answered with 204, not routed: {response:?}"
+    );
+    assert_eq!(
+        header_count(&response, "access-control-allow-origin"),
+        1,
+        "the preflight builds its own complete header set, so adding the \
+         per-response origin on top would duplicate it: {response:?}"
+    );
+    assert!(
+        response
+            .to_ascii_lowercase()
+            .contains("access-control-allow-methods"),
+        "the preflight set must be complete: {response:?}"
+    );
+}
+
+#[tokio::test]
+async fn a_denying_guard_produces_the_frameworks_403() {
+    let state = routed_state().with_guard_for_test(Arc::new(DenyAll));
+
+    let response = with_server(state, |addr| async move {
+        roundtrip(
+            addr,
+            b"GET /echo HTTP/1.1\r\nHost: a\r\nConnection: close\r\n\r\n",
+        )
+        .await
+    })
+    .await;
+
+    assert!(
+        response.starts_with("HTTP/1.1 403"),
+        "guards fail closed, so a refusal must reach the wire as a 403 rather \
+         than the handler running: {response:?}"
+    );
+    assert!(
+        response.contains("\"status\":403"),
+        "the framework's own 403 envelope, not a bare status line: {response:?}"
+    );
+}
+
+#[tokio::test]
+async fn a_guard_returning_an_error_maps_to_its_status() {
+    let state = routed_state().with_guard_for_test(Arc::new(ExplodingGuard));
+
+    let response = with_server(state, |addr| async move {
+        roundtrip(
+            addr,
+            b"GET /echo HTTP/1.1\r\nHost: a\r\nConnection: close\r\n\r\n",
+        )
+        .await
+    })
+    .await;
+
+    assert!(
+        response.starts_with("HTTP/1.1 401"),
+        "a guard's error maps through the error path, which is distinct from \
+         the canned 403 a refusal produces: {response:?}"
+    );
+}
+
+#[tokio::test]
+async fn a_path_parameter_is_extracted_and_reaches_the_handler() {
+    let response = with_server(routed_state(), |addr| async move {
+        roundtrip(
+            addr,
+            b"GET /u/42 HTTP/1.1\r\nHost: a\r\nConnection: close\r\n\r\n",
+        )
+        .await
+    })
+    .await;
+
+    assert!(response.starts_with("HTTP/1.1 200 OK"), "{response:?}");
+    assert!(
+        response.ends_with("id=42"),
+        "param extraction is a routing semantic that must survive the backend \
+         swap: {response:?}"
+    );
+}
+
+#[tokio::test]
+async fn a_known_path_with_an_unregistered_method_is_a_404() {
+    let response = with_server(routed_state(), |addr| async move {
+        // `/u/:id` exists for GET only. AGENTS.md names unknown-method → 404
+        // as a routing semantic to preserve exactly, and it is distinct from
+        // the unrouted-path case: the path matches, the method does not.
+        roundtrip(
+            addr,
+            b"DELETE /u/42 HTTP/1.1\r\nHost: a\r\nConnection: close\r\n\r\n",
+        )
+        .await
+    })
+    .await;
+
+    assert!(
+        response.starts_with("HTTP/1.1 404"),
+        "a known path with an unregistered method is a 404, not a 405 and not \
+         a match: {response:?}"
+    );
+}
+
+#[tokio::test]
+async fn a_head_response_reports_a_length_but_sends_no_body_bytes() {
+    let response = with_server(routed_state(), |addr| async move {
+        roundtrip(
+            addr,
+            b"HEAD /head HTTP/1.1\r\nHost: a\r\nConnection: close\r\n\r\n",
+        )
+        .await
+    })
+    .await;
+
+    assert!(response.starts_with("HTTP/1.1 200 OK"), "{response:?}");
+    let (head, body) = response
+        .split_once("\r\n\r\n")
+        .expect("a complete response head");
+    assert!(
+        head.to_ascii_lowercase().contains("content-length:"),
+        "HEAD reports the length a GET would have sent, or a client cannot use \
+         it to size a fetch: {head:?}"
+    );
+    assert!(
+        !head.to_ascii_lowercase().contains("content-length: 0"),
+        "the reported length is the body a GET would produce, not zero: {head:?}"
+    );
+    assert!(
+        body.is_empty(),
+        "…but none of those bytes go on the wire: {body:?}"
+    );
+}
+
+/// Not a swap regression — the router is shared by both backends — but worth
+/// pinning, because the framing test above would otherwise look like proof
+/// that `HEAD` works generally when it only works for an explicitly registered
+/// route. RFC 9110 §9.3.2 makes `HEAD` identical to `GET` bar the body, and
+/// this framework does not derive one from the other.
+#[tokio::test]
+async fn head_is_not_derived_from_a_registered_get_route() {
+    let response = with_server(routed_state(), |addr| async move {
+        roundtrip(
+            addr,
+            b"HEAD /echo HTTP/1.1\r\nHost: a\r\nConnection: close\r\n\r\n",
+        )
+        .await
+    })
+    .await;
+
+    assert!(
+        response.starts_with("HTTP/1.1 404"),
+        "a GET-only route does not answer HEAD; if this ever starts passing as \
+         a 200, the router gained auto-derivation and this test should become \
+         the assertion that it did: {response:?}"
+    );
+}
+
+#[tokio::test]
+async fn an_empty_200_is_framed_with_content_length_zero_but_a_204_is_not() {
+    let empty_200 = with_server(routed_state(), |addr| async move {
+        roundtrip(
+            addr,
+            b"GET /empty HTTP/1.1\r\nHost: a\r\nConnection: close\r\n\r\n",
+        )
+        .await
+    })
+    .await;
+
+    assert!(empty_200.starts_with("HTTP/1.1 200 OK"), "{empty_200:?}");
+    assert!(
+        empty_200.to_ascii_lowercase().contains("content-length: 0"),
+        "a 200 with an empty body still needs an explicit zero length, or the \
+         client cannot tell the body ended: {empty_200:?}"
+    );
+
+    let no_content = with_server(routed_state(), |addr| async move {
+        roundtrip(
+            addr,
+            b"GET /nothing HTTP/1.1\r\nHost: a\r\nConnection: close\r\n\r\n",
+        )
+        .await
+    })
+    .await;
+
+    assert!(no_content.starts_with("HTTP/1.1 204"), "{no_content:?}");
+    assert!(
+        !no_content.to_ascii_lowercase().contains("content-length"),
+        "a 204 must carry no body framing at all — this is the distinction a \
+         type-level assertion on ResponseBody cannot make, because it never \
+         reaches the writer: {no_content:?}"
     );
 }

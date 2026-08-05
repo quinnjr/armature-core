@@ -7,9 +7,12 @@
 //! # What changes
 //!
 //! HTTP/1.1 is served by [`armature_h1`]: its parser, its writer, its framing
-//! decisions, and its thread-per-core accept loop. HTTP/2 is unchanged — hyper
-//! still serves it, reached through [`h2_fallback`] when `armature-h1`'s
-//! dispatch classifies a connection as HTTP/2 (ALPN `h2`, or the h2c preface).
+//! decisions, and its thread-per-core accept loop. HTTP/2 is still hyper's —
+//! reached through [`h2_fallback`] when `armature-h1`'s dispatch classifies a
+//! connection as HTTP/2, which today means ALPN `h2` alone. `armature-h1` will
+//! also classify the h2c prior-knowledge preface, but only with
+//! `Config::detect_h2c` set, which [`serve::h1_config`] leaves off: plaintext
+//! HTTP/2 has its own hyper listener rather than sharing the HTTP/1 one.
 //! HTTP/3 is untouched.
 //!
 //! # What this buys

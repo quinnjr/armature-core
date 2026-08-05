@@ -102,10 +102,16 @@ Publish in this order:
   all built their serve state with no CORS configuration, so an HTTPS server
   configured with `with_cors` sent no CORS headers at all. Only `listen_on`
   honoured it. Every listener now does. **This changes behaviour for existing
-  HTTPS deployments**: CORS headers now appear on their responses, and because
-  the preflight handler answers *every* `OPTIONS` request with 204 before the
-  router is consulted, an `OPTIONS` route registered on an HTTPS listener stops
-  being reachable while CORS is configured. See `Application::with_cors`.
+  HTTPS deployments**: CORS headers now appear on their responses. A registered
+  `OPTIONS` route keeps working — see the next entry.
+- **A registered `OPTIONS` route is no longer shadowed by CORS.** The preflight
+  handler answered *every* `OPTIONS` request with 204 before the router was
+  consulted, so configuring CORS made `Router::options` unreachable. It now
+  intercepts only an actual preflight — an `OPTIONS` carrying
+  `Access-Control-Request-Method`, which is what a browser sends and what the
+  Fetch standard defines a preflight to be. Everything else routes normally,
+  including the RFC 9110 section 9.3.7 sense of `OPTIONS` (ask what a resource
+  supports), which had no way to be served at all while CORS was on.
 - **HTTP/2 lost the client's address on the `h1-backend` path.** `H2Fallback`
   had no way to report which peer a connection came from, so every HTTP/2
   request arrived with `HttpRequest::peer` of `None` while HTTP/1.1 on the same

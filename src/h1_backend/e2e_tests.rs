@@ -468,6 +468,7 @@ fn routed_state() -> ServeState {
     router.add_route(Route::new(HttpMethod::GET, "/empty", empty_ok));
     router.add_route(Route::new(HttpMethod::GET, "/nothing", no_content));
     router.add_route(Route::new(HttpMethod::HEAD, "/head", echo));
+    router.add_route(Route::new(HttpMethod::OPTIONS, "/echo", echo));
     ServeState::for_test(
         Arc::new(OptimizedRouter::from_router(&router)),
         DEFAULT_MAX_BODY_SIZE,
@@ -543,7 +544,8 @@ async fn an_options_preflight_is_answered_before_routing() {
         // be answered without consulting the router.
         roundtrip(
             addr,
-            b"OPTIONS /echo HTTP/1.1\r\nHost: a\r\nConnection: close\r\n\r\n",
+            b"OPTIONS /echo HTTP/1.1\r\nHost: a\r\nOrigin: https://example.test\r\n\
+              Access-Control-Request-Method: POST\r\nConnection: close\r\n\r\n",
         )
         .await
     })
@@ -564,6 +566,60 @@ async fn an_options_preflight_is_answered_before_routing() {
             .to_ascii_lowercase()
             .contains("access-control-allow-methods"),
         "the preflight set must be complete: {response:?}"
+    );
+}
+
+/// `OPTIONS` has a meaning of its own (RFC 9110 §9.3.7 — ask what a resource
+/// supports), and a CORS preflight is the narrower thing the Fetch standard
+/// defines: `OPTIONS` carrying `Access-Control-Request-Method`. Intercepting
+/// both made `Router::options` unreachable the moment CORS was configured —
+/// a routing decision taken by a header the caller sets.
+#[tokio::test]
+async fn a_plain_options_request_routes_even_with_cors_configured() {
+    let state = routed_state().with_cors_for_test(crate::CorsConfig::new("https://example.test"));
+
+    let response = with_server(state, |addr| async move {
+        // No `Access-Control-Request-Method`: not a preflight, so the
+        // registered OPTIONS handler must answer it.
+        roundtrip(
+            addr,
+            b"OPTIONS /echo HTTP/1.1\r\nHost: a\r\nConnection: close\r\n\r\n",
+        )
+        .await
+    })
+    .await;
+
+    assert!(
+        response.starts_with("HTTP/1.1 200 OK"),
+        "a non-preflight OPTIONS must reach its route, not the canned 204: \
+         {response:?}"
+    );
+    assert!(
+        response.contains("method=OPTIONS"),
+        "the handler must actually have run: {response:?}"
+    );
+}
+
+/// The companion to the above: an `Origin` header alone does not make a
+/// preflight either. A browser sends `Origin` on plenty of requests that are
+/// not preflights, so gating on it would shadow the route just as broadly.
+#[tokio::test]
+async fn an_options_request_with_only_an_origin_still_routes() {
+    let state = routed_state().with_cors_for_test(crate::CorsConfig::new("https://example.test"));
+
+    let response = with_server(state, |addr| async move {
+        roundtrip(
+            addr,
+            b"OPTIONS /echo HTTP/1.1\r\nHost: a\r\nOrigin: https://example.test\r\n\
+              Connection: close\r\n\r\n",
+        )
+        .await
+    })
+    .await;
+
+    assert!(
+        response.starts_with("HTTP/1.1 200 OK"),
+        "only `Access-Control-Request-Method` marks a preflight: {response:?}"
     );
 }
 

@@ -288,22 +288,24 @@ impl Application {
     /// Configure CORS for the application. Handles preflight OPTIONS
     /// requests automatically and adds CORS headers to every response.
     ///
-    /// # Precedence over registered OPTIONS routes
+    /// # Interaction with registered OPTIONS routes
     ///
-    /// The preflight handler answers *every* `OPTIONS` request with `204` before
-    /// the router is consulted — it does not check whether a route exists, since
-    /// a preflight is sent for a path the browser is about to call with some
-    /// other method. A handler registered with `Router::options` is therefore
-    /// unreachable while CORS is configured. If you need to serve `OPTIONS`
-    /// yourself, leave CORS off here and add it as middleware you control.
+    /// Only an actual CORS preflight is intercepted: an `OPTIONS` request that
+    /// carries `Access-Control-Request-Method`, which is what a browser sends
+    /// and what the Fetch standard defines a preflight to be. It is answered
+    /// with `204` before the router is consulted, deliberately without checking
+    /// whether a route exists — a preflight names a path the browser is *about*
+    /// to call with some other method, so requiring an `OPTIONS` route for it
+    /// would mean registering one beside every CORS-reachable handler.
+    ///
+    /// Any other `OPTIONS` request routes normally. RFC 9110 section 9.3.7
+    /// gives `OPTIONS` a meaning of its own — ask what a resource supports —
+    /// and a handler registered with `Router::options` keeps serving it.
     ///
     /// This applies to **every** listener. Before `0.9`, only
     /// [`listen_on`](Self::listen_on) consulted this configuration and every
     /// TLS listener silently ignored it, so an HTTPS server got no CORS headers
-    /// and served its own `OPTIONS` routes. That was a bug in those listeners,
-    /// not a documented exemption — but fixing it means an HTTPS deployment
-    /// that called `with_cors` and relied on reaching an `OPTIONS` handler will
-    /// stop reaching it.
+    /// at all.
     pub fn with_cors(mut self, config: CorsConfig) -> Self {
         self.cors_config = Some(Arc::new(config));
         self
@@ -1934,7 +1936,11 @@ pub(crate) async fn handle_request(
         .split_once('?')
         .map_or(target_handle.as_str(), |(p, _)| p);
 
-    if let Some(preflight) = cors_preflight(&method, &state) {
+    if let Some(preflight) = cors_preflight(
+        &method,
+        || req.headers().contains_key("access-control-request-method"),
+        &state,
+    ) {
         return Ok(to_hyper_response_raw(preflight));
     }
 
@@ -2035,7 +2041,19 @@ pub(crate) async fn dispatch_via_h1(
     } = req;
     let method = head.method.clone();
 
-    if let Some(preflight) = cors_preflight(&method, &state) {
+    if let Some(preflight) = cors_preflight(
+        &method,
+        || {
+            // `Access-Control-Request-Method` is outside armature-h1's
+            // well-known table, so this compares names rather than interning a
+            // needle. It runs only for an `OPTIONS` request on a
+            // CORS-configured server.
+            head.headers
+                .iter()
+                .any(|(id, _)| id.as_str() == "access-control-request-method")
+        },
+        &state,
+    ) {
         // No CORS argument: the preflight answer already carries the full
         // preflight header set, and appending the per-response origin pair on
         // top of it would duplicate `Access-Control-Allow-Origin`.
@@ -2095,9 +2113,27 @@ pub(crate) async fn dispatch_via_h1(
 /// it at the same point: before the body is read. Moving it after the read would
 /// have an `OPTIONS` carrying a body pay for that body before being answered
 /// with a response that never looks at it.
-fn cors_preflight(method: &crate::Method, state: &ServeState) -> Option<HttpResponse> {
+fn cors_preflight(
+    method: &crate::Method,
+    is_preflight: impl FnOnce() -> bool,
+    state: &ServeState,
+) -> Option<HttpResponse> {
     let cors = state.cors.as_deref()?;
     if method != "OPTIONS" {
+        return None;
+    }
+    // `OPTIONS` alone does not make it a preflight. RFC 9110 section 9.3.7
+    // gives `OPTIONS` its own meaning — ask what a resource supports, answered
+    // with `Allow` — and that request has nothing to do with CORS. A preflight
+    // is the narrower thing the Fetch standard defines: `OPTIONS` carrying
+    // `Access-Control-Request-Method`, which a browser sends and nothing else
+    // does.
+    //
+    // Answering both here would make a registered `OPTIONS` route unreachable
+    // the moment CORS is configured, which is a routing decision taken by a
+    // header the caller sets. The closure is invoked only once the two cheap
+    // checks above pass, so a non-`OPTIONS` request never pays for the lookup.
+    if !is_preflight() {
         return None;
     }
     let mut response = HttpResponse::new(204);

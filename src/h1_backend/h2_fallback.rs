@@ -12,10 +12,11 @@
 //! detection is `armature-h1`'s `Config::detect_h2c`, which is opt-in and which
 //! [`h1_config`](super::serve::h1_config) does not enable — plaintext h2c has
 //! its own hyper-only listener. So `buffered` is empty on every connection that
-//! reaches here today. [`Replay`] exists anyway: the bytes read to *recognise*
-//! a preface are part of the HTTP/2 stream and cannot be re-read from the
-//! socket, so the day detection is turned on, anything that does not replay
-//! them ahead of the transport hands hyper a stream missing its opening frames.
+//! reaches here today, and [`Replay::wrap`] hands each of those straight to
+//! hyper unwrapped. [`Replay`] exists anyway, for the day detection is turned
+//! on: the bytes read to *recognise* a preface are part of the HTTP/2 stream
+//! and cannot be re-read from the socket, so anything that does not replay them
+//! ahead of the transport hands hyper a stream missing its opening frames.
 
 use crate::application::ServeState;
 use armature_h1::{H2Fallback, Transport};
@@ -40,10 +41,28 @@ pub(crate) struct Replay {
 }
 
 impl Replay {
-    /// Splice `head` in front of `inner`, or hand back `inner` unchanged when
-    /// there is nothing to replay.
+    /// Splice `head` in front of `inner`.
+    ///
+    /// Wraps unconditionally; [`Replay::wrap`] is what callers holding a
+    /// possibly-empty `head` should reach for.
     pub(crate) fn new(inner: Box<dyn Transport>, head: Bytes) -> Self {
         Self { inner, head }
+    }
+
+    /// `inner` with `head` spliced in front of it, or `inner` itself when there
+    /// is nothing to replay.
+    ///
+    /// The empty case is the common one, not the corner one: `head` is empty on
+    /// every connection reaching this fallback today, so wrapping regardless
+    /// would put a layer with nothing to do underneath every HTTP/2 response the
+    /// server writes, and each read and write would pay a second virtual
+    /// dispatch on its way to the socket for the privilege.
+    pub(crate) fn wrap(inner: Box<dyn Transport>, head: Bytes) -> Box<dyn Transport> {
+        if head.is_empty() {
+            inner
+        } else {
+            Box::new(Self::new(inner, head))
+        }
     }
 }
 
@@ -53,12 +72,7 @@ impl AsyncRead for Replay {
         cx: &mut Context<'_>,
         buf: &mut ReadBuf<'_>,
     ) -> Poll<std::io::Result<()>> {
-        // `buf.remaining() > 0` is not redundant with the emptiness check:
-        // filling nothing and returning `Ready(Ok(()))` is how a reader signals
-        // EOF, so a zero-capacity poll answered from the replay buffer would
-        // announce end-of-stream on a connection that has not even begun. Fall
-        // through and let `inner` say whatever it says about a read of nothing.
-        if !self.head.is_empty() && buf.remaining() > 0 {
+        if !self.head.is_empty() {
             // A short read is a legal read, so there is no need to also pull
             // from `inner` in the same call — and doing so would reorder bytes
             // if `inner` were ready and the replay buffer did not fit.
@@ -93,8 +107,9 @@ impl AsyncWrite for Replay {
     // slices or must first coalesce them into a scratch buffer, and the default
     // answer is `false` — so leaving it to the default would make every HTTP/2
     // response on this path pay a copy the transport underneath is perfectly
-    // capable of avoiding. `Replay` wraps unconditionally, so "every" is
-    // literal.
+    // capable of avoiding. `Replay::wrap` keeps most connections out of here
+    // entirely, but the ones it does wrap are the ones carrying real h2c
+    // traffic, so answering for the transport underneath still matters.
     fn is_write_vectored(&self) -> bool {
         self.inner.is_write_vectored()
     }
@@ -147,7 +162,7 @@ impl H2Fallback for HyperH2 {
         };
         let builder = self.builder.clone();
         Box::pin(async move {
-            let io = TokioIo::new(Replay::new(io, buffered));
+            let io = TokioIo::new(Replay::wrap(io, buffered));
             let service = service_fn(move |req: hyper::Request<IncomingBody>| {
                 let state = state.clone();
                 async move { crate::application::handle_request(req, state).await }
@@ -199,5 +214,39 @@ mod tests {
         let mut out = vec![0u8; 8];
         client.read_exact(&mut out).await.expect("read");
         assert_eq!(&out[..], b"SETTINGS");
+    }
+
+    #[tokio::test]
+    async fn wrap_hands_back_the_transport_when_there_is_nothing_to_replay() {
+        let (mut client, server) = tokio::io::duplex(4096);
+        let server: Box<dyn Transport> = Box::new(server);
+        let addr = std::ptr::addr_of!(*server) as *const ();
+        let mut io = Replay::wrap(server, Bytes::new());
+
+        // The pointer identity is the assertion: an empty replay buffer must
+        // leave the transport itself in hyper's hands rather than a layer that
+        // would forward every read and write for the life of the connection.
+        assert_eq!(
+            std::ptr::addr_of!(*io) as *const (),
+            addr,
+            "an empty head must not be wrapped"
+        );
+
+        client.write_all(b"THEREST").await.expect("write");
+        let mut out = [0u8; 7];
+        io.read_exact(&mut out).await.expect("read");
+        assert_eq!(&out[..], b"THEREST");
+    }
+
+    #[tokio::test]
+    async fn wrap_splices_a_non_empty_head() {
+        let (mut client, server) = tokio::io::duplex(4096);
+        let mut io = Replay::wrap(Box::new(server), Bytes::from_static(b"PREFACE"));
+
+        client.write_all(b"THEREST").await.expect("write");
+
+        let mut out = [0u8; 14];
+        io.read_exact(&mut out).await.expect("read");
+        assert_eq!(&out[..], b"PREFACETHEREST");
     }
 }

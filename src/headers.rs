@@ -304,13 +304,7 @@ impl HeaderMap {
     /// Returns the old value if one was replaced.
     #[inline]
     pub fn insert(&mut self, name: impl AsRef<str>, value: impl HeaderValueInput) -> Option<Bytes> {
-        let id = header_id::intern(name.as_ref());
-        let value = value.into_value();
-        if let Some(existing) = self.inner.iter_mut().find(|h| h.id == id) {
-            return Some(std::mem::replace(&mut existing.value, value));
-        }
-        self.inner.push(Header { id, value });
-        None
+        self.insert_id(header_id::intern(name.as_ref()), value.into_value())
     }
 
     /// Insert a header whose name is already interned.
@@ -346,11 +340,30 @@ impl HeaderMap {
     /// ```
     #[inline]
     pub fn insert_id(&mut self, id: HeaderId, value: Bytes) -> Option<Bytes> {
-        if let Some(existing) = self.inner.iter_mut().find(|h| h.id == id) {
-            return Some(std::mem::replace(&mut existing.value, value));
+        // Replaces the first occurrence and *drops the rest*, matching
+        // `http::HeaderMap::insert`. Replacing only the first would be a
+        // security bug now that the serve path appends every occurrence a
+        // request carried: the canonical sanitisation idiom is
+        // `headers.insert("X-Forwarded-For", trusted_value)`, and if a
+        // client-supplied second line survived that call, `client_address`
+        // would go on reading it as a hop.
+        let mut replaced = None;
+        self.inner.retain_mut(|h| {
+            if h.id != id {
+                return true;
+            }
+            match replaced {
+                None => {
+                    replaced = Some(std::mem::replace(&mut h.value, value.clone()));
+                    true
+                }
+                Some(_) => false,
+            }
+        });
+        if replaced.is_none() {
+            self.inner.push(Header { id, value });
         }
-        self.inner.push(Header { id, value });
-        None
+        replaced
     }
 
     /// Append a header whose name is already interned, allowing duplicates.
@@ -396,9 +409,24 @@ impl HeaderMap {
     /// Remove a header by name (case-insensitive), returning its value.
     #[inline]
     pub fn remove(&mut self, name: &str) -> Option<Bytes> {
+        // Removes *every* occurrence, returning the first. A `remove` that left
+        // later duplicates behind would be a hole rather than a convenience:
+        // code that strips a client-supplied `X-Forwarded-For` or
+        // `Authorization` before trusting the request would strip only the
+        // first line and leave the attacker's second one in the map. Use
+        // [`remove_all`](Self::remove_all) when the count is what you want.
         let needle = Needle::new(name);
-        let pos = self.inner.iter().position(|h| needle.matches(&h.id))?;
-        Some(self.inner.remove(pos).value)
+        let mut removed = None;
+        self.inner.retain_mut(|h| {
+            if !needle.matches(&h.id) {
+                return true;
+            }
+            if removed.is_none() {
+                removed = Some(h.value.clone());
+            }
+            false
+        });
+        removed
     }
 
     /// Remove every header with the given name, returning how many were removed.
@@ -879,6 +907,61 @@ mod tests {
     /// `insert_id` is the pre-interned `insert`, so it must behave as `insert`
     /// does in the one place they could plausibly differ: what happens to an
     /// existing field of the same name.
+    /// The serve path appends every occurrence a request carried, so a
+    /// replacing operation that spared later duplicates would leave a
+    /// client-supplied value behind exactly where code was trying to overwrite
+    /// it. `http::HeaderMap::insert` collapses; so must this.
+    #[test]
+    fn insert_collapses_every_occurrence_of_a_repeated_field() {
+        use bytes::Bytes;
+
+        let mut headers = HeaderMap::new();
+        // As the wire delivered it: two field lines, the second attacker-chosen.
+        headers.append_id(
+            header_id::intern("x-forwarded-for"),
+            Bytes::from_static(b"203.0.113.7"),
+        );
+        headers.append_id(
+            header_id::intern("x-forwarded-for"),
+            Bytes::from_static(b"198.51.100.9"),
+        );
+        assert_eq!(headers.get_all("x-forwarded-for").len(), 2);
+
+        // The canonical sanitisation idiom.
+        headers.insert("X-Forwarded-For", "10.0.0.1");
+
+        let all = headers.get_all("x-forwarded-for");
+        assert_eq!(
+            all,
+            vec!["10.0.0.1"],
+            "a replacing insert must leave exactly one occurrence; a surviving \
+             duplicate is a value the caller believed it had overwritten"
+        );
+    }
+
+    #[test]
+    fn remove_takes_every_occurrence_not_just_the_first() {
+        use bytes::Bytes;
+
+        let mut headers = HeaderMap::new();
+        headers.append_id(HeaderId::Accept, Bytes::from_static(b"first"));
+        headers.append_id(HeaderId::Accept, Bytes::from_static(b"second"));
+
+        let removed = headers.remove("accept");
+
+        assert_eq!(
+            removed.as_deref(),
+            Some(&b"first"[..]),
+            "the first occurrence comes back, as before"
+        );
+        assert!(
+            headers.get("accept").is_none(),
+            "stripping a header must strip all of it, or code that removes an \
+             untrusted field before trusting the request keeps the attacker's \
+             second line"
+        );
+    }
+
     #[test]
     fn insert_id_replaces_the_first_match_like_insert() {
         use bytes::Bytes;

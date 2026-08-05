@@ -1,17 +1,29 @@
 //! HTTP/1.1 Pipelining Support
 //!
-//! This module wraps [`hyper::server::conn::http1::Builder`] and carries a
-//! [`PipelineConfig`] alongside connection-level statistics ([`PipelineStats`],
-//! [`ConnectionStats`]). HTTP/1.1 request pipelining itself (multiple requests
-//! in flight on one connection without waiting for each response) is handled
-//! by hyper's H1 connection driver, not by this module — this module only
-//! configures the subset of hyper's builder knobs that affect that behavior
-//! and tracks stats around it.
+//! This module carries a [`PipelineConfig`] alongside connection-level
+//! statistics ([`PipelineStats`], [`ConnectionStats`]) and configures hyper's
+//! HTTP/1.1 and HTTP/2 connection builders from it. Under the default
+//! `h1-backend` feature the HTTP/1.1 half of that is inert: HTTP/1.1 is served
+//! by `armature-h1`, which takes its settings from
+//! `crate::h1_backend::serve::h1_config` instead, and hyper is left serving
+//! HTTP/2 only. Request pipelining itself — multiple requests in flight on one
+//! connection without waiting for each response — is a property of the
+//! connection driver, not of this module.
 //!
-//! ## What `PipelineConfig` actually controls today
+//! ## Where each `PipelineConfig` field goes
 //!
-//! [`PipelinedHttp1Builder::configure_hyper_builder`] forwards exactly two
-//! fields onto hyper's [`hyper::server::conn::http1::Builder`]:
+//! ### Wired on the `h1-backend` path (the default)
+//!
+//! - `keep_alive_timeout` -> `armature_h1::Limits::idle_timeout`, the deadline
+//!   for the next request to begin on an idle keep-alive connection.
+//! - `max_header_size` -> `armature_h1::Limits::max_head_bytes`, a byte cap on
+//!   the request line plus header section.
+//! - `tcp_nodelay` -> `armature_h1::TcpConfig::nodelay`.
+//!
+//! ### Wired on the hyper path only
+//!
+//! [`PipelinedHttp1Builder::configure_hyper_builder`] forwards two fields onto
+//! hyper's [`hyper::server::conn::http1::Builder`]:
 //!
 //! - `pipeline_flush` -> [`Builder::pipeline_flush`](hyper::server::conn::http1::Builder::pipeline_flush)
 //! - `read_buffer_size` -> [`Builder::max_buf_size`](hyper::server::conn::http1::Builder::max_buf_size)
@@ -19,39 +31,34 @@
 //!   `PipelineConfig::low_latency()`/`::memory_efficient()` set 4096, which
 //!   would otherwise panic)
 //!
-//! `tcp_nodelay` is applied separately by the caller (`Application`) directly
-//! to the accepted `TcpStream`, not by this module.
+//! `armature-h1` writes each response as it is produced and grows its read
+//! buffer from a fixed chunk size, so it exposes no knob for either. With
+//! `h1-backend` on, both reach only the HTTP/2 connections hyper still serves.
 //!
-//! The remaining `PipelineConfig` fields — `mode`, `max_concurrent`,
-//! `max_buffered_requests`, `keep_alive_timeout`, `max_requests_per_connection`,
-//! `write_buffer_size`, and `max_header_size` — are **not currently wired to
-//! any behavior**. They are recorded on the config (and `mode` is echoed into
-//! a `tracing` log line) but nothing branches on `mode`, and hyper's H1
-//! `Builder` has no direct equivalent for the others:
+//! `tcp_nodelay` is also wired here, but not by this module: on the hyper path
+//! the caller (`Application`) calls `TcpStream::set_nodelay` on the accepted
+//! socket itself.
 //!
-//! - `keep_alive_timeout`: hyper's H1 builder only exposes `keep_alive(bool)`
-//!   (used, hardcoded to `true`) and a header-read timeout
-//!   ([`Builder::header_read_timeout`](hyper::server::conn::http1::Builder::header_read_timeout)),
-//!   which is a different concept (time to read request headers, not idle
-//!   keep-alive duration) and requires a [`hyper::rt::Timer`] the caller does
-//!   not currently supply. There is no builder-level idle-timeout knob to
-//!   wire this field into.
-//! - `max_header_size`: hyper's H1 builder exposes
-//!   [`Builder::max_headers`](hyper::server::conn::http1::Builder::max_headers),
-//!   but that method takes a **count** of headers (default 100), while this
-//!   field is documented and used elsewhere as a **byte size** (default
-//!   16384). Passing the byte value straight through would silently change
-//!   its meaning, so it is left unwired rather than misapplied.
-//! - `mode`, `max_concurrent`, `max_buffered_requests`,
-//!   `max_requests_per_connection`, `write_buffer_size`: these describe
-//!   request-scheduling / connection-lifecycle policy that hyper's per-
-//!   connection H1 builder has no API surface for at all; implementing them
-//!   would require custom logic layered above hyper (e.g. a semaphore around
-//!   concurrent handlers, a request counter that forces connection close, a
-//!   wrapping idle timer), which does not exist in this crate today.
+//! ### Wired on neither path
 //!
-//! Selecting a `PipelineMode` currently has **no effect** on server
-//! behavior beyond appearing in logs and being queryable via
+//! `mode`, `max_concurrent`, `max_buffered_requests`,
+//! `max_requests_per_connection` and `write_buffer_size` are recorded on the
+//! config (and `mode` is echoed into a `tracing` log line) but nothing reads
+//! them. The reasons differ per backend:
+//!
+//! - On the `h1-backend` path the three concurrency/lifecycle limits are
+//!   structurally moot: `armature-h1` reads no further than one complete head
+//!   and does not read again until that request's response has been written,
+//!   so there is never more than one request in flight on a connection to
+//!   limit. `mode` and `write_buffer_size` have nothing to attach to either.
+//! - On the hyper path, hyper's per-connection H1 builder has no API surface
+//!   for request scheduling, per-connection request counts, or a separate
+//!   write-buffer size (only the combined `max_buf_size`, which
+//!   `read_buffer_size` already maps to). Implementing them would need custom
+//!   logic layered above hyper that this crate does not have.
+//!
+//! Selecting a `PipelineMode` therefore has **no effect** on server behavior
+//! beyond appearing in logs and being queryable via
 //! [`PipelineMode::maintains_order`] / [`PipelineMode::is_concurrent`].
 //!
 //! ## Configuration
@@ -60,10 +67,10 @@
 //! use armature_core::pipeline::{PipelineConfig, PipelineMode};
 //!
 //! let config = PipelineConfig::builder()
-//!     .mode(PipelineMode::Concurrent) // currently informational only
-//!     .max_concurrent(16)             // currently unused
-//!     .pipeline_flush(true)           // wired to hyper's Builder
-//!     .keep_alive_timeout(Duration::from_secs(60)) // currently unused
+//!     .mode(PipelineMode::Concurrent) // informational only
+//!     .max_concurrent(16)             // unwired on both backends
+//!     .pipeline_flush(true)           // hyper path only
+//!     .keep_alive_timeout(Duration::from_secs(60)) // h1-backend path only
 //!     .build();
 //! ```
 
@@ -105,21 +112,27 @@ impl PipelineMode {
 
 /// Configuration for HTTP/1.1 pipelining
 ///
-/// See the [module docs](self) for exactly which of these fields are
-/// currently applied to server behavior versus recorded but unused.
+/// Which of these fields reach server behavior depends on the backend: see
+/// the [module docs](self) for the per-backend split, and each field below
+/// for where it lands.
 #[derive(Debug, Clone)]
 pub struct PipelineConfig {
     /// Pipeline processing mode.
     ///
-    /// **Not currently wired**: nothing branches on this value; it is only
-    /// echoed into a `tracing` log line by the caller.
+    /// **Not wired on either path**: nothing branches on this value; it is
+    /// only echoed into a `tracing` log line by the caller. Neither backend
+    /// exposes a request-scheduling policy for it to select.
     pub mode: PipelineMode,
 
     /// Maximum number of concurrent requests per connection.
     ///
-    /// **Not currently wired**: hyper's H1 builder has no per-connection
-    /// concurrency-limit knob; enforcing this would require custom
-    /// scheduling logic above hyper that does not exist yet.
+    /// **Not wired on either path.** On the `h1-backend` path — the default —
+    /// the limit is structurally moot: `armature-h1` reads no further than one
+    /// complete head and does not read again until that request's response has
+    /// been written, so there is never more than one request in flight on a
+    /// connection to limit. On the hyper path, hyper's H1 builder has no
+    /// per-connection concurrency-limit knob, and enforcing one would require
+    /// custom scheduling logic above hyper that does not exist.
     pub max_concurrent: usize,
 
     /// Enable pipeline flush optimization.
@@ -136,8 +149,12 @@ pub struct PipelineConfig {
 
     /// Maximum number of pipelined requests to buffer.
     ///
-    /// **Not currently wired**: hyper's H1 builder has no request-buffering
-    /// limit; there is no equivalent knob to apply this to.
+    /// **Not wired on either path.** On the `h1-backend` path there is nothing
+    /// to buffer: `armature-h1` reads no further than one complete head and
+    /// does not read again until that request's response has been written, so
+    /// a second pipelined request is never taken off the socket to be queued.
+    /// On the hyper path, hyper's H1 builder has no request-buffering limit to
+    /// apply this to.
     pub max_buffered_requests: usize,
 
     /// Keep-alive timeout for idle connections.
@@ -155,16 +172,22 @@ pub struct PipelineConfig {
     /// Maximum requests per connection before forcing close.
     /// Helps prevent resource exhaustion.
     ///
-    /// **Not currently wired**: hyper's H1 builder has no request-count
-    /// limit; enforcing this would require closing the connection from
-    /// caller-side logic after N requests, which does not exist yet.
+    /// **Not wired on either path.** `armature-h1` serves one request at a
+    /// time per connection and exposes no per-connection request budget, and
+    /// hyper's H1 builder has no request-count limit either; enforcing this
+    /// would require closing the connection from caller-side logic after N
+    /// requests, which neither backend gives this crate a hook for.
     pub max_requests_per_connection: Option<u64>,
 
     /// Enable TCP_NODELAY for lower latency.
     ///
-    /// **Wired**, but not by this module: the caller (`Application`) reads
-    /// this field directly and calls `TcpStream::set_nodelay` on the
-    /// accepted socket before handing it to hyper.
+    /// **Wired on both paths**, but not by this module — and by a different
+    /// mechanism on each. On the hyper path the caller (`Application`) reads
+    /// this field directly and calls `TcpStream::set_nodelay` on the accepted
+    /// socket before handing it to hyper. On the `h1-backend` path — the
+    /// default — this process does not own the accepted socket, so the value
+    /// is forwarded as `armature_h1::TcpConfig::nodelay` and applied by
+    /// `armature-h1`'s own accept loop.
     pub tcp_nodelay: bool,
 
     /// Read buffer size hint (bytes).
@@ -180,9 +203,10 @@ pub struct PipelineConfig {
 
     /// Write buffer size hint (bytes).
     ///
-    /// **Not currently wired**: hyper's H1 builder has no separate
-    /// write-buffer-size knob (only the combined `max_buf_size`, which
-    /// `read_buffer_size` already maps to).
+    /// **Not wired on either path**: `armature-h1` writes each response as it
+    /// is produced and takes no write-buffer hint, and hyper's H1 builder has
+    /// no separate write-buffer-size knob (only the combined `max_buf_size`,
+    /// which `read_buffer_size` already maps to).
     pub write_buffer_size: usize,
 
     /// Maximum header size (bytes).

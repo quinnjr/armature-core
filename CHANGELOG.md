@@ -10,6 +10,25 @@ Changes at or before `0.6.0` are recorded in the workspace
 
 ## [Unreleased]
 
+## [0.9.0] - 2026-08-05
+
+### Release ordering
+
+This release depends on `armature-h1 >= 0.3.0`, and `armature-h1` re-exports
+into this crate's public API (`ByteStr`, `HeaderId`, `Method`, `header_id`,
+and the signatures that use them), so it is a **public dependency**: two
+incompatible `armature-h1` versions in one graph produce `expected HeaderId,
+found HeaderId`. That is why this is `0.9.0` and not another `0.8.x` — moving
+a public dependency across a `0.x` minor is a breaking change for consumers.
+
+Publish in this order:
+
+1. `armature-h1 0.3.0` to crates.io.
+2. `armature-core 0.9.0`.
+3. Every sibling crate that pins `armature-core`, re-pinned to `"0.9"` and
+   released in the same train — a sibling still requiring `"0.8"` would
+   resolve a second, incompatible `armature-core` alongside this one.
+
 ### Added
 
 - `h1-backend` cargo feature, **on by default**: HTTP/1.1 is served by

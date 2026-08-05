@@ -233,13 +233,20 @@ impl HttpRequest {
         // line `get` would never reach. Splitting each line and chaining them is
         // the same sequence joining them with commas would produce, without the
         // intermediate `String`.
+        // Empty elements are kept rather than filtered, which looks like
+        // sloppiness and is the opposite. Discarding them shortens the list,
+        // and since the entry is chosen by counting from the *right*, a shorter
+        // list slides the index one position further left — onto an entry the
+        // client supplied. A malformed or empty hop means the chain is not the
+        // one the deployment was configured for, and the safe answer to that is
+        // no answer: the empty string fails `parse` below and the function
+        // returns `None`.
         let hops: Vec<&str> = self
             .headers
             .get_all("X-Forwarded-For")
             .into_iter()
             .flat_map(|line| line.split(','))
             .map(str::trim)
-            .filter(|hop| !hop.is_empty())
             .collect();
 
         // Counting from the right. A depth deeper than the chain present means
@@ -1175,6 +1182,26 @@ mod tests {
     /// `10.0.0.1:5555` — stands in for a reverse proxy.
     fn proxy() -> SocketAddr {
         SocketAddr::from(([10, 0, 0, 1], 5555))
+    }
+
+    /// An empty hop must not shorten the chain. The entry is selected by
+    /// counting from the right, so dropping one slides the index left — onto an
+    /// entry the client wrote. Failing closed is the only safe answer to a
+    /// chain that does not match the deployment.
+    #[test]
+    fn an_empty_hop_fails_closed_rather_than_sliding_the_index() {
+        let mut req = HttpRequest::new("GET", "/").with_peer(Some(proxy()));
+        // A misconfigured intermediary emits an empty element after the
+        // client's value. With the empty entry discarded, depth 1 would land on
+        // the client's own entry and return it as the trusted address.
+        req.headers.insert("X-Forwarded-For", "198.51.100.9, ");
+
+        assert_eq!(
+            req.client_address(1),
+            None,
+            "a chain containing an unusable hop must yield no address, not the \
+             entry next to it"
+        );
     }
 
     #[test]

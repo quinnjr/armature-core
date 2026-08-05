@@ -30,6 +30,14 @@ use crate::pipeline::PipelineConfig;
 use armature_h1::{Config, Limits, Server, ServerHandle, TcpConfig};
 use hyper_util::rt::TokioExecutor;
 use std::net::SocketAddr;
+use std::time::Duration;
+
+/// A deadline long enough to be no deadline.
+///
+/// `Duration::MAX` would overflow the instant arithmetic behind
+/// `tokio::time::sleep`, so this is a century — past the uptime of any process
+/// that will ever run this code, and still safe to add to `Instant::now()`.
+const NO_DEADLINE: Duration = Duration::from_secs(100 * 365 * 24 * 60 * 60);
 
 /// Signals shutdown when dropped.
 ///
@@ -107,10 +115,50 @@ pub(crate) fn h1_config(
         // with the envelope.
         max_body_bytes: u64::MAX,
         idle_timeout: pipeline.keep_alive_timeout,
+        // The next two are deliberately effectively-unbounded rather than
+        // inherited from `Limits::default()`, and that is the whole point of
+        // naming them here.
+        //
+        // `body_timeout` in `armature-h1` does not bound body *reads* — it
+        // races the entire handler future, answering a bare `408` and closing
+        // when it expires. `write_timeout` bounds the response write the same
+        // way. Both default to 30 seconds there, which is a sensible default
+        // for a server that owns its own policy; inherited here it would be a
+        // deadline this framework never had. The hyper path supplies no
+        // `hyper::rt::Timer` and therefore imposes no request deadline at all,
+        // so taking the defaults would have meant a default-on feature
+        // silently cancelling every long-poll, slow report and large upload at
+        // 30 seconds — with no `PipelineConfig` field able to raise it, no
+        // framework error envelope, and nothing logged, because the handler is
+        // cancelled before `dispatch_request` can return. A 200 MB response to
+        // a slow client would have been truncated mid-body with a
+        // `Content-Length` that never arrived.
+        //
+        // A request deadline is a feature worth having, but it has to be one
+        // the caller asks for. Until `PipelineConfig` carries one, matching the
+        // previous behaviour is the honest default.
+        body_timeout: NO_DEADLINE,
+        write_timeout: NO_DEADLINE,
+        // `header_timeout` is left at the default on purpose: it bounds how
+        // long a peer may take to send a complete head once it has sent a
+        // first byte, which is the slowloris defence, not a handler deadline.
+        // The hyper path had no equivalent, so this one is a gain rather than
+        // a regression.
         ..Limits::default()
     };
 
-    let mut cfg = Config::new(addr).limits(limits);
+    let mut cfg = Config::new(addr)
+        .limits(limits)
+        // Opted out rather than inherited. `armature-h1` defaults this on,
+        // which is right for a server that owns the whole process — but here
+        // the caller's own multi-threaded runtime is still running h2c
+        // listeners, exception-filter tasks and the HTTP-redirect server, and
+        // pinning N worker threads to cores 0..N puts them in contention with
+        // it on exactly those cores. That is a scheduling decision no
+        // armature-core user asked for. It also fails silently in a container
+        // that forbids `sched_setaffinity`, so a deployment could believe it
+        // was pinned when it was not.
+        .pin_cores(false);
     cfg.tcp = TcpConfig {
         nodelay: pipeline.tcp_nodelay,
         ..TcpConfig::default()
@@ -160,9 +208,30 @@ pub(crate) async fn serve_bound(
     h2: Option<hyper::server::conn::http2::Builder<TokioExecutor>>,
     on_bound: impl FnOnce(SocketAddr, ServerHandle),
 ) -> Result<(), crate::Error> {
-    let server = Server::bind(cfg).map_err(crate::Error::from)?;
+    // Read before `cfg` moves into `bind`, so a failure can name the address it
+    // failed on. `Error::Io`'s rendering is just the errno — "Address already
+    // in use" with no port is useless to an operator running four listeners.
+    let requested = cfg.addr;
+    let tls = cfg.tls.is_some();
+    let workers = cfg.workers;
+    let idle_timeout = cfg.limits.idle_timeout;
+
+    let server = Server::bind(cfg).map_err(|e| {
+        error!(address = %requested, error = %e, "failed to bind");
+        crate::Error::Io(e)
+    })?;
     let addr = server.local_addr();
-    info!(address = %addr, "HTTP server listening (armature-h1 backend)");
+    // Reports what was actually configured rather than a fixed string: the
+    // effective limits are otherwise unrecoverable from outside the process,
+    // and a line reading "HTTP server listening" on an HTTPS listener is how an
+    // operator concludes their TLS config did not apply.
+    info!(
+        address = %addr,
+        tls,
+        workers,
+        ?idle_timeout,
+        "server listening (armature-h1 backend)"
+    );
     on_bound(addr, server.handle());
 
     // Held across the await below, which is the whole point: it is the drop of
@@ -196,6 +265,22 @@ pub(crate) async fn serve_bound(
     .await;
 
     match joined {
+        // `Server::serve` returns `Ok(())` both when it drained after a
+        // shutdown signal and when every worker thread died before serving
+        // anything — it joins its handles and discards the results, and a
+        // worker exits silently if its runtime or listener could not be built.
+        // Treating the two alike would let a process that never served a byte
+        // exit `main` with status 0: no restart from a supervisor watching for
+        // failure, and an operator looking at a port that answers nothing and a
+        // log that says the server finished. A clean exit is one somebody asked
+        // for, so ask.
+        Ok(Ok(())) if !_stop.0.is_shutting_down() => {
+            error!(address = %addr, "armature-h1 workers stopped without a shutdown signal");
+            Err(crate::Error::Internal(format!(
+                "armature-h1 server on {addr} exited without a shutdown signal; \
+                 its worker threads stopped before serving"
+            )))
+        }
         Ok(Ok(())) => Ok(()),
         Ok(Err(e)) => Err(crate::Error::from(e)),
         Err(join) => {

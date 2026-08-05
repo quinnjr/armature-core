@@ -6,7 +6,7 @@ use crate::guard::{Guard, GuardContext};
 use crate::http2::{Http2Builder, Http2Config, Http2Stats};
 use crate::http3::{Http3Config, Http3Stats};
 use crate::logging::{debug, error, info, trace, warn};
-use crate::pipeline::{PipelineConfig, PipelineStats, PipelinedHttp1Builder};
+use crate::pipeline::{PipelineConfig, PipelineStats};
 use crate::route_cache::OptimizedRouter;
 use crate::{
     Container, Error, HttpRequest, HttpResponse, HttpsConfig, LifecycleManager, Module, Router,
@@ -21,6 +21,13 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::net::TcpListener;
+
+// Only the hyper serve path builds HTTP/1.1 connections and terminates TLS in
+// this process; with `h1-backend` on, `armature-h1` does both and these two
+// have no remaining use here.
+#[cfg(not(feature = "h1-backend"))]
+use crate::pipeline::PipelinedHttp1Builder;
+#[cfg(not(feature = "h1-backend"))]
 use tokio_rustls::TlsAcceptor;
 
 /// The main application struct
@@ -101,7 +108,7 @@ impl ScopedGuard {
 /// [`Application::serve_state`]). The linear router remains the registration
 /// target; only per-request dispatch is accelerated.
 #[derive(Clone)]
-struct ServeState {
+pub(crate) struct ServeState {
     router: Arc<OptimizedRouter>,
     cors: Option<Arc<CorsConfig>>,
     guards: Arc<[ScopedGuard]>,
@@ -110,6 +117,75 @@ struct ServeState {
     /// `None` preserves the original behavior: errors go straight to
     /// [`Error::to_client_response`] via [`error_response`].
     filter_chain: Option<Arc<ExceptionFilterChain>>,
+    /// The peer of the connection this state is serving, stamped onto every
+    /// request that arrives on it (see [`HttpRequest::peer`]).
+    ///
+    /// Carried here rather than passed to `handle_request` because the state is
+    /// already cloned once per connection, which is exactly the scope a peer
+    /// address has: it is a property of the connection, not of the request.
+    /// `None` on a path that does not know the address.
+    peer: Option<SocketAddr>,
+}
+
+impl ServeState {
+    /// A state with only a router and a body cap, for tests.
+    ///
+    /// The serve path's own tests need a `ServeState` without an `Application`
+    /// behind it; every other field takes the value it has when nothing is
+    /// configured, which is what those tests want to hold constant.
+    #[cfg(all(test, feature = "h1-backend"))]
+    pub(crate) fn for_test(router: Arc<OptimizedRouter>, max_body_size: usize) -> Self {
+        Self {
+            router,
+            cors: None,
+            guards: Vec::new().into(),
+            max_body_size,
+            filter_chain: None,
+            peer: None,
+        }
+    }
+
+    /// Serve with CORS configured, for tests.
+    #[cfg(all(test, feature = "h1-backend"))]
+    pub(crate) fn with_cors_for_test(mut self, cors: CorsConfig) -> Self {
+        self.cors = Some(Arc::new(cors));
+        self
+    }
+
+    /// Serve with one globally-scoped guard, for tests.
+    ///
+    /// An empty prefix, matching [`Application::with_guard`], so the guard runs
+    /// for every request path.
+    #[cfg(all(test, feature = "h1-backend"))]
+    pub(crate) fn with_guard_for_test(mut self, guard: Arc<dyn Guard>) -> Self {
+        self.guards = vec![ScopedGuard {
+            prefix: String::new(),
+            guard,
+        }]
+        .into();
+        self
+    }
+
+    /// Serve with a global exception filter chain, for tests.
+    ///
+    /// The only live-socket filter tests drive [`handle_request`], so the final
+    /// hop the `armature-h1` path takes — `dispatch_request` →
+    /// `respond_to_error` → `to_h1_response` — was asserted nowhere. A filter
+    /// response losing its status or its body in that hop is invisible without
+    /// a way to put a chain on a `ServeState` the serve tests build.
+    #[cfg(all(test, feature = "h1-backend"))]
+    pub(crate) fn with_filter_chain_for_test(mut self, chain: ExceptionFilterChain) -> Self {
+        self.filter_chain = Some(Arc::new(chain));
+        self
+    }
+
+    /// The same state, serving one connection whose peer is known.
+    pub(crate) fn for_peer(&self, peer: SocketAddr) -> Self {
+        Self {
+            peer: Some(peer),
+            ..self.clone()
+        }
+    }
 }
 
 /// CORS configuration for the application.
@@ -212,14 +288,24 @@ impl Application {
     /// Configure CORS for the application. Handles preflight OPTIONS
     /// requests automatically and adds CORS headers to every response.
     ///
-    /// # Precedence over registered OPTIONS routes
+    /// # Interaction with registered OPTIONS routes
     ///
-    /// The preflight handler answers *every* `OPTIONS` request with `204` before
-    /// the router is consulted — it does not check whether a route exists, since
-    /// a preflight is sent for a path the browser is about to call with some
-    /// other method. A handler registered with `Router::options` is therefore
-    /// unreachable while CORS is configured. If you need to serve `OPTIONS`
-    /// yourself, leave CORS off here and add it as middleware you control.
+    /// Only an actual CORS preflight is intercepted: an `OPTIONS` request that
+    /// carries `Access-Control-Request-Method`, which is what a browser sends
+    /// and what the Fetch standard defines a preflight to be. It is answered
+    /// with `204` before the router is consulted, deliberately without checking
+    /// whether a route exists — a preflight names a path the browser is *about*
+    /// to call with some other method, so requiring an `OPTIONS` route for it
+    /// would mean registering one beside every CORS-reachable handler.
+    ///
+    /// Any other `OPTIONS` request routes normally. RFC 9110 section 9.3.7
+    /// gives `OPTIONS` a meaning of its own — ask what a resource supports —
+    /// and a handler registered with `Router::options` keeps serving it.
+    ///
+    /// This applies to **every** listener. Before `0.9`, only
+    /// [`listen_on`](Self::listen_on) consulted this configuration and every
+    /// TLS listener silently ignored it, so an HTTPS server got no CORS headers
+    /// at all.
     pub fn with_cors(mut self, config: CorsConfig) -> Self {
         self.cors_config = Some(Arc::new(config));
         self
@@ -276,6 +362,15 @@ impl Application {
     /// `exclusive`) are advisory and are not applied by the built-in server
     /// (tokio owns its epoll registration).
     ///
+    /// **With the default `h1-backend` feature this applies only to
+    /// [`listen_h2c`](Self::listen_h2c).** Every other listener hands binding
+    /// and accepting to `armature-h1`, so there is no listener fd in this
+    /// process to configure and no accept loop to configure accepted sockets
+    /// from. `armature-h1`'s own `TcpConfig` covers the part that survives
+    /// — `TCP_NODELAY`, backlog, and `SO_REUSEPORT` (which it sets *before*
+    /// bind, so it actually works there). Build with `default-features = false`
+    /// to get the hyper serve path and this method's full effect back.
+    ///
     /// See also [`crate::connection_tuning::TcpConfig`] for the related
     /// per-workload TCP tuning API.
     ///
@@ -299,13 +394,24 @@ impl Application {
     /// uses the O(1) fast path instead of an O(n) linear scan. Called once per
     /// `listen*` entry point (server startup), so the compilation cost is paid
     /// a single time.
-    fn serve_state(&self, cors: Option<Arc<CorsConfig>>) -> ServeState {
+    ///
+    /// The CORS configuration is read from `self` here rather than passed in by
+    /// each listener, and that is deliberate. It used to be a parameter, and
+    /// every TLS listener passed `None` — so `with_cors` was a builder method
+    /// that accepted configuration and dropped it on the floor for anything but
+    /// plaintext. Fixing the call sites one by one leaves the mechanism intact:
+    /// the next `listen_*` method to be written can pass `None` again and
+    /// silently disable CORS a second time, and nothing would catch it. With no
+    /// parameter there is nothing to get wrong.
+    fn serve_state(&self) -> ServeState {
         ServeState {
             router: Arc::new(OptimizedRouter::from_router(&self.router)),
-            cors,
+            cors: self.cors_config.clone(),
             guards: self.guards.clone().into(),
             max_body_size: self.max_body_size,
             filter_chain: self.filter_chain.clone().map(Arc::new),
+            // Set per connection by the accept loops; this is the template.
+            peer: None,
         }
     }
 
@@ -327,6 +433,14 @@ impl Application {
     /// Get the pipeline statistics
     ///
     /// Use this to monitor pipeline performance at runtime.
+    ///
+    /// **With the default `h1-backend` feature every counter here stays at
+    /// zero.** The counters were incremented from the hyper accept loop;
+    /// `armature-h1` owns that loop now and exposes no hook into it. Nothing
+    /// about request handling changed — but a dashboard reading these will read
+    /// flat, which is a healthy-looking idle system rather than an obvious
+    /// failure. Build with `default-features = false` to get them back, or read
+    /// HTTP/1.1 traffic from your own middleware.
     pub fn pipeline_stats(&self) -> Arc<PipelineStats> {
         Arc::clone(&self.pipeline_stats)
     }
@@ -354,6 +468,12 @@ impl Application {
     /// Get the HTTP/2 statistics
     ///
     /// Use this to monitor HTTP/2 connection and stream metrics at runtime.
+    ///
+    /// These keep counting with the default `h1-backend` feature: HTTP/2 is
+    /// still served by hyper on both [`listen_h2c`](Self::listen_h2c) and the
+    /// `h2`-negotiating half of [`listen_https_h2`](Self::listen_https_h2), and
+    /// only those connections were ever counted here. Its HTTP/1.1 companion
+    /// [`pipeline_stats`](Self::pipeline_stats) does *not* — see there.
     pub fn http2_stats(&self) -> Arc<Http2Stats> {
         Arc::clone(&self.http2_stats)
     }
@@ -792,14 +912,23 @@ impl Application {
 
     /// Start the HTTP server on the specified port
     ///
-    /// Uses HTTP/1.1 pipelining for improved throughput. Configure pipelining
-    /// behavior with `with_pipeline_config()` before calling this method.
+    /// Configure HTTP/1.1 connection behavior with `with_pipeline_config()`
+    /// before calling this method.
     ///
     /// # Pipelining
     ///
-    /// HTTP/1.1 pipelining allows clients to send multiple requests on the
-    /// same connection without waiting for responses. This significantly
-    /// improves throughput, especially on high-latency connections.
+    /// With the default `h1-backend` feature, requests arriving on one
+    /// connection are served **one at a time**: `armature-h1` reads no further
+    /// than a single head and does not read again until that response has been
+    /// written. A client may still pipeline — the extra requests simply wait in
+    /// the socket buffer — but the throughput win of overlapping them is not
+    /// available, and a slow handler holds up everything queued behind it on
+    /// the same connection. Build with `default-features = false` for the hyper
+    /// serve path, which does overlap pipelined requests.
+    ///
+    /// See [`listen_on`](Self::listen_on) for the rest of what the default
+    /// backend changes: parser strictness, the blocking-handler hazard, the
+    /// flat statistics, and the inert `epoll_config`.
     ///
     /// # Example
     ///
@@ -839,9 +968,95 @@ impl Application {
     /// # Ok(())
     /// # }
     /// ```
+    ///
+    /// # With the default `h1-backend` feature
+    ///
+    /// HTTP/1.1 is served by the sibling crate `armature-h1` rather than by
+    /// hyper. It is the same framework above the transport — same routing, same
+    /// guards, same filters — but the transport itself behaves differently in
+    /// four ways a deployment can notice. All four apply to every HTTP/1.1
+    /// listener on this type, not only this one. Build with
+    /// `default-features = false` to get the hyper serve path back.
+    ///
+    /// **The parser is stricter.** `armature-h1` prescans the request head for
+    /// strict CRLF framing before tokenizing it, and rejects a bare CR, a bare
+    /// LF as a line terminator, obs-fold, whitespace before a field-name colon,
+    /// a non-token field name, a non-UTF-8 or otherwise invalid request target,
+    /// and any version other than HTTP/1.0 or HTTP/1.1. RFC 9112 permits some
+    /// of that leniency; this backend declines it, because leniency that
+    /// differs from a proxy's in front of it is a request-smuggling vector. A
+    /// client or test harness that was getting away with a malformed head under
+    /// hyper now gets a `400` and a closed connection.
+    ///
+    /// **A blocking handler stalls its whole worker.** `armature-h1` runs N
+    /// pinned OS threads, each with a `current_thread` tokio runtime serving
+    /// every connection assigned to it. A handler that blocks the thread —
+    /// synchronous file or database I/O, a `std` mutex held across work, a long
+    /// CPU loop — freezes every *other* connection on that core, not just its
+    /// own, and no work-stealing rescues them. Under a multi-threaded runtime
+    /// the same handler merely occupied one of many workers. Wrap blocking work
+    /// in `tokio::task::spawn_blocking`.
+    ///
+    /// **[`pipeline_stats`](Self::pipeline_stats) stays at zero, and
+    /// [`http2_stats`](Self::http2_stats) counts only HTTP/2.** The counters
+    /// were incremented from the accept loop; `armature-h1` owns that loop and
+    /// exposes no hook. This is observability, not behavior — but a dashboard
+    /// reading connection or request counts goes flat and reads as a healthy
+    /// idle system, which is worth knowing before the upgrade rather than after.
+    ///
+    /// **[`with_socket_tuning`](Self::with_socket_tuning) does nothing here.**
+    /// It reaches for the raw fd of a listener this process no longer owns. The
+    /// part that matters — `TCP_NODELAY`, backlog, `SO_REUSEPORT` — is covered
+    /// by `armature-h1`'s own `TcpConfig`, which sets `SO_REUSEPORT` *before*
+    /// bind and so actually gets the load balancing this method could never
+    /// deliver. Only [`listen_h2c`](Self::listen_h2c) still applies it.
     pub async fn listen_on(self, addr: impl Into<SocketAddr>) -> Result<(), Error> {
         let addr = addr.into();
 
+        // Which backend serves HTTP/1.1 is a compile-time choice, so it is made
+        // with a `cfg`-selected binding rather than a branch: exactly one of
+        // these two lines exists in any given build.
+        //
+        // The binding-then-`served` shape is not a redundant rebind waiting to
+        // be simplified away: an attribute may not decorate a tail expression,
+        // and `return` on the tail is `clippy::needless_return`. Every
+        // `listen_*` method here repeats it for the same reason.
+        #[cfg(feature = "h1-backend")]
+        let served = self.listen_on_h1(addr).await;
+        #[cfg(not(feature = "h1-backend"))]
+        let served = self.listen_on_hyper(addr).await;
+        served
+    }
+
+    /// `listen_on` over `armature-h1`'s thread-per-core server.
+    ///
+    /// Binding, accepting, TLS, and the per-connection loop all move into
+    /// `armature-h1`, so the hyper version's accept loop has no counterpart
+    /// here: what is left is configuration.
+    ///
+    /// Note what is *not* carried over. `PipelineStats` counted connections and
+    /// requests from inside the accept loop; `armature-h1` owns that loop and
+    /// exposes no hook, so those counters stay at zero on this path. They were
+    /// observability, not behaviour — but a dashboard reading them will go flat,
+    /// which is worth knowing before the upgrade rather than after.
+    ///
+    /// The `epoll_config` socket tuning is likewise not applied: it reaches for
+    /// the raw fd of a listener this process no longer owns. `armature-h1`'s
+    /// own `TcpConfig` covers the part that matters (`nodelay`, backlog,
+    /// `SO_REUSEPORT`).
+    #[cfg(feature = "h1-backend")]
+    async fn listen_on_h1(self, addr: SocketAddr) -> Result<(), Error> {
+        let state = self.serve_state();
+        let cfg = crate::h1_backend::h1_config(addr, &self.pipeline_config, None);
+        crate::h1_backend::serve(cfg, state, None).await
+    }
+
+    /// `listen_on` over `hyper::server::conn::http1`.
+    ///
+    /// The path taken with the `h1-backend` feature off, unchanged from before
+    /// that feature existed.
+    #[cfg(not(feature = "h1-backend"))]
+    async fn listen_on_hyper(self, addr: SocketAddr) -> Result<(), Error> {
         debug!(address = %addr, "Binding to address");
         let listener = TcpListener::bind(addr).await?;
 
@@ -861,7 +1076,7 @@ impl Application {
             "HTTP server listening with pipelining enabled"
         );
 
-        let state = self.serve_state(self.cors_config.clone());
+        let state = self.serve_state();
         let pipeline_builder = PipelinedHttp1Builder::with_stats(
             self.pipeline_config.clone(),
             Arc::clone(&self.pipeline_stats),
@@ -887,7 +1102,7 @@ impl Application {
             }
 
             let io = TokioIo::new(stream);
-            let state = state.clone();
+            let state = state.for_peer(client_addr);
             let http_builder = pipeline_builder.configure_hyper_builder();
             let stats = Arc::clone(&pipeline_stats);
 
@@ -936,9 +1151,66 @@ impl Application {
     /// # Ok(())
     /// # }
     /// ```
+    ///
+    /// This listener serves HTTP/1.1 only, so it advertises only `http/1.1`
+    /// over ALPN even though [`TlsConfig`] offers `h2` as well; use
+    /// [`listen_https_h2`](Self::listen_https_h2) for HTTP/2. See
+    /// [`listen_on`](Self::listen_on) for what the default `h1-backend` feature
+    /// changes about every HTTP/1.1 listener on this type.
     pub async fn listen_https(self, port: u16, tls_config: TlsConfig) -> Result<(), Error> {
         let addr = SocketAddr::from(([0, 0, 0, 0], port));
 
+        // See `listen_on` for why this is a `cfg`-selected binding and not a
+        // branch, and why the trailing `served` is not a redundant rebind.
+        #[cfg(feature = "h1-backend")]
+        let served = self.listen_https_h1(addr, tls_config, false).await;
+        #[cfg(not(feature = "h1-backend"))]
+        let served = self.listen_https_hyper(addr, tls_config).await;
+        served
+    }
+
+    /// The `armature-h1` implementation behind [`listen_https`](Self::listen_https)
+    /// and [`listen_https_h2`](Self::listen_https_h2).
+    ///
+    /// `armature-h1`'s dispatch does the ALPN check itself: it hands a
+    /// connection that negotiated `h2` to the fallback and serves everything
+    /// else as HTTP/1.1. `with_h2` decides whether that fallback is hyper's
+    /// HTTP/2 driver or a close — which is the entire difference between the
+    /// two public methods, since `listen_https` promises HTTP/1.1 only.
+    ///
+    /// See [`listen_on_h1`](Self::listen_on_h1) for what this path drops
+    /// (pipeline/HTTP-2 connection counters, `epoll_config` socket tuning).
+    #[cfg(feature = "h1-backend")]
+    async fn listen_https_h1(
+        self,
+        addr: SocketAddr,
+        tls_config: TlsConfig,
+        with_h2: bool,
+    ) -> Result<(), Error> {
+        let state = self.serve_state();
+        // The ALPN offer has to match what the fallback will actually do with
+        // an `h2` connection: when it closes them, offering `h2` is a promise
+        // the listener then breaks mid-handshake.
+        let tls = if with_h2 {
+            tls_config.server_config
+        } else {
+            without_h2_alpn(tls_config.server_config)
+        };
+        let cfg = crate::h1_backend::h1_config(addr, &self.pipeline_config, None).with_tls(tls);
+        let h2 = with_h2.then(|| {
+            Http2Builder::with_stats(self.http2_config.clone(), Arc::clone(&self.http2_stats))
+                .configure_hyper_builder()
+        });
+        crate::h1_backend::serve(cfg, state, h2).await
+    }
+
+    /// `listen_https` over `hyper::server::conn::http1`.
+    #[cfg(not(feature = "h1-backend"))]
+    async fn listen_https_hyper(
+        self,
+        addr: SocketAddr,
+        tls_config: TlsConfig,
+    ) -> Result<(), Error> {
         debug!(address = %addr, "Binding to address (HTTPS)");
         let listener = TcpListener::bind(addr).await?;
 
@@ -957,8 +1229,11 @@ impl Application {
             "HTTPS server listening with pipelining enabled"
         );
 
-        let acceptor = TlsAcceptor::from(tls_config.server_config);
-        let state = self.serve_state(None);
+        // HTTP/1.1 only, so `h2` comes back out of the ALPN offer: hyper's
+        // `http1` server rejects the h2 preface, and a protocol negotiated only
+        // to be refused is worse than one never offered. See `without_h2_alpn`.
+        let acceptor = TlsAcceptor::from(without_h2_alpn(tls_config.server_config));
+        let state = self.serve_state();
         let pipeline_builder = PipelinedHttp1Builder::with_stats(
             self.pipeline_config.clone(),
             Arc::clone(&self.pipeline_stats),
@@ -984,7 +1259,7 @@ impl Application {
             }
 
             let acceptor = acceptor.clone();
-            let state = state.clone();
+            let state = state.for_peer(client_addr);
             let http_builder = pipeline_builder.configure_hyper_builder();
             let stats = Arc::clone(&pipeline_stats);
 
@@ -1041,8 +1316,13 @@ impl Application {
     /// # Ok(())
     /// # }
     /// ```
+    ///
+    /// The HTTPS listener serves HTTP/1.1 only, so it advertises only
+    /// `http/1.1` over ALPN even though [`TlsConfig`] offers `h2` as well. See
+    /// [`listen_on`](Self::listen_on) for what the default `h1-backend` feature
+    /// changes about every HTTP/1.1 listener on this type.
     pub async fn listen_with_config(self, config: HttpsConfig) -> Result<(), Error> {
-        let state = self.serve_state(None);
+        let state = self.serve_state();
 
         // Start HTTP redirect server if configured
         if let Some(ref http_addr) = config.http_redirect_addr {
@@ -1067,6 +1347,61 @@ impl Application {
             .parse()
             .map_err(|e| Error::Internal(format!("Invalid HTTPS address: {}", e)))?;
 
+        // See `listen_on` for why this is a `cfg`-selected binding and not a
+        // branch, and why the trailing `served` is not a redundant rebind.
+        #[cfg(feature = "h1-backend")]
+        let served = self.listen_with_config_h1(https_addr, config, state).await;
+        #[cfg(not(feature = "h1-backend"))]
+        let served = self
+            .listen_with_config_hyper(https_addr, config, state)
+            .await;
+        served
+    }
+
+    /// The `armature-h1` half of [`listen_with_config`](Self::listen_with_config).
+    ///
+    /// The HTTP-to-HTTPS redirect server is already spawned by the caller and
+    /// keeps running on the caller's runtime; only the HTTPS listener moves
+    /// onto `armature-h1`.
+    ///
+    /// HTTP/2 is deliberately not offered here. The hyper version of this
+    /// method served HTTP/1.1 only, with a bare `http1::Builder`, so routing an
+    /// ALPN `h2` negotiation to hyper would add a protocol this listener never
+    /// had — a behaviour change smuggled in under a backend swap. So `h2` is
+    /// withdrawn from the ALPN offer instead of being negotiated and then
+    /// refused; see [`without_h2_alpn`].
+    #[cfg(feature = "h1-backend")]
+    async fn listen_with_config_h1(
+        self,
+        https_addr: SocketAddr,
+        config: HttpsConfig,
+        state: ServeState,
+    ) -> Result<(), Error> {
+        let redirecting = config.http_redirect_addr.is_some();
+        let cfg = crate::h1_backend::h1_config(https_addr, &self.pipeline_config, None)
+            .with_tls(without_h2_alpn(config.tls.server_config));
+        // Announced from `on_bound`, which runs once the listener exists.
+        // Printing before the bind means a port conflict shows the operator
+        // "listening on https://…" and then the error that says it never
+        // listened — and the address printed would be the requested one rather
+        // than the resolved one, which differ whenever the port is 0.
+        crate::h1_backend::serve::serve_bound(cfg, state, None, move |addr, _| {
+            println!("🔒 HTTPS Server listening on https://{}", addr);
+            if redirecting {
+                println!("↪️  HTTP redirect server enabled");
+            }
+        })
+        .await
+    }
+
+    /// The hyper half of [`listen_with_config`](Self::listen_with_config).
+    #[cfg(not(feature = "h1-backend"))]
+    async fn listen_with_config_hyper(
+        self,
+        https_addr: SocketAddr,
+        config: HttpsConfig,
+        state: ServeState,
+    ) -> Result<(), Error> {
         let listener = TcpListener::bind(https_addr).await?;
 
         #[cfg(unix)]
@@ -1082,10 +1417,13 @@ impl Application {
             println!("↪️  HTTP redirect server enabled");
         }
 
-        let acceptor = TlsAcceptor::from(config.tls.server_config);
+        // HTTP/1.1 only here too — see `without_h2_alpn`, and
+        // `listen_with_config_h1` for why this listener does not gain HTTP/2.
+        let acceptor = TlsAcceptor::from(without_h2_alpn(config.tls.server_config));
 
         loop {
-            let (stream, _) = listener.accept().await?;
+            let (stream, client_addr) = listener.accept().await?;
+            trace!(client_address = %client_addr, "TLS connection accepted");
 
             // Apply opt-in socket tuning to the accepted socket
             #[cfg(unix)]
@@ -1095,7 +1433,7 @@ impl Application {
             }
 
             let acceptor = acceptor.clone();
-            let state = state.clone();
+            let state = state.for_peer(client_addr);
 
             tokio::spawn(async move {
                 match acceptor.accept(stream).await {
@@ -1157,7 +1495,7 @@ impl Application {
         );
         warn!("HTTP/2 cleartext (h2c) is not recommended for production. Use HTTPS.");
 
-        let state = self.serve_state(None);
+        let state = self.serve_state();
         let h2_builder =
             Http2Builder::with_stats(self.http2_config.clone(), Arc::clone(&self.http2_stats));
         let h2_stats = Arc::clone(&self.http2_stats);
@@ -1174,7 +1512,7 @@ impl Application {
             }
 
             let io = TokioIo::new(stream);
-            let state = state.clone();
+            let state = state.for_peer(client_addr);
             let http_builder = h2_builder.configure_hyper_builder();
             let stats = Arc::clone(&h2_stats);
 
@@ -1220,9 +1558,33 @@ impl Application {
     /// # Ok(())
     /// # }
     /// ```
+    ///
+    /// See [`listen_on`](Self::listen_on) for what the default `h1-backend`
+    /// feature changes about the HTTP/1.1 half of this listener; the HTTP/2
+    /// half is hyper's either way, so [`http2_stats`](Self::http2_stats) keeps
+    /// counting here.
     pub async fn listen_https_h2(self, port: u16, tls_config: TlsConfig) -> Result<(), Error> {
         let addr = SocketAddr::from(([0, 0, 0, 0], port));
 
+        // `true`: connections that negotiate `h2` over ALPN go to hyper's
+        // HTTP/2 driver rather than being closed.
+        //
+        // See `listen_on` for why this is a `cfg`-selected binding and not a
+        // branch, and why the trailing `served` is not a redundant rebind.
+        #[cfg(feature = "h1-backend")]
+        let served = self.listen_https_h1(addr, tls_config, true).await;
+        #[cfg(not(feature = "h1-backend"))]
+        let served = self.listen_https_h2_hyper(addr, tls_config).await;
+        served
+    }
+
+    /// `listen_https_h2` with both protocols served by hyper.
+    #[cfg(not(feature = "h1-backend"))]
+    async fn listen_https_h2_hyper(
+        self,
+        addr: SocketAddr,
+        tls_config: TlsConfig,
+    ) -> Result<(), Error> {
         debug!(address = %addr, "Binding to address (HTTPS with HTTP/2)");
         let listener = TcpListener::bind(addr).await?;
 
@@ -1242,7 +1604,7 @@ impl Application {
         );
 
         let acceptor = TlsAcceptor::from(tls_config.server_config);
-        let state = self.serve_state(None);
+        let state = self.serve_state();
         let h1_builder = PipelinedHttp1Builder::with_stats(
             self.pipeline_config.clone(),
             Arc::clone(&self.pipeline_stats),
@@ -1264,7 +1626,7 @@ impl Application {
             }
 
             let acceptor = acceptor.clone();
-            let state = state.clone();
+            let state = state.for_peer(client_addr);
             let h1_builder_ref = h1_builder.configure_hyper_builder();
             let h2_builder_ref = h2_builder.configure_hyper_builder();
             let h1_stats = Arc::clone(&h1_stats);
@@ -1455,6 +1817,31 @@ impl Application {
     }
 }
 
+/// The same rustls configuration with `h2` withdrawn from its ALPN offer.
+///
+/// [`TlsConfig`] unconditionally advertises `["h2", "http/1.1"]`, so a listener
+/// that serves HTTP/1.1 only would negotiate `h2` with every modern browser and
+/// then drop the connection without a byte of HTTP ever crossing it — the client
+/// is told the server speaks a protocol the server immediately refuses. That is
+/// not new to the `armature-h1` backend (hyper's `http1` server rejects the h2
+/// preface too), which is precisely why it needs fixing at the offer rather than
+/// left as inherited parity: the failure is invisible from the server side and
+/// looks like a network fault from the client's.
+///
+/// Returns the input untouched when `h2` was not offered, so the common case
+/// costs a scan of a two-element list rather than a clone of the config.
+///
+/// Applied on both serve paths, because both need it: hyper's `http1` server
+/// rejects the h2 preface exactly as `armature-h1`'s `CloseH2` does.
+fn without_h2_alpn(tls: Arc<rustls::ServerConfig>) -> Arc<rustls::ServerConfig> {
+    if !tls.alpn_protocols.iter().any(|p| p.as_slice() == b"h2") {
+        return tls;
+    }
+    let mut stripped = (*tls).clone();
+    stripped.alpn_protocols.retain(|p| p.as_slice() != b"h2");
+    Arc::new(stripped)
+}
+
 /// Apply the configured socket tuning options to a raw fd, logging a
 /// warning on failure. Never fails the caller.
 #[cfg(unix)]
@@ -1518,7 +1905,7 @@ async fn start_http_redirect_server(addr: &str, https_port: u16) -> Result<(), E
 }
 
 /// Handle an incoming HTTP request
-async fn handle_request(
+pub(crate) async fn handle_request(
     req: Request<IncomingBody>,
     state: ServeState,
 ) -> Result<Response<Full<bytes::Bytes>>, hyper::Error> {
@@ -1536,7 +1923,7 @@ async fn handle_request(
         .path_and_query()
         .map_or_else(|| req.uri().path().to_owned(), |pq| pq.as_str().to_owned());
 
-    let mut armature_req = HttpRequest::new(method.clone(), target);
+    let mut armature_req = HttpRequest::new(method.clone(), target).with_peer(state.peer);
 
     // Guards and routing each consume `armature_req` by value, so the target
     // has to be kept separately for logging and guard-scope prefix matching.
@@ -1547,54 +1934,45 @@ async fn handle_request(
         .split_once('?')
         .map_or(target_handle.as_str(), |(p, _)| p);
 
-    trace!(method = %method, path = %path, "Incoming request");
-
-    if method == "OPTIONS"
-        && let Some(ref cors) = state.cors
-    {
-        let mut builder = Response::builder().status(204);
-        builder = builder.header("Access-Control-Allow-Origin", &cors.allow_origin);
-        builder = builder.header("Access-Control-Allow-Methods", &cors.allow_methods);
-        builder = builder.header("Access-Control-Allow-Headers", &cors.allow_headers);
-        builder = builder.header("Access-Control-Max-Age", cors.max_age.to_string());
-        if cors.allow_credentials {
-            builder = builder.header("Access-Control-Allow-Credentials", "true");
-        }
-        return Ok(builder.body(Full::new(bytes::Bytes::new())).unwrap());
+    if let Some(preflight) = cors_preflight(
+        &method,
+        || req.headers().contains_key("access-control-request-method"),
+        &state,
+    ) {
+        return Ok(to_hyper_response_raw(preflight, &method, path));
     }
 
     // Copy headers. One copy per value, because hyper's `HeaderValue` owns its
     // own buffer and cannot be projected into our `Bytes`; the name goes in as
     // a `&str`, so it costs nothing for a well-known header.
-    let header_count = req.headers().len();
+    //
+    // `append`, not `insert`. hyper's iterator yields each occurrence of a
+    // repeated field separately, and `insert` would replace — collapsing a
+    // field the wire sent twice to its last occurrence, while the h1 adapter
+    // keeps all of them. That divergence is not cosmetic: `client_address`
+    // reads `get_all("X-Forwarded-For")` and joins the lines per RFC 9110
+    // §5.3, so a collapsing adapter hands it one line where the other hands it
+    // all of them, and the same request resolves to a different client over
+    // HTTP/2 (served here) than over HTTP/1.1. Both adapters must present the
+    // same shape to `dispatch_request` or the policy above it is not shared at
+    // all.
     for (name, value) in req.headers() {
-        armature_req.headers.insert(
+        armature_req.headers.append(
             name.as_str(),
             bytes::Bytes::copy_from_slice(value.as_bytes()),
         );
     }
-    trace!(header_count = header_count, "Headers parsed");
 
-    // Fast-path rejection: if the client declares a Content-Length larger than
-    // the configured limit, reject with 413 before buffering any body bytes.
-    // The streaming `Limited` wrapper below still enforces the limit for
-    // chunked or undeclared bodies.
-    if let Some(declared_len) = armature_req
-        .headers
-        .get("content-length")
-        .and_then(|v| v.parse::<usize>().ok())
-        && !body_within_limit(declared_len, state.max_body_size)
-    {
-        warn!(
-            method = %method,
-            path = %path,
-            limit = state.max_body_size,
-            declared_len,
-            "Request Content-Length exceeds configured limit"
-        );
+    // Fast-path rejection, before any body byte is buffered. The streaming
+    // `Limited` wrapper below still enforces the limit for chunked or
+    // undeclared bodies.
+    let declared_len = declared_content_length(armature_req.headers.get("content-length"));
+    if let Some(rejection) = declared_length_rejection(declared_len, &method, path, &state) {
         return Ok(to_hyper_response(
-            payload_too_large_response(),
+            rejection,
             state.cors.as_deref(),
+            &method,
+            path,
         ));
     }
 
@@ -1613,6 +1991,8 @@ async fn handle_request(
             return Ok(to_hyper_response(
                 payload_too_large_response(),
                 state.cors.as_deref(),
+                &method,
+                path,
             ));
         }
         Err(err) => match err.downcast::<hyper::Error>() {
@@ -1622,6 +2002,8 @@ async fn handle_request(
                 return Ok(to_hyper_response(
                     HttpResponse::new(400),
                     state.cors.as_deref(),
+                    &method,
+                    path,
                 ));
             }
         },
@@ -1633,6 +2015,260 @@ async fn handle_request(
         armature_req.set_body_bytes(body_bytes);
         trace!(body_size = body_size, "Request body received (zero-copy)");
     }
+
+    Ok(to_hyper_response(
+        dispatch_request(armature_req, &state, start).await,
+        state.cors.as_deref(),
+        &method,
+        path,
+    ))
+}
+
+/// Serve one request that arrived over `armature-h1`.
+///
+/// The counterpart to [`handle_request`], and deliberately the same shape: both
+/// build an [`HttpRequest`], answer a CORS preflight before touching the body,
+/// enforce the body limit, and then hand off to [`dispatch_request`], which is
+/// where all the actual policy lives. Only the transport-facing edges differ.
+///
+/// Returns an `armature_h1::Response` rather than a `Result`, because there is
+/// no error to report to: `armature-h1` owns the connection and every failure
+/// this function can encounter has a status code that belongs on the wire.
+#[cfg(feature = "h1-backend")]
+pub(crate) async fn dispatch_via_h1(
+    req: armature_h1::Request,
+    state: ServeState,
+) -> armature_h1::Response {
+    use crate::h1_backend::bridge::{request_from_head, to_h1_response};
+    use std::time::Instant;
+
+    let start = Instant::now();
+    let armature_h1::Request {
+        head,
+        mut body,
+        peer,
+    } = req;
+    let method = head.method.clone();
+
+    if let Some(preflight) = cors_preflight(
+        &method,
+        || {
+            // `Access-Control-Request-Method` is outside armature-h1's
+            // well-known table, so this compares names rather than interning a
+            // needle. It runs only for an `OPTIONS` request on a
+            // CORS-configured server.
+            head.headers
+                .iter()
+                .any(|(id, _)| id.as_str() == "access-control-request-method")
+        },
+        &state,
+    ) {
+        // No CORS argument: the preflight answer already carries the full
+        // preflight header set, and appending the per-response origin pair on
+        // top of it would duplicate `Access-Control-Allow-Origin`.
+        return to_h1_response(preflight, None, &method, head.path());
+    }
+
+    // Fast-path rejection, before any body byte is buffered — the same check
+    // the hyper path makes, through the same helper. `armature-h1`
+    // independently caps the body at `Limits::max_body_bytes`, but that cap
+    // produces a bare 413 from the connection loop; going through
+    // `payload_too_large_response` here keeps the body this framework's other
+    // transports return.
+    let declared_len = declared_content_length(head.get_str(&armature_h1::HeaderId::ContentLength));
+    if let Some(rejection) = declared_length_rejection(declared_len, &method, head.path(), &state) {
+        return to_h1_response(rejection, state.cors.as_deref(), &method, head.path());
+    }
+
+    // `collect` enforces the cap while reading rather than after, so an
+    // undeclared or chunked body over the limit is refused mid-stream instead
+    // of being buffered whole first.
+    let body_bytes = match body.collect(state.max_body_size as u64).await {
+        Ok(b) => b,
+        Err(err) => {
+            let status = err.status();
+            warn!(
+                method = %method,
+                path = head.path(),
+                error = %err,
+                status,
+                "Failed to read request body"
+            );
+            let response = if status == 413 {
+                payload_too_large_response()
+            } else {
+                HttpResponse::new(status)
+            };
+            return to_h1_response(response, state.cors.as_deref(), &method, head.path());
+        }
+    };
+
+    let mut armature_req = request_from_head(head, peer);
+    if !body_bytes.is_empty() {
+        let body_size = body_bytes.len();
+        armature_req.set_body_bytes(body_bytes);
+        trace!(body_size = body_size, "Request body received (zero-copy)");
+    }
+
+    // `head` is gone into the request by now, so the target is kept the way the
+    // hyper path keeps it: a `ByteStr` clone is a refcount bump on the read
+    // buffer, and `split_once` trims the query off it without allocating.
+    let target_handle = armature_req.path.clone();
+    let path = target_handle
+        .split_once('?')
+        .map_or(target_handle.as_str(), |(p, _)| p);
+
+    to_h1_response(
+        dispatch_request(armature_req, &state, start).await,
+        state.cors.as_deref(),
+        &method,
+        path,
+    )
+}
+
+/// The CORS preflight answer for this request, if one is owed.
+///
+/// Split out of [`handle_request`] because both serve paths owe it, and both owe
+/// it at the same point: before the body is read. Moving it after the read would
+/// have an `OPTIONS` carrying a body pay for that body before being answered
+/// with a response that never looks at it.
+fn cors_preflight(
+    method: &crate::Method,
+    is_preflight: impl FnOnce() -> bool,
+    state: &ServeState,
+) -> Option<HttpResponse> {
+    let cors = state.cors.as_deref()?;
+    if method != "OPTIONS" {
+        return None;
+    }
+    // `OPTIONS` alone does not make it a preflight. RFC 9110 section 9.3.7
+    // gives `OPTIONS` its own meaning — ask what a resource supports, answered
+    // with `Allow` — and that request has nothing to do with CORS. A preflight
+    // is the narrower thing the Fetch standard defines: `OPTIONS` carrying
+    // `Access-Control-Request-Method`, which a browser sends and nothing else
+    // does.
+    //
+    // Answering both here would make a registered `OPTIONS` route unreachable
+    // the moment CORS is configured, which is a routing decision taken by a
+    // header the caller sets. The closure is invoked only once the two cheap
+    // checks above pass, so a non-`OPTIONS` request never pays for the lookup.
+    if !is_preflight() {
+        return None;
+    }
+    let mut response = HttpResponse::new(204);
+    response.headers.insert(
+        "Access-Control-Allow-Origin".into(),
+        cors.allow_origin.clone(),
+    );
+    response.headers.insert(
+        "Access-Control-Allow-Methods".into(),
+        cors.allow_methods.clone(),
+    );
+    response.headers.insert(
+        "Access-Control-Allow-Headers".into(),
+        cors.allow_headers.clone(),
+    );
+    response
+        .headers
+        .insert("Access-Control-Max-Age".into(), cors.max_age.to_string());
+    // Through the same decision the per-response path uses, because the
+    // preflight is a response too and the wildcard rule does not care which one
+    // it is. Its result reaches the adapters with `cors = None` — it carries the
+    // full preflight set already — so this is the only place the guard can run
+    // for it, and without it a wildcard-plus-credentials configuration went out
+    // as the invalid pair on the preflight while being correctly suppressed on
+    // every response that followed.
+    if response_wire::cors_additions(None, cors).credentials {
+        response.headers.insert(
+            "Access-Control-Allow-Credentials".into(),
+            "true".to_string(),
+        );
+    }
+    Some(response)
+}
+
+/// The body length a request declares, in bytes, or `None` if it declares none
+/// this framework will act on.
+///
+/// Only the first comma-separated element is parsed. `Content-Length: 100, 100`
+/// is a legal spelling of a 100-byte body — RFC 9112 §6.3 accepts a list whose
+/// elements all agree, and `armature-h1`'s framing does too — but a bare
+/// `parse::<usize>()` fails on it and reports no declared length at all, which
+/// silently skips the fast-path rejection below for exactly the request most
+/// likely to be probing for one. The size cap is not lost when that happens (the
+/// streaming read still enforces it), but the early refusal and the operator's
+/// `warn!` line are, and the framing this parse must agree with is the
+/// connection's, not the strictest reading available.
+fn declared_content_length(raw: Option<&str>) -> Option<usize> {
+    raw?.split(',').next()?.trim().parse::<usize>().ok()
+}
+
+/// The `413` answer owed to a request whose declared body already exceeds the
+/// configured cap, if one is owed.
+///
+/// Sibling to [`cors_preflight`], split out for the same reason: both serve
+/// paths owe this check and both owe it at the same moment — after the preflight
+/// answer, before a single body byte is buffered. Left inline it was policy
+/// living in two adapters whose whole arrangement is that only their
+/// transport-facing edges differ, and the two copies had already begun to: they
+/// extracted the declared length by different rules.
+///
+/// `None` for `declared_len` means the request declares no length; the streaming
+/// read caps those instead.
+fn declared_length_rejection(
+    declared_len: Option<usize>,
+    method: &crate::Method,
+    path: &str,
+    state: &ServeState,
+) -> Option<HttpResponse> {
+    let declared_len = declared_len?;
+    if body_within_limit(declared_len, state.max_body_size) {
+        return None;
+    }
+    warn!(
+        method = %method,
+        path = %path,
+        limit = state.max_body_size,
+        declared_len,
+        "Request Content-Length exceeds configured limit"
+    );
+    Some(payload_too_large_response())
+}
+
+/// Guards, routing, and error mapping for a fully-formed request.
+///
+/// Everything between "an [`HttpRequest`] exists, body included" and "an
+/// [`HttpResponse`] is ready", with no transport type in the signature. Both
+/// serve paths — hyper and `armature-h1` — funnel through here, so the guard
+/// ordering, the filter-chain snapshot, and the error mapping have exactly one
+/// implementation rather than two that drift.
+///
+/// `start` is passed in rather than taken here because the duration that
+/// matters is measured from the point the transport handed the request over,
+/// which is upstream of this call.
+async fn dispatch_request(
+    mut armature_req: HttpRequest,
+    state: &ServeState,
+    start: std::time::Instant,
+) -> HttpResponse {
+    let method = armature_req.method.clone();
+    let target_handle = armature_req.path.clone();
+    let path = target_handle
+        .split_once('?')
+        .map_or(target_handle.as_str(), |(p, _)| p);
+
+    // The arrival record, emitted here rather than in each adapter so both
+    // transports produce it. It was previously written only by the hyper
+    // adapter, so moving the serve path onto `armature-h1` silently removed
+    // every per-request trace for HTTP/1.1 — the first record for a request
+    // became "Routing request", which is emitted after body handling and never
+    // at all for one rejected before that.
+    trace!(
+        method = %method,
+        path = %path,
+        header_count = armature_req.headers.len(),
+        "Incoming request"
+    );
 
     // Only needed when a global exception filter chain is configured: a
     // filter's `catch()` receives the original request for context (path,
@@ -1663,16 +2299,13 @@ async fn handle_request(
                     "error": "Forbidden",
                     "status": 403,
                 });
-                let response = HttpResponse::new(403)
+                return HttpResponse::new(403)
                     .with_json(&body)
                     .unwrap_or_else(|_| HttpResponse::new(403));
-                return Ok(to_hyper_response(response, state.cors.as_deref()));
             }
             Err(GuardRejection::Error(err)) => {
                 warn!(method = %method, path = %path, error = %err, "Guard returned an error");
-                let response =
-                    respond_to_error(err, filter_ctx_request, state.filter_chain.clone()).await;
-                return Ok(to_hyper_response(response, state.cors.as_deref()));
+                return respond_to_error(err, filter_ctx_request, state.filter_chain.clone()).await;
             }
         }
     }
@@ -1699,7 +2332,7 @@ async fn handle_request(
         "Request completed"
     );
 
-    Ok(to_hyper_response(response, state.cors.as_deref()))
+    response
 }
 
 /// Convert a handler error into a client-safe HTTP response.
@@ -1878,34 +2511,397 @@ async fn evaluate_scoped_guards(
     Ok(context.request)
 }
 
+/// The tests and decisions every response adapter owes, whichever transport it
+/// writes to.
+///
+/// This crate has two response adapters — [`to_hyper_response`] here and
+/// `to_h1_response` in the `armature-h1` bridge — and the shipped default build
+/// runs both: `armature-h1` serves HTTP/1.1 and hyper serves every HTTP/2
+/// stream through the fallback. Anything that decides what may go on the wire
+/// therefore has to live somewhere both can reach, or one transport enforces it
+/// and the other does not — which is not a smaller version of the same policy
+/// but a hole in it, reachable by asking for the protocol that skips the check.
+///
+/// It lives here rather than in the bridge because the bridge is compiled only
+/// with the `h1-backend` feature, while this module is compiled always: helpers
+/// kept there would vanish from the `--no-default-features` build that still
+/// serves every request through hyper. Nothing in here names a transport type;
+/// the inputs are a field name, a field value, and the CORS configuration.
+pub(crate) mod response_wire {
+    use super::{CorsConfig, HttpResponse};
+    use crate::logging::{debug, warn};
+
+    /// Whether a field name is a token, as RFC 9110 section 5.6.2 defines one.
+    pub(crate) fn name_is_token(name: &str) -> bool {
+        !name.is_empty()
+            && name.bytes().all(|b| {
+                b.is_ascii_alphanumeric()
+                    || matches!(
+                        b,
+                        b'!' | b'#'
+                            | b'$'
+                            | b'%'
+                            | b'&'
+                            | b'\''
+                            | b'*'
+                            | b'+'
+                            | b'-'
+                            | b'.'
+                            | b'^'
+                            | b'_'
+                            | b'`'
+                            | b'|'
+                            | b'~'
+                    )
+            })
+    }
+
+    /// Whether a field value carries nothing that would terminate the field
+    /// early.
+    ///
+    /// `armature-h1`'s writer runs the same test and answers it by dropping the
+    /// offending field and serving the rest of the response. That is the wrong
+    /// side to err on for a *response*: response splitting is prevented either
+    /// way, but the field that gets dropped is as likely to be a
+    /// `Content-Security-Policy`, an `X-Frame-Options`, or a `Set-Cookie`
+    /// carrying `Secure`/`HttpOnly` as it is to be decoration, and a page served
+    /// with its protections silently missing is worse than a page not served at
+    /// all. So both adapters ask the question first, where the whole response
+    /// can still be abandoned.
+    ///
+    /// The two transports do not reject the *same set*: `armature_h1`'s writer
+    /// permits control bytes other than CR, LF, and NUL, where hyper's
+    /// `HeaderValue` refuses every control byte
+    /// (`armature-h1/BACKENDS.md` records the difference). What they share is
+    /// the *outcome* this test buys — a field this returns `false` for never
+    /// reaches the wire under either, and the response carrying it is abandoned
+    /// rather than quietly stripped. Values in the gap between the two sets are
+    /// still handled: on the hyper side they fail when the builder refuses them,
+    /// and the same 500 is served.
+    pub(crate) fn value_is_emittable(value: &[u8]) -> bool {
+        !value.iter().any(|b| matches!(b, b'\r' | b'\n' | 0))
+    }
+
+    /// A field the transport decides rather than the handler.
+    pub(crate) enum TransportField {
+        /// A hop-by-hop field, or one that steers how the body is framed.
+        Framing,
+        /// `Content-Length`, which the writer computes from the bytes it
+        /// actually writes.
+        ContentLength,
+    }
+
+    /// Whether this field is the transport's to decide rather than the
+    /// handler's.
+    ///
+    /// The hop-by-hop set is RFC 9110 section 7.6.1's, plus `Content-Length`:
+    /// that one is not hop-by-hop, but both serve paths frame the body
+    /// themselves, and a handler-supplied length that disagrees with the bytes
+    /// actually written is a desync a pooling proxy reads as the start of the
+    /// next response.
+    ///
+    /// Matched on the name rather than on either transport's interned field
+    /// enum, so the two adapters cannot answer this differently.
+    pub(crate) fn transport_field(name: &str) -> Option<TransportField> {
+        const FRAMING: [&str; 8] = [
+            "connection",
+            "keep-alive",
+            "proxy-authenticate",
+            "proxy-authorization",
+            "te",
+            "trailer",
+            "transfer-encoding",
+            "upgrade",
+        ];
+        if name.eq_ignore_ascii_case("content-length") {
+            return Some(TransportField::ContentLength);
+        }
+        FRAMING
+            .iter()
+            .any(|known| name.eq_ignore_ascii_case(known))
+            .then_some(TransportField::Framing)
+    }
+
+    /// Report a field dropped because it belongs to the transport.
+    ///
+    /// Two levels, because the two cases say different things about the
+    /// handler. Setting `Content-Length` on a response is a common and harmless
+    /// habit — the writer computes the true length regardless — and warning
+    /// about it once per request buries the lines that matter. A `Connection`,
+    /// `Upgrade`, or `Transfer-Encoding` is a handler reaching for framing the
+    /// connection loop decides knowing things the handler does not: whether the
+    /// body was consumed, whether the connection is about to close. A response
+    /// that carried its own `Connection` would win over that decision —
+    /// `armature-h1`'s writer suppresses its own field when one was supplied —
+    /// so a handler reflecting a request's `connection: keep-alive` could talk
+    /// the server out of the `close` it is about to act on regardless, and a
+    /// pooling proxy would then keep a socket the server has already hung up.
+    ///
+    /// The name is safe to log here: it reached this point only by passing
+    /// [`name_is_token`].
+    pub(crate) fn report_transport_field(field: &TransportField, name: &str) {
+        match field {
+            TransportField::ContentLength => {
+                debug!(field = %name, "Dropping a handler-supplied Content-Length; the writer computes it");
+            }
+            TransportField::Framing => {
+                warn!(field = %name, "Dropping a hop-by-hop or framing header supplied by a handler");
+            }
+        }
+    }
+
+    /// Report the field that made a response unemittable, and why.
+    ///
+    /// Deliberately without the name or the value. The name is checked here too,
+    /// so a failing field may be failing *because* its name carries CR or LF —
+    /// and interpolating it would carry that injection straight into whatever
+    /// reads the log, forging log lines from the same bytes that were denied the
+    /// wire. Lengths and which half failed are enough to find the handler;
+    /// `method` and `path` say which request to look at.
+    pub(crate) fn report_unemittable(
+        name: &str,
+        value: &[u8],
+        method: &crate::Method,
+        path: &str,
+        what: &str,
+    ) {
+        warn!(
+            method = %method,
+            path = %path,
+            what,
+            name_ok = name_is_token(name),
+            name_len = name.len(),
+            value_len = value.len(),
+            "Handler produced an unwritable header; failing the response closed"
+        );
+    }
+
+    /// The `500` served in place of a response a handler made unemittable.
+    ///
+    /// The framework's own error envelope rather than an empty body, for the
+    /// reason the `max_body_bytes` note in `h1_backend::serve` gives for the 413
+    /// path: a bare status with no `Content-Type` and no CORS headers reaches a
+    /// browser doing a credentialed fetch as an opaque CORS failure, so the one
+    /// audience that can act on it is told nothing. Both adapters attach the
+    /// configured CORS pair to it as they would to any other response.
+    ///
+    /// The handler's own body is not carried over — it was written alongside a
+    /// field that cannot go on the wire, and that field may well be what the
+    /// body needed for protection.
+    pub(crate) fn internal_error_envelope() -> HttpResponse {
+        let body = serde_json::json!({
+            "error": "Internal Server Error",
+            "status": 500,
+        });
+        HttpResponse::new(500)
+            .with_json(&body)
+            .unwrap_or_else(|_| HttpResponse::new(500))
+    }
+
+    /// What the configured CORS policy adds to a response the handler has
+    /// already had its say on.
+    pub(crate) struct CorsAdditions {
+        /// The `Access-Control-Allow-Origin` to add, or `None` when the handler
+        /// supplied one and adding a second would make the browser reject the
+        /// response outright.
+        pub(crate) origin: Option<String>,
+        /// Whether to add `Access-Control-Allow-Credentials: true`.
+        pub(crate) credentials: bool,
+        /// Whether to add `Vary: Origin`.
+        pub(crate) vary_origin: bool,
+    }
+
+    /// Decide what the configured CORS policy adds, given whatever origin the
+    /// handler already set.
+    ///
+    /// One function for both adapters because this is a policy decision with no
+    /// transport in it, and written twice it had already drifted — one copy
+    /// compared origins case-insensitively, the other compared an exact
+    /// lowercase string.
+    ///
+    /// Three rules, in the order they bite:
+    ///
+    /// A handler that sets `Access-Control-Allow-Origin` itself has answered
+    /// more precisely than a static config can, and the configured value is not
+    /// added next to it: two `Allow-Origin` fields make a browser discard the
+    /// whole response, so the result would be worse than either answer alone.
+    /// Because the response then depends on the request's `Origin`, it also
+    /// earns `Vary: Origin` — without it a shared cache can serve one origin's
+    /// answer to another.
+    ///
+    /// Credentials are attached only when the origin actually going out is one
+    /// the configuration authorised — the configured origin itself, or no
+    /// handler origin at all. A handler that reflects the request's `Origin`
+    /// unchecked is the classic CORS mistake, and pairing that reflection with
+    /// `Allow-Credentials: true` turns it into a full credentialed cross-origin
+    /// read of the response for *any* site that asks. This crate is the last
+    /// place that can tell the difference, because only it knows which origin
+    /// the operator configured.
+    ///
+    /// And `*` never carries credentials: the pair is invalid, a browser
+    /// discards the response rather than downgrading it, so emitting both turns
+    /// a misconfiguration into a silently failing request.
+    pub(crate) fn cors_additions(handler_origin: Option<&str>, cors: &CorsConfig) -> CorsAdditions {
+        let effective_origin = handler_origin.unwrap_or(cors.allow_origin.as_str());
+        let authorised = match handler_origin {
+            None => true,
+            Some(origin) => origin.eq_ignore_ascii_case(&cors.allow_origin),
+        };
+        let credentials = if !cors.allow_credentials {
+            false
+        } else if !authorised {
+            warn!(
+                "Access-Control-Allow-Credentials withheld: the handler set an \
+                 Access-Control-Allow-Origin the CORS configuration does not \
+                 authorise, and credentials against an unvalidated origin would \
+                 allow any site to read this response"
+            );
+            false
+        } else if effective_origin == "*" {
+            warn!(
+                "Access-Control-Allow-Credentials withheld: it is invalid \
+                 alongside a wildcard origin, and a browser rejects the pair"
+            );
+            false
+        } else {
+            true
+        };
+        CorsAdditions {
+            origin: handler_origin.is_none().then(|| cors.allow_origin.clone()),
+            credentials,
+            vary_origin: handler_origin.is_some(),
+        }
+    }
+}
+
+/// Convert our HttpResponse to a hyper Response, adding no CORS headers.
+///
+/// For a response that already carries every header it should — the CORS
+/// preflight answer, which sets the full preflight set itself and must not have
+/// the per-response `Allow-Origin` pair appended on top.
+fn to_hyper_response_raw(
+    response: HttpResponse,
+    method: &crate::Method,
+    path: &str,
+) -> Response<Full<bytes::Bytes>> {
+    to_hyper_response(response, None, method, path)
+}
+
 /// Convert our HttpResponse to a hyper Response, applying CORS headers.
+///
+/// `method` and `path` are carried only so the fail-closed 500 below can name
+/// the request that produced it; nothing else here reads them.
 fn to_hyper_response(
     response: HttpResponse,
     cors: Option<&CorsConfig>,
+    method: &crate::Method,
+    path: &str,
 ) -> Response<Full<bytes::Bytes>> {
+    use response_wire::{
+        cors_additions, name_is_token, report_transport_field, report_unemittable, transport_field,
+        value_is_emittable,
+    };
+
     let mut builder = Response::builder().status(response.status);
 
     for (key, value) in &response.headers {
+        // The same two tests, in the same order, as the `armature-h1` bridge —
+        // out of the same module, so this transport cannot end up enforcing a
+        // narrower rule than the other. Before they were shared, a handler that
+        // set `Content-Length: 999` on a five-byte body had it stripped over
+        // HTTP/1.1 and passed straight through here, which is a response desync
+        // reachable by asking for HTTP/2.
+        if !name_is_token(key) || !value_is_emittable(value.as_bytes()) {
+            report_unemittable(key, value.as_bytes(), method, path, "header");
+            return unemittable_hyper_response(cors);
+        }
+        if let Some(field) = transport_field(key) {
+            report_transport_field(&field, key);
+            continue;
+        }
         builder = builder.header(key, value);
     }
     for cookie_value in &response.cookies {
+        // The name is the literal `set-cookie`, so only the value is in
+        // question here.
+        if !value_is_emittable(cookie_value.as_bytes()) {
+            report_unemittable(
+                "set-cookie",
+                cookie_value.as_bytes(),
+                method,
+                path,
+                "set-cookie",
+            );
+            return unemittable_hyper_response(cors);
+        }
         builder = builder.header("Set-Cookie", cookie_value);
     }
     if let Some(cors) = cors {
-        builder = builder.header("Access-Control-Allow-Origin", &cors.allow_origin);
-        if cors.allow_credentials {
+        let handler_origin = response
+            .headers
+            .iter()
+            .find(|(key, _)| key.eq_ignore_ascii_case("access-control-allow-origin"))
+            .map(|(_, value)| value.as_str());
+        let additions = cors_additions(handler_origin, cors);
+        if let Some(origin) = &additions.origin {
+            builder = builder.header("Access-Control-Allow-Origin", origin);
+        }
+        if additions.credentials {
             builder = builder.header("Access-Control-Allow-Credentials", "true");
+        }
+        if additions.vary_origin {
+            builder = builder.header("Vary", "Origin");
         }
     }
 
     // Zero-copy body passthrough to Hyper
     let body = Full::new(response.into_body_bytes());
     builder.body(body).unwrap_or_else(|_| {
-        // A handler produced a header hyper rejects; fail closed with a 500.
-        let mut fallback = Response::new(Full::new(bytes::Bytes::new()));
-        *fallback.status_mut() = hyper::StatusCode::INTERNAL_SERVER_ERROR;
-        fallback
+        // A field in the gap between the two writers' rules: hyper refuses
+        // every control byte, where the checks above refuse only the three that
+        // terminate a field. Same outcome, one step later.
+        warn!(
+            method = %method,
+            path = %path,
+            "hyper refused a handler header; failing the response closed"
+        );
+        unemittable_hyper_response(cors)
     })
+}
+
+/// The hyper form of the fail-closed 500, CORS included.
+///
+/// Built field by field rather than by handing the envelope back to
+/// [`to_hyper_response`]: that would be a recursion whose base case depends on
+/// the configured origin being emittable, and a configuration is not a thing
+/// this function gets to assume anything about.
+fn unemittable_hyper_response(cors: Option<&CorsConfig>) -> Response<Full<bytes::Bytes>> {
+    let envelope = response_wire::internal_error_envelope();
+    let mut builder = Response::builder().status(envelope.status);
+    for (key, value) in &envelope.headers {
+        builder = builder.header(key, value);
+    }
+    if let Some(cors) = cors {
+        // No handler origin: this response is the framework's, not the
+        // handler's, so the configured pair applies unconditionally.
+        let additions = response_wire::cors_additions(None, cors);
+        if let Some(origin) = &additions.origin {
+            builder = builder.header("Access-Control-Allow-Origin", origin);
+        }
+        if additions.credentials {
+            builder = builder.header("Access-Control-Allow-Credentials", "true");
+        }
+    }
+    builder
+        .body(Full::new(envelope.into_body_bytes()))
+        .unwrap_or_else(|_| {
+            // Only reachable from a configured origin hyper refuses, which is
+            // a misconfiguration rather than a request-shaped input. The status
+            // still has to reach the client.
+            let mut fallback = Response::new(Full::new(bytes::Bytes::new()));
+            *fallback.status_mut() = hyper::StatusCode::INTERNAL_SERVER_ERROR;
+            fallback
+        })
 }
 
 #[cfg(test)]
@@ -1948,6 +2944,268 @@ mod tests {
         assert!(body.contains("User not found"));
     }
 
+    /// Every conversion below answers the same nominal request. The method and
+    /// path reach the logs and nothing else, so one pair serves for all of them.
+    fn convert(response: HttpResponse, cors: Option<&CorsConfig>) -> Response<Full<bytes::Bytes>> {
+        to_hyper_response(response, cors, &crate::Method::Get, "/t")
+    }
+
+    /// Parity with `to_h1_response`. `builder.header` appends, so a handler
+    /// that reflects `Origin` would otherwise get two of them and the browser
+    /// rejects the response — turning a working credentialed-CORS handler into
+    /// a broken one purely by configuring CORS.
+    #[test]
+    fn to_hyper_response_does_not_duplicate_a_handler_supplied_cors_origin() {
+        let mut response = HttpResponse::new(200);
+        response.headers.insert(
+            "Access-Control-Allow-Origin".to_string(),
+            "https://reflected.test".to_string(),
+        );
+        let cors = CorsConfig::new("https://configured.test");
+
+        let out = convert(response, Some(&cors));
+
+        let origins: Vec<_> = out
+            .headers()
+            .get_all("access-control-allow-origin")
+            .iter()
+            .map(|v| v.to_str().expect("ascii"))
+            .collect();
+        assert_eq!(
+            origins,
+            vec!["https://reflected.test"],
+            "the handler's reflected origin must stand alone; a second field \
+             makes the browser reject a response that was correct"
+        );
+        assert_eq!(
+            out.headers()
+                .get("vary")
+                .map(|v| v.to_str().expect("ascii")),
+            Some("Origin"),
+            "the origin came from the handler, so the response varies by it"
+        );
+    }
+
+    /// `*` with `Allow-Credentials: true` is an invalid pair browsers reject,
+    /// so emitting it turns a misconfiguration into a silently broken control.
+    #[test]
+    fn to_hyper_response_withholds_credentials_from_a_wildcard_origin() {
+        let cors = CorsConfig::new("*").with_credentials();
+
+        let out = convert(HttpResponse::new(200), Some(&cors));
+
+        assert!(
+            out.headers()
+                .get("access-control-allow-credentials")
+                .is_none(),
+            "credentials must be withheld alongside a wildcard origin rather \
+             than emitted as a pair no browser will honour"
+        );
+    }
+
+    /// The security half of the reflection fix: not duplicating the handler's
+    /// origin is only correct if the credentials flag is then judged against
+    /// *that* origin. A handler reflecting `Origin` unchecked, plus
+    /// `Allow-Credentials: true`, is a credentialed cross-origin read granted to
+    /// whoever asked.
+    #[test]
+    fn to_hyper_response_withholds_credentials_from_an_unauthorised_reflected_origin() {
+        let mut response = HttpResponse::new(200);
+        response.headers.insert(
+            "Access-Control-Allow-Origin".to_string(),
+            "https://evil.test".to_string(),
+        );
+        let cors = CorsConfig::new("https://configured.test").with_credentials();
+
+        let out = convert(response, Some(&cors));
+
+        assert_eq!(
+            out.headers()
+                .get("access-control-allow-origin")
+                .map(|v| v.to_str().expect("ascii")),
+            Some("https://evil.test")
+        );
+        assert!(
+            out.headers()
+                .get("access-control-allow-credentials")
+                .is_none(),
+            "credentials belong only to an origin the configuration authorised"
+        );
+    }
+
+    /// The origin the configuration *did* authorise still gets them.
+    #[test]
+    fn to_hyper_response_keeps_credentials_for_the_configured_origin() {
+        let mut response = HttpResponse::new(200);
+        response.headers.insert(
+            "Access-Control-Allow-Origin".to_string(),
+            "https://configured.test".to_string(),
+        );
+        let cors = CorsConfig::new("https://configured.test").with_credentials();
+
+        let out = convert(response, Some(&cors));
+
+        assert_eq!(
+            out.headers()
+                .get("access-control-allow-credentials")
+                .map(|v| v.to_str().expect("ascii")),
+            Some("true")
+        );
+    }
+
+    /// The mirror of the bridge's
+    /// `a_handler_cannot_override_the_connection_loops_framing`. Both adapters
+    /// ship in the default build — hyper serves every HTTP/2 stream — so a
+    /// filter enforced on one of them is a hole reachable by choosing the other
+    /// protocol.
+    #[test]
+    fn to_hyper_response_drops_handler_supplied_framing_headers() {
+        let mut response = HttpResponse::new(413);
+        response
+            .headers
+            .insert("Connection".to_string(), "keep-alive".to_string());
+        response
+            .headers
+            .insert("Transfer-Encoding".to_string(), "chunked".to_string());
+        response
+            .headers
+            .insert("Upgrade".to_string(), "websocket".to_string());
+        response
+            .headers
+            .insert("Content-Length".to_string(), "999".to_string());
+        response
+            .headers
+            .insert("Content-Type".to_string(), "text/plain".to_string());
+
+        let out = convert(response, None);
+
+        for field in [
+            "connection",
+            "transfer-encoding",
+            "upgrade",
+            "content-length",
+        ] {
+            assert!(
+                out.headers().get(field).is_none(),
+                "{field} is the transport's to decide, not the handler's — and \
+                 a handler-supplied Content-Length over a body of another \
+                 length is a desync a pooling proxy reads as the next response"
+            );
+        }
+        assert_eq!(
+            out.headers()
+                .get("content-type")
+                .map(|v| v.to_str().expect("ascii")),
+            Some("text/plain"),
+            "only the transport's own fields go; the rest survives"
+        );
+    }
+
+    /// Same fail-closed rule as the bridge, for the same reason: the field that
+    /// would be dropped is as likely to be a `Content-Security-Policy` as it is
+    /// to be decoration.
+    #[test]
+    fn to_hyper_response_fails_a_response_closed_on_an_unwritable_field() {
+        for (name, value) in [
+            ("X-Bad", "a\r\nx-injected: 1"),
+            ("X-Bad", "a\nb"),
+            ("X-Bad", "a\0b"),
+            ("X Bad", "fine"),
+            ("bad:name", "fine"),
+        ] {
+            let mut response = HttpResponse::new(200);
+            response.headers.insert(
+                "Content-Security-Policy".to_string(),
+                "default-src 'none'".to_string(),
+            );
+            response.headers.insert(name.to_string(), value.to_string());
+
+            let out = convert(response, None);
+
+            assert_eq!(
+                out.status(),
+                500,
+                "{name}: {value:?} must fail the whole response closed"
+            );
+            assert!(out.headers().get("content-security-policy").is_none());
+            assert_eq!(
+                out.headers()
+                    .get("content-type")
+                    .map(|v| v.to_str().expect("ascii")),
+                Some("application/json"),
+                "an envelope, not a bare status: a credentialed fetch has to be \
+                 able to tell a 500 from a network failure"
+            );
+        }
+    }
+
+    #[test]
+    fn the_hyper_fail_closed_500_carries_the_configured_cors_headers() {
+        let mut response = HttpResponse::new(200);
+        response
+            .headers
+            .insert("X Bad".to_string(), "fine".to_string());
+        let cors = CorsConfig::new("https://configured.test").with_credentials();
+
+        let out = convert(response, Some(&cors));
+
+        assert_eq!(out.status(), 500);
+        assert_eq!(
+            out.headers()
+                .get("access-control-allow-origin")
+                .map(|v| v.to_str().expect("ascii")),
+            Some("https://configured.test")
+        );
+        assert_eq!(
+            out.headers()
+                .get("access-control-allow-credentials")
+                .map(|v| v.to_str().expect("ascii")),
+            Some("true")
+        );
+    }
+
+    /// The preflight answer reaches the adapters with `cors = None`, so the
+    /// wildcard guard cannot run on it there — it has to run where the answer is
+    /// built, or a wildcard-plus-credentials configuration goes out as the
+    /// invalid pair on the preflight and is correctly suppressed on every
+    /// response after it.
+    #[test]
+    fn a_preflight_withholds_credentials_from_a_wildcard_origin() {
+        let state = Application::new(Container::new(), Router::new())
+            .with_cors(CorsConfig::new("*").with_credentials())
+            .serve_state();
+
+        let preflight = cors_preflight(&crate::Method::Options, || true, &state)
+            .expect("a preflight answer is owed");
+
+        assert_eq!(preflight.status, 204);
+        assert!(
+            preflight
+                .headers
+                .get("Access-Control-Allow-Credentials")
+                .is_none(),
+            "the pair is invalid, so a browser discards the preflight entirely"
+        );
+    }
+
+    #[test]
+    fn a_preflight_keeps_credentials_for_a_named_origin() {
+        let state = Application::new(Container::new(), Router::new())
+            .with_cors(CorsConfig::new("https://configured.test").with_credentials())
+            .serve_state();
+
+        let preflight = cors_preflight(&crate::Method::Options, || true, &state)
+            .expect("a preflight answer is owed");
+
+        assert_eq!(
+            preflight
+                .headers
+                .get("Access-Control-Allow-Credentials")
+                .map(String::as_str),
+            Some("true")
+        );
+    }
+
     #[test]
     fn test_to_hyper_response_sets_headers_cookies_and_cors() {
         let response = HttpResponse::ok()
@@ -1956,7 +3214,7 @@ mod tests {
             .with_body(b"{}".to_vec());
         let cors = CorsConfig::new("https://example.com").with_credentials();
 
-        let hyper_resp = to_hyper_response(response, Some(&cors));
+        let hyper_resp = convert(response, Some(&cors));
         assert_eq!(hyper_resp.status(), 200);
         assert_eq!(
             hyper_resp.headers().get("Content-Type").unwrap(),
@@ -1994,6 +3252,66 @@ mod tests {
         let max = DEFAULT_MAX_BODY_SIZE;
         assert!(body_within_limit(max, max));
         assert!(!body_within_limit(max + 1, max));
+    }
+
+    #[test]
+    fn test_declared_content_length_accepts_a_comma_list() {
+        assert_eq!(declared_content_length(Some("100")), Some(100));
+        assert_eq!(declared_content_length(Some(" 100 ")), Some(100));
+        // RFC 9112 §6.3: a list whose elements agree frames a body of that
+        // length, and `armature-h1` reads it that way. A bare `parse` does not,
+        // and reporting `None` here would skip the pre-buffer 413 entirely.
+        assert_eq!(declared_content_length(Some("100, 100")), Some(100));
+        assert_eq!(declared_content_length(Some("100,100")), Some(100));
+
+        assert_eq!(declared_content_length(None), None);
+        assert_eq!(declared_content_length(Some("")), None);
+        assert_eq!(declared_content_length(Some("banana")), None);
+        assert_eq!(declared_content_length(Some("-1")), None);
+    }
+
+    #[test]
+    fn test_without_h2_alpn_strips_only_h2() {
+        use rustls::ServerConfig;
+
+        // Named explicitly, matching `TlsConfig`: rustls refuses to pick a
+        // process-level provider on its own.
+        let base =
+            ServerConfig::builder_with_provider(Arc::new(rustls::crypto::ring::default_provider()))
+                .with_safe_default_protocol_versions()
+                .expect("ring provider supports the default protocol versions")
+                .with_no_client_auth()
+                .with_cert_resolver(Arc::new(NoCertResolver));
+
+        let mut offering_h2 = base.clone();
+        offering_h2.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
+        let stripped = without_h2_alpn(Arc::new(offering_h2));
+        assert_eq!(
+            stripped.alpn_protocols,
+            vec![b"http/1.1".to_vec()],
+            "a listener that closes h2 connections must not advertise h2"
+        );
+
+        // Nothing to strip: returned as-is rather than cloned.
+        let mut h1_only = base;
+        h1_only.alpn_protocols = vec![b"http/1.1".to_vec()];
+        let untouched = Arc::new(h1_only);
+        let same = without_h2_alpn(Arc::clone(&untouched));
+        assert!(Arc::ptr_eq(&untouched, &same));
+    }
+
+    /// A resolver that never resolves, for building a `ServerConfig` whose
+    /// certificate is irrelevant because no handshake is ever performed.
+    #[derive(Debug)]
+    struct NoCertResolver;
+
+    impl rustls::server::ResolvesServerCert for NoCertResolver {
+        fn resolve(
+            &self,
+            _hello: rustls::server::ClientHello<'_>,
+        ) -> Option<Arc<rustls::sign::CertifiedKey>> {
+            None
+        }
     }
 
     #[test]
@@ -2774,7 +4092,7 @@ mod tests {
         );
 
         assert!(app.filter_chain.is_some());
-        let state = app.serve_state(None);
+        let state = app.serve_state();
         assert!(
             state.filter_chain.is_some(),
             "serve_state must carry the configured filter chain through to ServeState"
@@ -2784,7 +4102,7 @@ mod tests {
     #[test]
     fn test_no_filter_configured_leaves_serve_state_filter_chain_none() {
         let app = Application::new(Container::new(), Router::new());
-        let state = app.serve_state(None);
+        let state = app.serve_state();
         assert!(
             state.filter_chain.is_none(),
             "without use_global_filter, ServeState must carry no filter chain, \
@@ -2821,6 +4139,7 @@ mod tests {
             .into(),
             max_body_size: DEFAULT_MAX_BODY_SIZE,
             filter_chain: Some(filter_chain),
+            peer: None,
         };
 
         let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
@@ -2907,6 +4226,7 @@ mod tests {
             guards: Vec::new().into(),
             max_body_size: DEFAULT_MAX_BODY_SIZE,
             filter_chain: Some(filter_chain),
+            peer: None,
         };
 
         let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();

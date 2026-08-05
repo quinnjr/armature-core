@@ -7,9 +7,10 @@
 //! case-insensitive string compare. A custom name (`x-request-id` and friends)
 //! still costs an ASCII-insensitive compare per stored header, but no
 //! allocation: by-name lookups resolve the needle borrowed rather than
-//! materializing a `HeaderId::Other` per call. Values are [`Bytes`], so once
-//! Plan 4 wires the serve path through `armature-h1` they become slices of the
-//! connection read buffer rather than copies.
+//! materializing a `HeaderId::Other` per call. Values are [`Bytes`], and under
+//! the default `h1-backend` feature they are slices of the connection's read
+//! buffer rather than copies — see [`append_id`](HeaderMap::append_id), which
+//! is the serve path's entry point.
 //!
 //! ## Case normalization
 //!
@@ -247,17 +248,35 @@ impl HeaderMap {
         self.inner.is_empty()
     }
 
-    /// The value of `name` as UTF-8, case-insensitively.
+    /// The **first** value of `name` as UTF-8, case-insensitively.
     ///
     /// Returns `None` for a value that is not valid UTF-8; use
     /// [`HeaderMap::get_bytes`] for those.
+    ///
+    /// # First-wins on a map that carries wire duplicates
+    ///
+    /// The serve path [appends](Self::append_id) every occurrence a request
+    /// carried, so a field the client sent twice is present twice and this
+    /// returns the earlier line. For a field defined to repeat (`Accept`,
+    /// `X-Forwarded-For`) that is the right first element and
+    /// [`get_all`](Self::get_all) has the rest. For a single-valued field it is
+    /// a hazard: a fronting proxy that *appends* rather than replaces (Envoy's
+    /// `APPEND_IF_EXISTS_OR_ADD`, nginx `add_header`) leaves the client's line
+    /// first and its own second, so a client that sends
+    /// `X-Authenticated-User: admin` outranks the proxy's `alice` here. Reach
+    /// for [`get_unique`](Self::get_unique) whenever the answer is a decision
+    /// rather than a report.
     #[inline]
     pub fn get(&self, name: &str) -> Option<&str> {
         self.get_bytes(name)
             .and_then(|v| std::str::from_utf8(v).ok())
     }
 
-    /// The raw value of `name`, case-insensitively.
+    /// The raw **first** value of `name`, case-insensitively.
+    ///
+    /// First-wins on a repeated field, with the hazard [`get`](Self::get)
+    /// describes; see [`get_unique`](Self::get_unique) and
+    /// [`get_all`](Self::get_all).
     #[inline]
     pub fn get_bytes(&self, name: &str) -> Option<&Bytes> {
         let needle = Needle::new(name);
@@ -267,10 +286,38 @@ impl HeaderMap {
             .map(|h| &h.value)
     }
 
+    /// The raw value of `name` only if it occurs exactly once.
+    ///
+    /// The duplicate-aware counterpart to [`get_bytes`](Self::get_bytes), for
+    /// fields where "which occurrence" is a security question rather than a
+    /// formatting one. `Ok(None)` means absent, `Ok(Some(_))` means exactly one
+    /// occurrence, and [`DuplicateField`] means the wire carried more than one —
+    /// at which point picking either is a guess, and the caller can fail the
+    /// request instead of guessing in the attacker's favour.
+    ///
+    /// ```
+    /// use armature_core::headers::HeaderMap;
+    ///
+    /// let mut headers = HeaderMap::new();
+    /// headers.append("X-Authenticated-User", "admin");   // the client's line
+    /// headers.append("X-Authenticated-User", "alice");   // the proxy appended
+    ///
+    /// // `get` hands back the client's claim; `get_unique` refuses to choose.
+    /// assert_eq!(headers.get("x-authenticated-user"), Some("admin"));
+    /// assert!(headers.get_unique("x-authenticated-user").is_err());
+    /// ```
+    #[inline]
+    pub fn get_unique(&self, name: &str) -> Result<Option<&Bytes>, DuplicateField> {
+        let needle = Needle::new(name);
+        self.unique_where(|h| needle.matches(&h.id))
+            .map(|found| found.map(|h| &h.value))
+    }
+
     /// The raw value for an already-interned name.
     ///
     /// The hot-path accessor: no interning, and for a well-known name the
-    /// comparison is on the enum discriminant.
+    /// comparison is on the enum discriminant. First-wins on a repeated field,
+    /// with the hazard [`get`](Self::get) describes.
     #[inline]
     pub fn get_id(&self, id: &HeaderId) -> Option<&Bytes> {
         self.inner.iter().find(|h| &h.id == id).map(|h| &h.value)
@@ -303,13 +350,108 @@ impl HeaderMap {
     /// Returns the old value if one was replaced.
     #[inline]
     pub fn insert(&mut self, name: impl AsRef<str>, value: impl HeaderValueInput) -> Option<Bytes> {
-        let id = header_id::intern(name.as_ref());
-        let value = value.into_value();
-        if let Some(existing) = self.inner.iter_mut().find(|h| h.id == id) {
-            return Some(std::mem::replace(&mut existing.value, value));
+        self.insert_id(header_id::intern(name.as_ref()), value.into_value())
+    }
+
+    /// Insert a header whose name is already interned.
+    ///
+    /// The pre-interned counterpart to [`insert`](Self::insert): `armature-h1`
+    /// parses field names straight into [`HeaderId`], so re-deriving one here
+    /// would lowercase and re-intern a name already in its final form — an
+    /// allocation per unknown header, per request, to arrive back where the
+    /// parser started.
+    ///
+    /// Collapses *every* existing occurrence of the name to the new value, like
+    /// `insert` and like `http::HeaderMap::insert`, and returns the value the
+    /// first one held. Collapsing rather than replacing-the-first is what makes
+    /// the sanitisation idiom sound: the serve path appends every field line a
+    /// request carried, so an `insert_id` that spared later duplicates would
+    /// leave a client-supplied value exactly where the caller believed it had
+    /// overwritten one. The serve path itself uses
+    /// [`append_id`](Self::append_id) rather than this, because a field the wire
+    /// repeated must not collapse on the way in.
+    ///
+    /// ```
+    /// use armature_core::headers::HeaderMap;
+    /// use armature_core::{HeaderId, header_id};
+    /// use bytes::Bytes;
+    ///
+    /// let mut headers = HeaderMap::new();
+    /// assert_eq!(headers.insert_id(HeaderId::Accept, Bytes::from_static(b"a")), None);
+    /// // The second insert replaces, handing back what it displaced.
+    /// let replaced = headers.insert_id(HeaderId::Accept, Bytes::from_static(b"b"));
+    /// assert_eq!(replaced.as_deref(), Some(&b"a"[..]));
+    /// assert_eq!(headers.get("accept"), Some("b"));
+    /// assert_eq!(headers.len(), 1);
+    ///
+    /// // As the wire may deliver it: three field lines, only the first of which
+    /// // any proxy wrote. One `insert_id` leaves one occurrence, not two.
+    /// let xff = header_id::intern("x-forwarded-for");
+    /// headers.append_id(xff.clone(), Bytes::from_static(b"203.0.113.7"));
+    /// headers.append_id(xff.clone(), Bytes::from_static(b"198.51.100.9"));
+    /// headers.insert_id(xff, Bytes::from_static(b"10.0.0.1"));
+    /// assert_eq!(headers.get_all("x-forwarded-for"), vec!["10.0.0.1"]);
+    /// assert_eq!(headers.get_all("x-forwarded-for").len(), 1);
+    ///
+    /// // A name outside the well-known table interns to the same value the
+    /// // parser produces, so it is found by name afterwards.
+    /// headers.insert_id(header_id::intern("x-trace-id"), Bytes::from_static(b"t"));
+    /// assert_eq!(headers.get("X-Trace-Id"), Some("t"));
+    /// ```
+    #[inline]
+    pub fn insert_id(&mut self, id: HeaderId, value: Bytes) -> Option<Bytes> {
+        // Replaces the first occurrence and *drops the rest*, matching
+        // `http::HeaderMap::insert`. Replacing only the first would be a
+        // security bug now that the serve path appends every occurrence a
+        // request carried: the canonical sanitisation idiom is
+        // `headers.insert("X-Forwarded-For", trusted_value)`, and if a
+        // client-supplied second line survived that call, `client_address`
+        // would go on reading it as a hop.
+        let mut replaced = None;
+        self.inner.retain_mut(|h| {
+            if h.id != id {
+                return true;
+            }
+            match replaced {
+                None => {
+                    replaced = Some(std::mem::replace(&mut h.value, value.clone()));
+                    true
+                }
+                Some(_) => false,
+            }
+        });
+        if replaced.is_none() {
+            self.inner.push(Header { id, value });
         }
+        replaced
+    }
+
+    /// Append a header whose name is already interned, allowing duplicates.
+    ///
+    /// The serve path's entry point, and the repeating-field counterpart to
+    /// [`insert_id`](Self::insert_id); see there for why the pre-interned name
+    /// matters. Appending rather than replacing is what keeps a field the wire
+    /// sent twice from collapsing to its last occurrence — which matters for
+    /// `X-Forwarded-For`, where the occurrences a proxy appended are the
+    /// trustworthy ones (see
+    /// [`HttpRequest::client_address`](crate::HttpRequest::client_address)).
+    ///
+    /// ```
+    /// use armature_core::headers::HeaderMap;
+    /// use armature_core::HeaderId;
+    /// use bytes::Bytes;
+    ///
+    /// let mut headers = HeaderMap::new();
+    /// headers.append_id(HeaderId::Accept, Bytes::from_static(b"text/html"));
+    /// headers.append_id(HeaderId::Accept, Bytes::from_static(b"text/plain"));
+    ///
+    /// // Both occurrences are kept; a single-valued lookup sees the first.
+    /// assert_eq!(headers.get_all("accept").len(), 2);
+    /// assert_eq!(headers.get("accept"), Some("text/html"));
+    /// ```
+    #[inline]
+    pub fn append_id(&mut self, id: HeaderId, value: Bytes) {
         self.inner.push(Header { id, value });
-        None
     }
 
     /// Append a header, allowing duplicates.
@@ -324,12 +466,29 @@ impl HeaderMap {
         });
     }
 
-    /// Remove a header by name (case-insensitive), returning its value.
+    /// Remove *every* occurrence of a header name (case-insensitive), returning
+    /// the value the first one held.
+    ///
+    /// A `remove` that left later duplicates behind would be a hole rather than
+    /// a convenience: the serve path appends every field line a request carried,
+    /// so code that strips a client-supplied `X-Forwarded-For` or
+    /// `Authorization` before trusting the request would strip only the first
+    /// line and leave the attacker's second one in the map. Use
+    /// [`remove_all`](Self::remove_all) when the count is what you want.
     #[inline]
     pub fn remove(&mut self, name: &str) -> Option<Bytes> {
         let needle = Needle::new(name);
-        let pos = self.inner.iter().position(|h| needle.matches(&h.id))?;
-        Some(self.inner.remove(pos).value)
+        let mut removed = None;
+        self.inner.retain_mut(|h| {
+            if !needle.matches(&h.id) {
+                return true;
+            }
+            if removed.is_none() {
+                removed = Some(h.value.clone());
+            }
+            false
+        });
+        removed
     }
 
     /// Remove every header with the given name, returning how many were removed.
@@ -438,9 +597,15 @@ impl HeaderMap {
     }
 
     /// Get the `Content-Length` header as a `usize`.
+    ///
+    /// `None` if the field is absent, unparseable, **or present more than
+    /// once**. Two `Content-Length` lines are the classic request-smuggling
+    /// shape (RFC 9112 §6.3 requires the message be rejected), and the serve
+    /// path keeps both, so answering with either one lets the framing this
+    /// process believes differ from the framing an upstream believes.
     #[inline]
     pub fn content_length(&self) -> Option<usize> {
-        self.str_of(&HeaderId::ContentLength)?.parse().ok()
+        self.unique_str_of(&HeaderId::ContentLength)?.parse().ok()
     }
 
     /// Get the `Accept` header.
@@ -450,9 +615,17 @@ impl HeaderMap {
     }
 
     /// Get the `Authorization` header.
+    ///
+    /// `None` if the field is absent **or present more than once**. RFC 9110
+    /// §11.6.2 defines `Authorization` as single-valued, so a second line is
+    /// anomalous by construction — and since the serve path keeps both, and a
+    /// fronting proxy that appends its own credential leaves the client's line
+    /// first, "pick one" would systematically pick the client's. Refusing to
+    /// answer sends the request down whatever unauthenticated path the caller
+    /// already handles.
     #[inline]
     pub fn authorization(&self) -> Option<&str> {
-        self.str_of(&HeaderId::Authorization)
+        self.unique_str_of(&HeaderId::Authorization)
     }
 
     /// Get the `User-Agent` header.
@@ -462,9 +635,14 @@ impl HeaderMap {
     }
 
     /// Get the `Host` header.
+    ///
+    /// `None` if the field is absent **or present more than once**. `Host`
+    /// picks the origin the request is addressed to, so two disagreeing lines
+    /// let this process route or cache under one authority while an upstream
+    /// used the other; RFC 9112 §3.2 requires such a message be rejected.
     #[inline]
     pub fn host(&self) -> Option<&str> {
-        self.str_of(&HeaderId::Host)
+        self.unique_str_of(&HeaderId::Host)
     }
 
     /// Get the `Cookie` header.
@@ -506,7 +684,97 @@ impl HeaderMap {
     fn str_of(&self, id: &HeaderId) -> Option<&str> {
         self.get_id(id).and_then(|v| std::str::from_utf8(v).ok())
     }
+
+    /// The UTF-8 value for an already-interned name, or `None` if it repeats.
+    ///
+    /// The fail-closed reading, for the accessors whose answer a caller acts on
+    /// rather than reports. A duplicate collapses to `None` here rather than
+    /// surfacing as an error because these accessors already return `Option`
+    /// and their callers already have an absent branch — which is the branch a
+    /// contradictory request belongs in.
+    #[inline]
+    fn unique_str_of(&self, id: &HeaderId) -> Option<&str> {
+        self.unique_where(|h| &h.id == id)
+            .ok()
+            .flatten()
+            .and_then(Header::value_str)
+    }
+
+    /// The single header matching `pred`, or [`DuplicateField`] if several do.
+    ///
+    /// One pass: the count and the first match come out together, so the common
+    /// no-duplicate case costs exactly what a `find` would. The error names the
+    /// field from the *stored* id rather than from the caller's spelling, so it
+    /// is the canonical lowercase form however it was looked up.
+    #[inline]
+    fn unique_where(
+        &self,
+        mut pred: impl FnMut(&Header) -> bool,
+    ) -> Result<Option<&Header>, DuplicateField> {
+        let mut first: Option<&Header> = None;
+        let mut count = 0usize;
+        for header in &self.inner {
+            if !pred(header) {
+                continue;
+            }
+            count += 1;
+            if first.is_none() {
+                first = Some(header);
+            }
+        }
+        match first {
+            // Allocating the name is fine here: this arm is the anomalous
+            // request, and a caller logging the rejection wants the name.
+            Some(header) if count > 1 => Err(DuplicateField {
+                name: header.name().to_owned(),
+                count,
+            }),
+            other => Ok(other),
+        }
+    }
 }
+
+/// A single-valued header field that arrived more than once.
+///
+/// Returned by [`HeaderMap::get_unique`]. The map keeps every occurrence the
+/// wire carried, so a field defined to appear at most once appearing twice is a
+/// statement about the request, not about the map: some intermediary added a
+/// line without removing the client's, and no occurrence can be shown to be the
+/// authoritative one.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DuplicateField {
+    /// The field name, lowercased.
+    name: String,
+    /// How many occurrences were found; always at least 2.
+    count: usize,
+}
+
+impl DuplicateField {
+    /// The field name, lowercased.
+    #[inline]
+    pub fn name(&self) -> &str {
+        &self.name
+    }
+
+    /// How many occurrences the map holds. Always at least 2.
+    #[inline]
+    pub fn count(&self) -> usize {
+        self.count
+    }
+}
+
+impl fmt::Display for DuplicateField {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "header `{}` appeared {} times but is single-valued; no occurrence \
+             can be trusted over another",
+            self.name, self.count
+        )
+    }
+}
+
+impl std::error::Error for DuplicateField {}
 
 impl fmt::Debug for HeaderMap {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -758,6 +1026,261 @@ mod tests {
 
         let pairs: Vec<_> = headers.iter().collect();
         assert_eq!(pairs.len(), 2);
+    }
+
+    /// The zero-copy serve path hands `HeaderMap` a [`HeaderId`] produced by a
+    /// *different crate* — `armature-h1`'s parser — and never re-interns it. If
+    /// that id were not byte-identical to what `header_id::intern` produces for
+    /// the same name, every by-name lookup of a custom header would silently
+    /// miss: `get` would return `None` for a header that is demonstrably
+    /// present, which is the kind of bug that looks like a client problem.
+    #[test]
+    fn a_parser_produced_id_equals_an_interned_one() {
+        use armature_h1::{Limits, parse_head};
+        use bytes::Bytes;
+
+        // Mixed case on the wire, since that is the case that forces the
+        // parser down its lowercasing path rather than a borrowed slice.
+        let raw = Bytes::from_static(b"GET / HTTP/1.1\r\nHost: a\r\nX-Trace-Id: abc\r\n\r\n");
+        let head = parse_head(&raw, &Limits::default())
+            .expect("parse")
+            .expect("complete")
+            .0;
+
+        let (parsed_id, value) = head
+            .headers
+            .iter()
+            .find(|(id, _)| id.as_str() == "x-trace-id")
+            .cloned()
+            .expect("the custom header is present in the parsed head");
+
+        assert_eq!(
+            parsed_id,
+            header_id::intern("x-trace-id"),
+            "a parser-produced id must equal an interned one, or the serve \
+             path's stored headers are unreachable by name"
+        );
+
+        let mut headers = HeaderMap::new();
+        headers.append_id(parsed_id, value);
+
+        // Found by the wire casing and by lowercase alike.
+        assert_eq!(headers.get("X-Trace-Id"), Some("abc"));
+        assert_eq!(headers.get("x-trace-id"), Some("abc"));
+
+        // And the case-normalization invariant this module documents holds for
+        // a name it never interned itself.
+        assert!(headers.iter().any(|(k, _)| k == "x-trace-id"));
+        assert!(headers.keys().any(|k| k == "x-trace-id"));
+        assert!(headers.to_hash_map().contains_key("x-trace-id"));
+    }
+
+    /// `insert_id` is the pre-interned `insert`, so it must behave as `insert`
+    /// does in the one place they could plausibly differ: what happens to an
+    /// existing field of the same name.
+    /// The serve path appends every occurrence a request carried, so a
+    /// replacing operation that spared later duplicates would leave a
+    /// client-supplied value behind exactly where code was trying to overwrite
+    /// it. `http::HeaderMap::insert` collapses; so must this.
+    #[test]
+    fn insert_collapses_every_occurrence_of_a_repeated_field() {
+        use bytes::Bytes;
+
+        let mut headers = HeaderMap::new();
+        let xff = header_id::intern("x-forwarded-for");
+        // Three field lines, which is what a two-proxy chain actually produces,
+        // interleaved with an unrelated field. Two occurrences would be passed
+        // by a compaction that drops the first plus exactly one more; three
+        // interleaved ones also stress the index arithmetic that shifting
+        // survivors leftwards depends on.
+        headers.append_id(xff.clone(), Bytes::from_static(b"203.0.113.7"));
+        headers.append_id(HeaderId::Accept, Bytes::from_static(b"text/html"));
+        headers.append_id(xff.clone(), Bytes::from_static(b"198.51.100.9"));
+        headers.append_id(HeaderId::UserAgent, Bytes::from_static(b"curl/8"));
+        headers.append_id(xff, Bytes::from_static(b"192.0.2.4"));
+        assert_eq!(headers.get_all("x-forwarded-for").len(), 3);
+
+        // The canonical sanitisation idiom.
+        headers.insert("X-Forwarded-For", "10.0.0.1");
+
+        let all = headers.get_all("x-forwarded-for");
+        assert_eq!(
+            all,
+            vec!["10.0.0.1"],
+            "a replacing insert must leave exactly one occurrence; a surviving \
+             duplicate is a value the caller believed it had overwritten"
+        );
+        assert_eq!(
+            headers.get("accept"),
+            Some("text/html"),
+            "collapsing one field must not disturb the fields interleaved with it"
+        );
+        assert_eq!(headers.get("user-agent"), Some("curl/8"));
+        assert_eq!(
+            headers.len(),
+            3,
+            "one X-Forwarded-For plus the two bystanders"
+        );
+    }
+
+    #[test]
+    fn remove_takes_every_occurrence_not_just_the_first() {
+        use bytes::Bytes;
+
+        let mut headers = HeaderMap::new();
+        // Three occurrences, interleaved: a removal that takes the first plus
+        // exactly one more leaves the third behind, and a removal whose index
+        // arithmetic slips takes a bystander with it.
+        headers.append_id(HeaderId::Accept, Bytes::from_static(b"first"));
+        headers.append_id(HeaderId::Host, Bytes::from_static(b"example.com"));
+        headers.append_id(HeaderId::Accept, Bytes::from_static(b"second"));
+        headers.append_id(HeaderId::UserAgent, Bytes::from_static(b"curl/8"));
+        headers.append_id(HeaderId::Accept, Bytes::from_static(b"third"));
+
+        let removed = headers.remove("accept");
+
+        assert_eq!(
+            removed.as_deref(),
+            Some(&b"first"[..]),
+            "the first occurrence comes back, as before"
+        );
+        assert!(
+            headers.get("accept").is_none(),
+            "stripping a header must strip all of it, or code that removes an \
+             untrusted field before trusting the request keeps the attacker's \
+             later lines"
+        );
+        assert_eq!(
+            headers.get_all("accept").len(),
+            0,
+            "no occurrence of the removed field may survive"
+        );
+        assert_eq!(
+            headers.get("host"),
+            Some("example.com"),
+            "removing one field must not disturb the fields interleaved with it"
+        );
+        assert_eq!(headers.get("user-agent"), Some("curl/8"));
+        assert_eq!(headers.len(), 2);
+    }
+
+    #[test]
+    fn get_unique_refuses_to_choose_between_duplicate_occurrences() {
+        let mut headers = HeaderMap::new();
+        headers.append("X-Authenticated-User", "admin");
+
+        assert_eq!(
+            headers
+                .get_unique("x-authenticated-user")
+                .expect("one occurrence is not a duplicate")
+                .map(|v| &v[..]),
+            Some(&b"admin"[..])
+        );
+        assert_eq!(
+            headers
+                .get_unique("absent")
+                .expect("absent is not a duplicate"),
+            None,
+            "an absent field is Ok(None), not an error"
+        );
+
+        // A proxy that appends rather than replaces leaves the client's claim
+        // first, which is exactly what `get` would hand back.
+        headers.append("x-authenticated-user", "alice");
+        assert_eq!(headers.get("X-Authenticated-User"), Some("admin"));
+
+        let err = headers
+            .get_unique("X-Authenticated-User")
+            .expect_err("two occurrences of a single-valued field must be an error");
+        assert_eq!(err.name(), "x-authenticated-user");
+        assert_eq!(err.count(), 2);
+        assert!(
+            err.to_string().contains("x-authenticated-user"),
+            "the message must name the field, or a rejection log cannot say which"
+        );
+    }
+
+    #[test]
+    fn security_relevant_accessors_fail_closed_on_a_duplicated_field() {
+        // A request that says two contradictory things about who it is, how
+        // long it is, or where it is addressed is not a request to answer from.
+        // Every one of these fields is single-valued by its RFC, and the serve
+        // path keeps both lines, so "first wins" would systematically pick the
+        // client's over the proxy's.
+        let mut headers = HeaderMap::new();
+        headers.append("Authorization", "Bearer client-chosen");
+        headers.append("Content-Length", "5");
+        headers.append("Host", "example.com");
+        assert_eq!(headers.authorization(), Some("Bearer client-chosen"));
+        assert_eq!(headers.content_length(), Some(5));
+        assert_eq!(headers.host(), Some("example.com"));
+
+        headers.append("authorization", "Bearer proxy-issued");
+        headers.append("content-length", "500");
+        headers.append("host", "internal.example");
+
+        assert_eq!(
+            headers.authorization(),
+            None,
+            "a duplicated Authorization must read as no credential, not as the \
+             first line the client happened to send"
+        );
+        assert_eq!(
+            headers.content_length(),
+            None,
+            "two Content-Length lines are the request-smuggling shape; neither \
+             length may be reported as the framing"
+        );
+        assert_eq!(
+            headers.host(),
+            None,
+            "two Host lines leave no single authority to route or cache under"
+        );
+
+        // The raw first-wins accessors are unchanged: only the deciding
+        // accessors fail closed.
+        assert_eq!(headers.get("authorization"), Some("Bearer client-chosen"));
+        assert_eq!(headers.get_all("host").len(), 2);
+    }
+
+    #[test]
+    fn insert_id_collapses_every_occurrence_like_insert() {
+        use bytes::Bytes;
+
+        let mut by_id = HeaderMap::new();
+        assert_eq!(
+            by_id.insert_id(HeaderId::Accept, Bytes::from_static(b"first")),
+            None,
+            "the first insert replaces nothing"
+        );
+        let replaced = by_id.insert_id(HeaderId::Accept, Bytes::from_static(b"second"));
+        assert_eq!(replaced.as_deref(), Some(&b"first"[..]));
+        assert_eq!(by_id.len(), 1, "replacing must not grow the map");
+
+        let mut by_name = HeaderMap::new();
+        by_name.insert("Accept", "first");
+        let replaced_by_name = by_name.insert("Accept", "second");
+
+        assert_eq!(
+            replaced_by_name.as_deref(),
+            Some(&b"first"[..]),
+            "insert and insert_id must return the same displaced value"
+        );
+        assert_eq!(by_id.get("accept"), by_name.get("accept"));
+        assert_eq!(by_id.len(), by_name.len());
+
+        // And the property the name claims: three occurrences in, one out.
+        let mut repeated = HeaderMap::new();
+        for value in [&b"a"[..], b"b", b"c"] {
+            repeated.append_id(HeaderId::Accept, Bytes::copy_from_slice(value));
+        }
+        repeated.insert_id(HeaderId::Accept, Bytes::from_static(b"final"));
+        assert_eq!(
+            repeated.get_all("accept"),
+            vec!["final"],
+            "insert_id must collapse every occurrence, as insert and \
+             http::HeaderMap::insert do"
+        );
     }
 
     #[test]

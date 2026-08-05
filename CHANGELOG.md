@@ -10,7 +10,265 @@ Changes at or before `0.6.0` are recorded in the workspace
 
 ## [Unreleased]
 
+## [0.9.0] - 2026-08-05
+
+### Release ordering
+
+This release depends on `armature-h1 >= 0.3.0`, and `armature-h1` re-exports
+into this crate's public API (`ByteStr`, `HeaderId`, `Method`, `header_id`,
+and the signatures that use them), so it is a **public dependency**: two
+incompatible `armature-h1` versions in one graph produce `expected HeaderId,
+found HeaderId`. That is why this is `0.9.0` and not another `0.8.x` — moving
+a public dependency across a `0.x` minor is a breaking change for consumers.
+
+Publish in this order:
+
+1. `armature-h1 0.3.0` to crates.io.
+2. `armature-core 0.9.0`.
+3. Every sibling crate that pins `armature-core`, re-pinned to `"0.9"` **and
+   minor-bumped** (`armature-auth 0.2.1 → 0.3.0`, `armature-jwt 0.2.2 →
+   0.3.0`, and so on for all 36). A re-pin alone cannot ship: each sibling
+   already sits on a published release at its current version, and crates.io
+   refuses a re-publish at the same version. The bump has to be a *minor*
+   rather than a patch because each sibling re-exposes `armature-core` types
+   in its own public API (`armature-auth`'s guards, `armature-testing`'s
+   assertions, …), which makes `armature-core` a public dependency of each of
+   them by the same argument that forced this crate to `0.9.0` — so moving
+   the requirement across a `0.x` boundary is breaking for their consumers
+   too. A sibling still requiring `"0.8"` would resolve a second,
+   incompatible `armature-core` alongside this one. Where siblings depend on
+   each other (`armature-auth` → `armature-jwt`, `armature-audit` →
+   `armature-auth`, `armature-cli` → `armature-app`, `armature-siem` →
+   `armature-audit`, and the `armature-proc-macro`/`armature-rhai`
+   dependents), publish the depended-on crate first and make sure the
+   dependent's requirement names the new minor.
+4. `armature-framework 0.6.0` last. Its `src/lib.rs` opens with
+   `pub use armature_core::*;`, a glob re-export, so `armature-core` is a
+   public dependency of the facade for exactly the reason it is one of this
+   crate — and `0.8 → 0.9` is therefore breaking for facade consumers, which
+   is why its minor moves rather than its patch. It goes last because it
+   depends on the siblings above and its requirements name their new minors.
+
 ### Added
+
+- `h1-backend` cargo feature, **on by default**: HTTP/1.1 is served by
+  `armature-h1` rather than `hyper::server::conn::http1`. HTTP/2 is still
+  hyper's, reached through `armature-h1`'s `H2Fallback` hook when a connection
+  negotiates ALPN `h2` — but see the HTTP/2 entries below, because it is not
+  wholly unchanged. HTTP/3 is untouched. Turn the feature off
+  (`default-features = false`) to keep the previous hyper HTTP/1.1 path.
+  Note that Cargo unifies features across a whole dependency graph, so
+  `default-features = false` is only reliable if *nothing* else in the build
+  enables this crate's defaults.
+- `HeaderMap::insert_id` and `HeaderMap::append_id`: insert or append a header
+  whose name is already interned. `append_id` is the serve path's entry point
+  and is what makes it zero-copy — `armature-h1` parses names straight into
+  `HeaderId` and values into `Bytes` slices of the connection's read buffer, so
+  a head crosses into `HttpRequest` as a sequence of moves rather than a copy
+  per value and a re-intern per name.
+- `HeaderMap::get_unique(name) -> Result<Option<&Bytes>, DuplicateField>`, and
+  the `DuplicateField` error it returns. The serve path now keeps every
+  occurrence of a repeated field, and every other accessor except `get_all`
+  answers with the *first* — which for a single-valued field is the hazard this
+  closes. A fronting proxy that appends rather than replaces (Envoy's
+  `APPEND_IF_EXISTS_OR_ADD`, nginx `add_header`) leaves the client's line first
+  and its own second, so a client sending `X-Authenticated-User: admin` outranks
+  the proxy's `alice` under `get`. `get_unique` answers only when exactly one
+  occurrence exists and reports the count otherwise, so a caller can reject a
+  request that says two contradictory things rather than guess.
+
+- `PipelineConfig::request_timeout` and `PipelineConfig::write_timeout`, both
+  wired on the `h1-backend` path to `armature-h1`'s `Limits::body_timeout` and
+  `Limits::write_timeout`. They default asymmetrically, deliberately.
+
+  `request_timeout` defaults to `None`. Its underlying deadline races the
+  *entire handler future*, not just the body read, so a finite default would
+  make the backend swap silently cancel every long-poll, SSE stream and slow
+  upload the hyper path allowed — with a bare `408`, no error envelope, and
+  nothing logged, because the handler is cancelled before it can return. A
+  deployment that knows its handlers' upper bound sets it; note that it is also
+  the only bound on a peer that sends a complete head and then trickles its
+  body, so a server exposed directly to the internet should.
+
+  `write_timeout` defaults to five minutes. The failure it prevents is not a
+  slow handler but a peer that stops reading: `armature-h1` caps neither
+  connection count nor write duration, so an unbounded write deadline lets a
+  client hold a worker's connection slot, its file descriptor and its whole
+  response buffer indefinitely by shrinking its receive window to zero.
+
+### Changed
+
+- **Breaking (behaviour, not signature)**: with default features, HTTP/1.1
+  parsing is `armature-h1`'s and is stricter than hyper's. A bare LF as a line
+  terminator, a `#` fragment in the request target, and an unsupported transfer
+  coding are refused rather than accepted or silently repaired, and every
+  framing rejection closes the connection. That strictness is the reason for
+  the swap — leniency that differs from a peer's leniency is the request
+  smuggling vector — but a client that relied on hyper's permissiveness will
+  now be refused. See `armature-h1`'s `BACKENDS.md`.
+- `PipelineConfig::keep_alive_timeout` and `PipelineConfig::max_header_size`
+  are now wired on the `h1-backend` path, to `Limits::idle_timeout` and
+  `Limits::max_head_bytes`. Both documented themselves as unwired because
+  hyper's H1 builder had no knob for them; `armature-h1` does. Configurations
+  that set them and saw no effect will now see one.
+- `Application::listen_on`, `listen_https`, `listen_https_h2`,
+  `listen_with_config` and `listen_dual_stack` keep their signatures. Serving
+  moves onto `armature-h1`'s thread-per-core worker threads, run from a
+  blocking-pool thread so the caller's runtime is not blocked.
+- **A handler must not block on the `h1-backend` path.** One thread serves
+  every connection on its core, so a blocking handler stalls all of them. The
+  hyper path's work-stealing runtime hid this; this one does not. Move
+  genuinely blocking work to a shared pool.
+- Repeated header fields are preserved rather than collapsed. The hyper path
+  stored headers with `HeaderMap::insert`, which replaces, so a field the wire
+  sent twice survived only as its last occurrence; the serve path now appends,
+  and a single-valued lookup returns the first. See the `client_address` entry
+  under **Fixed** for why this mattered.
+- **Breaking (behaviour, not signature)**: `HeaderMap::insert`, `insert_id` and
+  `remove` now act on *every* occurrence of a repeated field, matching
+  `http::HeaderMap::insert`. Each previously touched only the first, which
+  became a security hole the moment the serve path started appending: the
+  canonical sanitisation idiom
+  `headers.insert("X-Forwarded-For", trusted_value)` left the client's second
+  field line in the map, where `client_address` went on reading it as a hop.
+  `insert`/`insert_id` still return the value the first occurrence held;
+  `remove` still returns the first value, and `remove_all` still returns the
+  count.
+- **Breaking (behaviour, not signature)**: `HeaderMap::authorization`,
+  `content_length` and `host` fail closed on a duplicated field, returning
+  `None` where they previously returned the first occurrence. All three are
+  single-valued by their RFCs, and since the serve path keeps both lines,
+  "first wins" would systematically prefer the client's line over an appending
+  proxy's. Two `Content-Length` lines are the request-smuggling shape RFC 9112
+  §6.3 requires be rejected, and two `Host` lines leave no single authority to
+  route or cache under. `get`, `get_bytes` and `get_all` are unchanged.
+- The per-request `trace!("Incoming request")` record now comes from the shared
+  dispatch path, so both backends emit it. It was previously written only by
+  the hyper adapter, which would have left HTTP/1.1 with no arrival record at
+  all — and none whatsoever for a request rejected at CORS preflight or the
+  body limit, which are decided before routing.
+- On the `h1-backend` path, `PipelineStats` and `Http2Stats` connection and
+  request counters stay at zero: `armature-h1` owns the accept loop and exposes
+  no hook to count from. Nothing was removed — the types and their methods keep
+  their signatures — but a dashboard reading them will go flat. The same applies
+  to `with_socket_tuning` (`EpollConfig`), which reaches for the raw fd of a
+  listener this process no longer owns; `armature-h1`'s own `TcpConfig` covers
+  `nodelay`, backlog and `SO_REUSEPORT` (and sets the last of those *before*
+  bind, where it actually takes effect). `with_socket_tuning` still applies on
+  `listen_h2c`, which remains a hyper listener.
+- `PipelineConfig::pipeline_flush` and `PipelineConfig::read_buffer_size`, both
+  documented as wired, are inert on the `h1-backend` path: `armature-h1` writes
+  each response as it is produced and grows its read buffer from a fixed chunk
+  size, so it exposes no knob for either. Both fields still exist and still
+  reach the HTTP/2 connections hyper serves.
+
+### Fixed
+
+- **HTTP/1.1-only HTTPS listeners no longer advertise ALPN `h2` and then hang
+  up on it.** `TlsConfig` offers `h2, http/1.1` unconditionally, so
+  `listen_https` and `listen_with_config` — which serve HTTP/1.1 only —
+  negotiated `h2` with every modern browser and then closed the connection
+  without a byte of HTTP. Both now strip `h2` from the offer, so the handshake
+  settles on `http/1.1` and the connection is served. `listen_https_h2` is
+  unaffected: it genuinely serves HTTP/2.
+
+  This was pre-existing rather than introduced by the backend swap — hyper's
+  HTTP/1.1 server also rejects an h2 preface — and the fix is applied on both
+  paths, so an h2-only client now receives a `no_application_protocol` TLS
+  alert instead of a successful handshake followed by silence. That is a
+  behaviour change on the hyper path too, and a more diagnosable one.
+
+- **`with_cors` was silently ignored by every TLS listener.** `listen_https`,
+  `listen_https_h2`, `listen_with_config`, `listen_h2c` and `listen_dual_stack`
+  all built their serve state with no CORS configuration, so an HTTPS server
+  configured with `with_cors` sent no CORS headers at all. Only `listen_on`
+  honoured it. Every listener now does. **This changes behaviour for existing
+  HTTPS deployments**: CORS headers now appear on their responses. A registered
+  `OPTIONS` route keeps working — see the next entry.
+- **A registered `OPTIONS` route is no longer shadowed by CORS.** The preflight
+  handler answered *every* `OPTIONS` request with 204 before the router was
+  consulted, so configuring CORS made `Router::options` unreachable. It now
+  intercepts only an actual preflight — an `OPTIONS` carrying
+  `Access-Control-Request-Method`, which is what a browser sends and what the
+  Fetch standard defines a preflight to be. Everything else routes normally,
+  including the RFC 9110 section 9.3.7 sense of `OPTIONS` (ask what a resource
+  supports), which had no way to be served at all while CORS was on.
+- **HTTP/2 lost the client's address on the `h1-backend` path.** `H2Fallback`
+  had no way to report which peer a connection came from, so every HTTP/2
+  request arrived with `HttpRequest::peer` of `None` while HTTP/1.1 on the same
+  socket kept a real one — silently sending `client_address` to the
+  caller-controlled `X-Forwarded-For` header for rate limiting, deduplication
+  and audit attribution. Fixed by passing the peer through the hook, which is a
+  **breaking change to `armature-h1`'s `H2Fallback` trait** (see that crate's
+  changelog).
+- **`HttpRequest::client_address` could be spoofed via a repeated
+  `X-Forwarded-For`.** It read a single field line, so where a proxy appends
+  its own line rather than extending the client's — HAProxy's `option
+  forwardfor` and several ingress configurations do this — the client's line
+  won and `client_address` returned an address the caller chose. Repeated field
+  lines are now joined per RFC 9110 §5.3 before the rightmost hop is selected,
+  which is also the only reading that makes both backends agree.
+- **`HttpRequest::client_address` fails closed on an empty or unparseable
+  hop.** An empty element anywhere in the chain now yields `None` rather than
+  being skipped. Skipping it shortened the list, and because the entry is chosen
+  by counting from the *right*, a shorter list slid the index one position
+  further left — onto an entry the client supplied, returned as the trusted
+  address. A malformed hop means the chain is not the one the deployment was
+  configured for, and the safe answer to that is no answer. **This changes
+  behaviour**: a deployment whose ingress emits `a, , b` will now see `None`
+  where it previously got an address.
+- A declared `Content-Length` over the configured limit now returns this
+  framework's `{"error":"Payload Too Large","status":413}` envelope with CORS
+  headers, as every other transport does. `armature-h1`'s own body cap was
+  configured with the same value and is evaluated before the service runs, so
+  it answered first with a bare status line — leaving a browser doing a CORS
+  upload with an opaque CORS failure instead of a 413.
+
+## [0.8.5] - 2026-08-04
+
+### Added
+
+- `HttpRequest::peer: Option<SocketAddr>` — the address of the socket a request
+  arrived on. This is the only client identifier a handler can trust: every
+  address in a header (`X-Forwarded-For`, `X-Real-IP`, `Forwarded`) is set by the
+  caller, so anything that rate-limits, deduplicates, or logs by "client address"
+  without it is keyed on a value the client chooses. `None` means genuinely
+  unknown rather than a plausible-looking `0.0.0.0`, so a fabricated address
+  cannot reach an audit log through an unwrap-shaped default.
+
+  Populated by every serve path: HTTP/1.1, HTTPS, HTTP/2 and the ALPN-multiplexed
+  listener carry it on the per-connection `ServeState`; HTTP/3 takes it from the
+  QUIC connection's `remote_address()`; `micro` takes it from its accept loop.
+  Two accept loops previously discarded the address outright.
+
+  Additive, and not a breaking change: `HttpRequest` has a private field, so it
+  was never constructible outside this crate by struct literal.
+
+- `HttpRequest::with_peer` and `HttpRequest::client_address(trusted_proxy_depth)`.
+  The latter answers "which address do I attribute this request to", given how
+  many reverse proxies sit in front of the process, and exists so applications
+  stop reimplementing the rule — which is easy to state and easy to get exactly
+  backwards.
+
+  `X-Forwarded-For` is *appended* to by each proxy, so the rightmost hops are the
+  ones your own infrastructure added and the only ones worth believing. The
+  client is selected `depth`-from-the-right (1-indexed). Taking the leftmost
+  entry — the obvious reading of "the first one is the client" — is a spoof: a
+  caller sends `X-Forwarded-For: 198.51.100.9`, the real proxy appends what it
+  actually saw, and the leftmost entry is the fabrication. That defeats rate
+  limiting (rotate it per request for a fresh bucket) and abuse attribution (name
+  a victim and let them absorb it).
+
+  A `depth` of `0` trusts no proxy, ignores the header, and uses the socket peer;
+  that is the right default for a directly reachable process. A `depth` deeper
+  than the chain actually present returns `None` rather than falling back to the
+  peer, because the request did not traverse the proxies the deployment is
+  configured for, and attributing it to the proxy would collapse every client
+  into one bucket.
+
+  This matches `forwarded_ip_at_depth` in `armature-ratelimit`, whose
+  implementation of the same rule previously had to note that this crate exposed
+  no peer to fall back to.
 
 - Adopted the framework's criterion benchmarks that measure this crate: `core`, `arena`, `body`, `json`, `micro`, `pipeline`, `resilience`, `simd_parser` and `internal_overhead` moved here from the root package's `benches/`. Run them with `cargo bench -p armature-core --bench <name>`. The crate now sets `autobenches = false`, so a new file under `benches/` needs an explicit `[[bench]]` entry. `criterion` also gains the `async_tokio` feature: `internal_overhead`, `micro` and `resilience` drive async work through `Bencher::to_async`, which is feature-gated, so without it these benches do not compile outside the workspace.
 

@@ -13,10 +13,13 @@
 //! That is a property of `HttpResponse`, not of this bridge, and changing it is
 //! a separate job from swapping the serve path.
 
+use crate::application::response_wire;
 use crate::http::{HttpRequest, HttpResponse};
-use crate::logging::warn;
 use armature_h1::{HeaderId, Response as H1Response, ResponseBody, header as header_id};
 use bytes::Bytes;
+use response_wire::{
+    name_is_token, report_transport_field, report_unemittable, transport_field, value_is_emittable,
+};
 use std::collections::HashMap;
 
 /// Build an [`HttpRequest`] from a parsed `armature-h1` head.
@@ -53,61 +56,47 @@ pub(crate) fn request_from_head(
     req
 }
 
-/// Whether a field name is a token (RFC 9110 section 5.6.2) and a field value
-/// carries nothing that would terminate the field early.
+/// The 500 served in place of a response a handler made unemittable, CORS
+/// included.
 ///
-/// `armature-h1`'s writer runs the same test and answers it by dropping the
-/// offending field and serving the rest of the response. That is the wrong side
-/// to err on for a *response*: response splitting is prevented either way, but
-/// the field that gets dropped is as likely to be a
-/// `Content-Security-Policy`, an `X-Frame-Options`, or a `Set-Cookie` carrying
-/// `Secure`/`HttpOnly` as it is to be decoration, and a page served with its
-/// protections silently missing is worse than a page not served at all. So the
-/// bridge asks the question first, where the whole response can still be
-/// abandoned, and matches the hyper path — whose `Response::builder` refuses
-/// the same fields and whose bridge turns that refusal into a 500.
-fn field_is_emittable(name: &str, value: &[u8]) -> bool {
-    let name_ok = !name.is_empty()
-        && name.bytes().all(|b| {
-            b.is_ascii_alphanumeric()
-                || matches!(
-                    b,
-                    b'!' | b'#'
-                        | b'$'
-                        | b'%'
-                        | b'&'
-                        | b'\''
-                        | b'*'
-                        | b'+'
-                        | b'-'
-                        | b'.'
-                        | b'^'
-                        | b'_'
-                        | b'`'
-                        | b'|'
-                        | b'~'
-                )
-        });
-    name_ok && !value.iter().any(|b| matches!(b, b'\r' | b'\n' | 0))
+/// Assembled field by field from [`internal_error_envelope`] rather than by
+/// re-entering [`to_h1_response`]: that would be a recursion whose base case
+/// depends on the configured origin being emittable, which is not something this
+/// function gets to assume about a configuration.
+fn unemittable_response(cors: Option<&crate::CorsConfig>) -> H1Response {
+    let envelope = response_wire::internal_error_envelope();
+    let mut out = H1Response::new(envelope.status);
+    for (key, value) in HashMap::from(envelope.headers) {
+        out.headers
+            .push((header_id::intern(&key), Bytes::from(value)));
+    }
+    if let Some(cors) = cors {
+        // No handler origin to weigh: this response is the framework's, so the
+        // configured pair applies as it would to any response the handler did
+        // not touch.
+        apply_cors(&mut out, &response_wire::cors_additions(None, cors));
+    }
+    out.with_body(ResponseBody::Full(envelope.body))
 }
 
-/// The 500 served in place of a response a handler made unemittable.
-///
-/// Empty-bodied on purpose: whatever the handler meant to say, it said it
-/// alongside a field that cannot go on the wire, and the body may well be the
-/// thing the missing field was protecting.
-fn unemittable_response() -> H1Response {
-    H1Response::new(500).with_body(ResponseBody::Empty)
-}
-
-/// Whether this field is the transport's to decide rather than the handler's.
-///
-/// The hop-by-hop set is `armature-h1`'s own, plus `Content-Length`: that one is
-/// not hop-by-hop in the RFC 9110 sense, but `armature-h1` frames the body
-/// itself, and a handler-supplied length that disagrees with the bytes actually
-/// written is a desync a proxy will read as the start of the next response.
-fn belongs_to_the_transport(id: &HeaderId) -> bool {
-    id.is_hop_by_hop() || *id == HeaderId::ContentLength
+/// Add whatever the CORS policy decided to add.
+fn apply_cors(out: &mut H1Response, additions: &response_wire::CorsAdditions) {
+    if let Some(origin) = &additions.origin {
+        out.headers.push((
+            header_id::intern("access-control-allow-origin"),
+            Bytes::from(origin.clone()),
+        ));
+    }
+    if additions.credentials {
+        out.headers.push((
+            header_id::intern("access-control-allow-credentials"),
+            Bytes::from_static(b"true"),
+        ));
+    }
+    if additions.vary_origin {
+        out.headers
+            .push((header_id::intern("vary"), Bytes::from_static(b"Origin")));
+    }
 }
 
 /// Convert an [`HttpResponse`] into an `armature-h1` response, applying CORS.
@@ -115,9 +104,14 @@ fn belongs_to_the_transport(id: &HeaderId) -> bool {
 /// `cors` mirrors the hyper path's `to_hyper_response`: the per-response origin
 /// pair, added to every response when CORS is configured, as distinct from the
 /// preflight answer which carries its own full set.
+///
+/// `method` and `path` are carried only so the fail-closed 500 can name the
+/// request that produced it; nothing else here reads them.
 pub(crate) fn to_h1_response(
     response: HttpResponse,
     cors: Option<&crate::CorsConfig>,
+    method: &crate::Method,
+    path: &str,
 ) -> H1Response {
     // Destructured rather than read through `&response`, so each header value's
     // `String` buffer becomes the `Bytes` instead of being copied into a fresh
@@ -136,32 +130,16 @@ pub(crate) fn to_h1_response(
     // Bytes); 16]>`, so a builder chain moves about a kilobyte of inline
     // storage per field for no gain in a loop that already owns the response.
     for (key, value) in HashMap::from(headers) {
-        if !field_is_emittable(&key, value.as_bytes()) {
-            // The name only. A value that fails this test is by definition
-            // holding bytes that break out of the field, and it reached here
-            // from somewhere — logging it would carry the same injection into
-            // whatever reads the log.
-            warn!(
-                field = %key,
-                "Handler produced an unwritable header; failing the response closed"
-            );
-            return unemittable_response();
+        if !name_is_token(&key) || !value_is_emittable(value.as_bytes()) {
+            report_unemittable(&key, value.as_bytes(), method, path, "header");
+            return unemittable_response(cors);
         }
-        let id = header_id::intern(&key);
-        if belongs_to_the_transport(&id) {
-            // Framing is the connection loop's decision, and it makes it
-            // knowing things the handler does not: whether the body was
-            // consumed, whether the connection is about to close. A response
-            // that carries its own `Connection` wins over that decision —
-            // `armature-h1`'s writer suppresses its own field when one was
-            // supplied — so a handler reflecting a request's `connection:
-            // keep-alive` can talk the server out of the `close` it is about to
-            // act on regardless, and a pooling proxy then keeps a socket the
-            // server has already hung up.
-            warn!(field = %key, "Dropping a hop-by-hop or framing header supplied by a handler");
+        if let Some(field) = transport_field(&key) {
+            report_transport_field(&field, &key);
             continue;
         }
-        out.headers.push((id, Bytes::from(value)));
+        out.headers
+            .push((header_id::intern(&key), Bytes::from(value)));
     }
     // `Set-Cookie` is the canonical repeating field: a response setting two
     // cookies must emit two fields rather than one comma-joined one. Nothing on
@@ -169,52 +147,32 @@ pub(crate) fn to_h1_response(
     // loop above preserves a repeated field exactly as this one does — the two
     // loops differ only in where their values come from.
     for cookie in cookies {
-        if !field_is_emittable("set-cookie", cookie.as_bytes()) {
-            warn!("Handler produced an unwritable Set-Cookie; failing the response closed");
-            return unemittable_response();
+        // Only the value is in question: the name is the literal `set-cookie`,
+        // which is a token by inspection.
+        if !value_is_emittable(cookie.as_bytes()) {
+            report_unemittable("set-cookie", cookie.as_bytes(), method, path, "set-cookie");
+            return unemittable_response(cors);
         }
         out.headers.push((HeaderId::SetCookie, Bytes::from(cookie)));
     }
     if let Some(cors) = cors {
-        // A handler that reflects the request's `Origin` — the standard way to
-        // do credentialed CORS, since `*` is not allowed with credentials — has
-        // already answered this question better than the static config can.
-        // Adding the configured origin next to it emits the field twice, which
-        // browsers reject outright, so the response ends up worse than either
-        // answer alone.
         let handler_origin = out
             .headers
             .iter()
             .find(|(id, _)| id.as_str() == "access-control-allow-origin")
             .map(|(_, value)| value.clone());
-        // Whichever of the two actually reaches the browser is the one the
-        // credentials rule has to be judged against.
-        let effective_origin = handler_origin
-            .clone()
-            .unwrap_or_else(|| Bytes::from(cors.allow_origin.clone()));
-        if handler_origin.is_none() {
-            out.headers.push((
-                header_id::intern("access-control-allow-origin"),
-                Bytes::from(cors.allow_origin.clone()),
-            ));
-        }
-        if cors.allow_credentials {
-            if effective_origin.as_ref() != b"*" {
-                out.headers.push((
-                    header_id::intern("access-control-allow-credentials"),
-                    Bytes::from_static(b"true"),
-                ));
-            } else {
-                // Emitting both is not a stricter policy than emitting one, it
-                // is a broken one: a browser seeing `*` with credentials
-                // discards the whole response, so the request fails rather than
-                // succeeding without credentials.
-                warn!(
-                    "CORS allows credentials against a wildcard origin, a combination browsers \
-                     reject; omitting access-control-allow-credentials"
-                );
-            }
-        }
+        // The decision itself is `cors_additions`, shared with the hyper
+        // adapter; this side only carries the result onto the wire. The origin
+        // arrived as bytes and the policy is expressed over `str`, so a
+        // non-UTF-8 origin is treated as one the configuration cannot have
+        // authorised — which is what it is.
+        let additions = response_wire::cors_additions(
+            handler_origin
+                .as_ref()
+                .map(|value| std::str::from_utf8(value).unwrap_or("\u{fffd}")),
+            cors,
+        );
+        apply_cors(&mut out, &additions);
     }
 
     if body.is_empty() {
@@ -240,6 +198,12 @@ mod tests {
             .expect("parse")
             .expect("complete")
             .0
+    }
+
+    /// Every conversion below answers the same nominal request. The method and
+    /// path reach the logs and nothing else, so one pair serves for all of them.
+    fn convert(response: HttpResponse, cors: Option<&crate::CorsConfig>) -> H1Response {
+        to_h1_response(response, cors, &crate::Method::Get, "/t")
     }
 
     #[test]
@@ -300,7 +264,7 @@ mod tests {
 
     #[test]
     fn an_empty_body_is_named_empty_rather_than_a_zero_length_full() {
-        let out = to_h1_response(HttpResponse::new(204), None);
+        let out = convert(HttpResponse::new(204), None);
         assert_eq!(out.status, 204);
         assert!(
             matches!(out.body, ResponseBody::Empty),
@@ -316,7 +280,7 @@ mod tests {
         resp.cookies.push("b=2".to_string());
         let cors = crate::CorsConfig::new("https://example.test").with_credentials();
 
-        let out = to_h1_response(resp, Some(&cors));
+        let out = convert(resp, Some(&cors));
 
         let cookies: Vec<_> = out
             .headers
@@ -367,7 +331,7 @@ mod tests {
         resp.headers
             .insert("Content-Type".to_string(), "text/plain".to_string());
 
-        let out = to_h1_response(resp, None);
+        let out = convert(resp, None);
 
         for field in [
             "connection",
@@ -404,14 +368,46 @@ mod tests {
             );
             resp.headers.insert(name.to_string(), value.to_string());
 
-            let out = to_h1_response(resp, None);
+            let out = convert(resp, None);
 
             assert_eq!(out.status, 500, "{name}: {value:?} must fail closed");
             // Not merely "the bad field is gone": serving the rest would serve
             // the page with its CSP silently dropped.
             assert_eq!(count_of(&out, "content-security-policy"), 0);
-            assert!(matches!(out.body, ResponseBody::Empty));
+            // The framework's envelope, not a bare status: a browser doing a
+            // credentialed fetch has to be able to tell a 500 from a network
+            // failure.
+            let body = match &out.body {
+                ResponseBody::Full(bytes) => bytes.clone(),
+                other => panic!("{name}: expected an envelope body, got {other:?}"),
+            };
+            assert_eq!(
+                String::from_utf8_lossy(&body),
+                r#"{"error":"Internal Server Error","status":500}"#
+            );
+            assert_eq!(
+                value_of(&out, "content-type").map(|v| v.as_ref()),
+                Some(&b"application/json"[..])
+            );
         }
+    }
+
+    #[test]
+    fn the_fail_closed_500_still_carries_the_configured_cors_headers() {
+        let mut resp = HttpResponse::new(200);
+        resp.headers.insert("X Bad".to_string(), "fine".to_string());
+        let cors = crate::CorsConfig::new("https://configured.test").with_credentials();
+
+        let out = convert(resp, Some(&cors));
+
+        assert_eq!(out.status, 500);
+        assert_eq!(
+            value_of(&out, "access-control-allow-origin").map(|v| v.as_ref()),
+            Some(&b"https://configured.test"[..]),
+            "without these a credentialed fetch sees an opaque CORS failure \
+             rather than the 500 that actually happened"
+        );
+        assert_eq!(count_of(&out, "access-control-allow-credentials"), 1);
     }
 
     #[test]
@@ -420,7 +416,7 @@ mod tests {
         resp.cookies
             .push("session=abc; Secure; HttpOnly\r\nx-injected: 1".to_string());
 
-        let out = to_h1_response(resp, None);
+        let out = convert(resp, None);
 
         assert_eq!(out.status, 500);
         assert_eq!(count_of(&out, "set-cookie"), 0);
@@ -433,7 +429,7 @@ mod tests {
             .insert("X-Trace-Id".to_string(), "abc-123".to_string());
         resp.cookies.push("a=1; Secure".to_string());
 
-        let out = to_h1_response(resp, None);
+        let out = convert(resp, None);
 
         assert_eq!(out.status, 200);
         assert_eq!(count_of(&out, "x-trace-id"), 1);
@@ -445,11 +441,11 @@ mod tests {
         let mut resp = HttpResponse::new(200);
         resp.headers.insert(
             "Access-Control-Allow-Origin".to_string(),
-            "https://reflected.test".to_string(),
+            "https://configured.test".to_string(),
         );
         let cors = crate::CorsConfig::new("https://configured.test").with_credentials();
 
-        let out = to_h1_response(resp, Some(&cors));
+        let out = convert(resp, Some(&cors));
 
         assert_eq!(
             count_of(&out, "access-control-allow-origin"),
@@ -458,17 +454,52 @@ mod tests {
         );
         assert_eq!(
             value_of(&out, "access-control-allow-origin").map(|v| v.as_ref()),
-            Some(&b"https://reflected.test"[..]),
-            "the handler's per-origin reflection is the more specific answer"
+            Some(&b"https://configured.test"[..])
         );
-        assert_eq!(count_of(&out, "access-control-allow-credentials"), 1);
+        assert_eq!(
+            count_of(&out, "access-control-allow-credentials"),
+            1,
+            "the handler named the origin the configuration authorises, so the \
+             credentialed answer is the one the operator asked for"
+        );
+        assert_eq!(
+            value_of(&out, "vary").map(|v| v.as_ref()),
+            Some(&b"Origin"[..]),
+            "the origin came from the handler, so the response varies by it and \
+             a shared cache has to be told"
+        );
+    }
+
+    #[test]
+    fn a_reflected_origin_the_configuration_does_not_authorise_gets_no_credentials() {
+        let mut resp = HttpResponse::new(200);
+        resp.headers.insert(
+            "Access-Control-Allow-Origin".to_string(),
+            "https://evil.test".to_string(),
+        );
+        let cors = crate::CorsConfig::new("https://configured.test").with_credentials();
+
+        let out = convert(resp, Some(&cors));
+
+        assert_eq!(
+            value_of(&out, "access-control-allow-origin").map(|v| v.as_ref()),
+            Some(&b"https://evil.test"[..]),
+            "the handler's field still stands alone; a second one would only \
+             make the browser discard the response"
+        );
+        assert_eq!(
+            count_of(&out, "access-control-allow-credentials"),
+            0,
+            "a handler reflecting Origin unchecked plus credentials is a full \
+             credentialed cross-origin read for any site that asks"
+        );
     }
 
     #[test]
     fn credentials_are_withheld_from_a_wildcard_origin() {
         let cors = crate::CorsConfig::new("*").with_credentials();
 
-        let out = to_h1_response(HttpResponse::new(200), Some(&cors));
+        let out = convert(HttpResponse::new(200), Some(&cors));
 
         assert_eq!(
             value_of(&out, "access-control-allow-origin").map(|v| v.as_ref()),

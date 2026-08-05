@@ -25,9 +25,29 @@ Publish in this order:
 
 1. `armature-h1 0.3.0` to crates.io.
 2. `armature-core 0.9.0`.
-3. Every sibling crate that pins `armature-core`, re-pinned to `"0.9"` and
-   released in the same train — a sibling still requiring `"0.8"` would
-   resolve a second, incompatible `armature-core` alongside this one.
+3. Every sibling crate that pins `armature-core`, re-pinned to `"0.9"` **and
+   minor-bumped** (`armature-auth 0.2.1 → 0.3.0`, `armature-jwt 0.2.2 →
+   0.3.0`, and so on for all 36). A re-pin alone cannot ship: each sibling
+   already sits on a published release at its current version, and crates.io
+   refuses a re-publish at the same version. The bump has to be a *minor*
+   rather than a patch because each sibling re-exposes `armature-core` types
+   in its own public API (`armature-auth`'s guards, `armature-testing`'s
+   assertions, …), which makes `armature-core` a public dependency of each of
+   them by the same argument that forced this crate to `0.9.0` — so moving
+   the requirement across a `0.x` boundary is breaking for their consumers
+   too. A sibling still requiring `"0.8"` would resolve a second,
+   incompatible `armature-core` alongside this one. Where siblings depend on
+   each other (`armature-auth` → `armature-jwt`, `armature-audit` →
+   `armature-auth`, `armature-cli` → `armature-app`, `armature-siem` →
+   `armature-audit`, and the `armature-proc-macro`/`armature-rhai`
+   dependents), publish the depended-on crate first and make sure the
+   dependent's requirement names the new minor.
+4. `armature-framework 0.6.0` last. Its `src/lib.rs` opens with
+   `pub use armature_core::*;`, a glob re-export, so `armature-core` is a
+   public dependency of the facade for exactly the reason it is one of this
+   crate — and `0.8 → 0.9` is therefore breaking for facade consumers, which
+   is why its minor moves rather than its patch. It goes last because it
+   depends on the siblings above and its requirements name their new minors.
 
 ### Added
 
@@ -46,6 +66,35 @@ Publish in this order:
   `HeaderId` and values into `Bytes` slices of the connection's read buffer, so
   a head crosses into `HttpRequest` as a sequence of moves rather than a copy
   per value and a re-intern per name.
+- `HeaderMap::get_unique(name) -> Result<Option<&Bytes>, DuplicateField>`, and
+  the `DuplicateField` error it returns. The serve path now keeps every
+  occurrence of a repeated field, and every other accessor except `get_all`
+  answers with the *first* — which for a single-valued field is the hazard this
+  closes. A fronting proxy that appends rather than replaces (Envoy's
+  `APPEND_IF_EXISTS_OR_ADD`, nginx `add_header`) leaves the client's line first
+  and its own second, so a client sending `X-Authenticated-User: admin` outranks
+  the proxy's `alice` under `get`. `get_unique` answers only when exactly one
+  occurrence exists and reports the count otherwise, so a caller can reject a
+  request that says two contradictory things rather than guess.
+
+- `PipelineConfig::request_timeout` and `PipelineConfig::write_timeout`, both
+  wired on the `h1-backend` path to `armature-h1`'s `Limits::body_timeout` and
+  `Limits::write_timeout`. They default asymmetrically, deliberately.
+
+  `request_timeout` defaults to `None`. Its underlying deadline races the
+  *entire handler future*, not just the body read, so a finite default would
+  make the backend swap silently cancel every long-poll, SSE stream and slow
+  upload the hyper path allowed — with a bare `408`, no error envelope, and
+  nothing logged, because the handler is cancelled before it can return. A
+  deployment that knows its handlers' upper bound sets it; note that it is also
+  the only bound on a peer that sends a complete head and then trickles its
+  body, so a server exposed directly to the internet should.
+
+  `write_timeout` defaults to five minutes. The failure it prevents is not a
+  slow handler but a peer that stops reading: `armature-h1` caps neither
+  connection count nor write duration, so an unbounded write deadline lets a
+  client hold a worker's connection slot, its file descriptor and its whole
+  response buffer indefinitely by shrinking its receive window to zero.
 
 ### Changed
 
@@ -75,11 +124,43 @@ Publish in this order:
   sent twice survived only as its last occurrence; the serve path now appends,
   and a single-valued lookup returns the first. See the `client_address` entry
   under **Fixed** for why this mattered.
+- **Breaking (behaviour, not signature)**: `HeaderMap::insert`, `insert_id` and
+  `remove` now act on *every* occurrence of a repeated field, matching
+  `http::HeaderMap::insert`. Each previously touched only the first, which
+  became a security hole the moment the serve path started appending: the
+  canonical sanitisation idiom
+  `headers.insert("X-Forwarded-For", trusted_value)` left the client's second
+  field line in the map, where `client_address` went on reading it as a hop.
+  `insert`/`insert_id` still return the value the first occurrence held;
+  `remove` still returns the first value, and `remove_all` still returns the
+  count.
+- **Breaking (behaviour, not signature)**: `HeaderMap::authorization`,
+  `content_length` and `host` fail closed on a duplicated field, returning
+  `None` where they previously returned the first occurrence. All three are
+  single-valued by their RFCs, and since the serve path keeps both lines,
+  "first wins" would systematically prefer the client's line over an appending
+  proxy's. Two `Content-Length` lines are the request-smuggling shape RFC 9112
+  §6.3 requires be rejected, and two `Host` lines leave no single authority to
+  route or cache under. `get`, `get_bytes` and `get_all` are unchanged.
 - The per-request `trace!("Incoming request")` record now comes from the shared
   dispatch path, so both backends emit it. It was previously written only by
   the hyper adapter, which would have left HTTP/1.1 with no arrival record at
   all — and none whatsoever for a request rejected at CORS preflight or the
   body limit, which are decided before routing.
+- On the `h1-backend` path, `PipelineStats` and `Http2Stats` connection and
+  request counters stay at zero: `armature-h1` owns the accept loop and exposes
+  no hook to count from. Nothing was removed — the types and their methods keep
+  their signatures — but a dashboard reading them will go flat. The same applies
+  to `with_socket_tuning` (`EpollConfig`), which reaches for the raw fd of a
+  listener this process no longer owns; `armature-h1`'s own `TcpConfig` covers
+  `nodelay`, backlog and `SO_REUSEPORT` (and sets the last of those *before*
+  bind, where it actually takes effect). `with_socket_tuning` still applies on
+  `listen_h2c`, which remains a hyper listener.
+- `PipelineConfig::pipeline_flush` and `PipelineConfig::read_buffer_size`, both
+  documented as wired, are inert on the `h1-backend` path: `armature-h1` writes
+  each response as it is produced and grows its read buffer from a fixed chunk
+  size, so it exposes no knob for either. Both fields still exist and still
+  reach the HTTP/2 connections hyper serves.
 
 ### Fixed
 
@@ -127,29 +208,21 @@ Publish in this order:
   won and `client_address` returned an address the caller chose. Repeated field
   lines are now joined per RFC 9110 §5.3 before the rightmost hop is selected,
   which is also the only reading that makes both backends agree.
+- **`HttpRequest::client_address` fails closed on an empty or unparseable
+  hop.** An empty element anywhere in the chain now yields `None` rather than
+  being skipped. Skipping it shortened the list, and because the entry is chosen
+  by counting from the *right*, a shorter list slid the index one position
+  further left — onto an entry the client supplied, returned as the trusted
+  address. A malformed hop means the chain is not the one the deployment was
+  configured for, and the safe answer to that is no answer. **This changes
+  behaviour**: a deployment whose ingress emits `a, , b` will now see `None`
+  where it previously got an address.
 - A declared `Content-Length` over the configured limit now returns this
   framework's `{"error":"Payload Too Large","status":413}` envelope with CORS
   headers, as every other transport does. `armature-h1`'s own body cap was
   configured with the same value and is evaluated before the service runs, so
   it answered first with a bare status line — leaving a browser doing a CORS
   upload with an opaque CORS failure instead of a 413.
-
-### Removed
-
-- On the `h1-backend` path, `PipelineStats` and `Http2Stats` connection and
-  request counters stay at zero: `armature-h1` owns the accept loop and exposes
-  no hook to count from. This is observability, not behaviour — but a dashboard
-  reading them will go flat. The same applies to `with_socket_tuning`
-  (`EpollConfig`), which reaches for the raw fd of a listener this process no
-  longer owns; `armature-h1`'s own `TcpConfig` covers `nodelay`, backlog and
-  `SO_REUSEPORT` (and sets the last of those *before* bind, where it actually
-  takes effect). `with_socket_tuning` still applies on `listen_h2c`, which
-  remains a hyper listener.
-- `PipelineConfig::pipeline_flush` and `PipelineConfig::read_buffer_size`, both
-  documented as wired, are not honoured on the `h1-backend` path: `armature-h1`
-  writes each response as it is produced and grows its read buffer from a fixed
-  chunk size, so it exposes no knob for either. They still reach the HTTP/2
-  connections hyper serves.
 
 ## [0.8.5] - 2026-08-04
 

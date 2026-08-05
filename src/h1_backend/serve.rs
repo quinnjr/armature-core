@@ -32,12 +32,17 @@ use hyper_util::rt::TokioExecutor;
 use std::net::SocketAddr;
 use std::time::Duration;
 
-/// A deadline long enough to be no deadline.
+/// `armature-h1`'s stand-in for "no deadline".
 ///
-/// `Duration::MAX` would overflow the instant arithmetic behind
-/// `tokio::time::sleep`, so this is a century — past the uptime of any process
-/// that will ever run this code, and still safe to add to `Instant::now()`.
-const NO_DEADLINE: Duration = Duration::from_secs(100 * 365 * 24 * 60 * 60);
+/// `Limits` takes a bare `Duration`, so an absent deadline has to be spelled as
+/// a very large one. `Duration::MAX` is not usable — the deadline is added to an
+/// `Instant` — and this is deliberately the same magnitude as `armature-h1`'s
+/// own `deadline::FAR_FUTURE`, which its author chose to stay well inside
+/// tokio's representable timer range.
+///
+/// Only reachable when the caller explicitly asks for no limit; see
+/// [`PipelineConfig::request_timeout`](crate::pipeline::PipelineConfig::request_timeout).
+const NO_DEADLINE: Duration = Duration::from_secs(365 * 24 * 60 * 60);
 
 /// Signals shutdown when dropped.
 ///
@@ -115,30 +120,27 @@ pub(crate) fn h1_config(
         // with the envelope.
         max_body_bytes: u64::MAX,
         idle_timeout: pipeline.keep_alive_timeout,
-        // The next two are deliberately effectively-unbounded rather than
-        // inherited from `Limits::default()`, and that is the whole point of
-        // naming them here.
+        // Both come from `PipelineConfig` rather than from `Limits::default()`,
+        // and they default differently on purpose.
         //
-        // `body_timeout` in `armature-h1` does not bound body *reads* — it
-        // races the entire handler future, answering a bare `408` and closing
-        // when it expires. `write_timeout` bounds the response write the same
-        // way. Both default to 30 seconds there, which is a sensible default
-        // for a server that owns its own policy; inherited here it would be a
-        // deadline this framework never had. The hyper path supplies no
-        // `hyper::rt::Timer` and therefore imposes no request deadline at all,
-        // so taking the defaults would have meant a default-on feature
-        // silently cancelling every long-poll, slow report and large upload at
-        // 30 seconds — with no `PipelineConfig` field able to raise it, no
-        // framework error envelope, and nothing logged, because the handler is
-        // cancelled before `dispatch_request` can return. A 200 MB response to
-        // a slow client would have been truncated mid-body with a
-        // `Content-Length` that never arrived.
+        // `body_timeout` in `armature-h1` does not bound body *reads* alone —
+        // it races the entire handler future, answering a bare `408` and
+        // closing when it expires. The hyper path supplies no `hyper::rt::Timer`
+        // and so imposes no request deadline at all, so inheriting a 30-second
+        // default here would have made a backend swap silently cancel every
+        // long-poll, SSE stream and slow upload, with no envelope and nothing
+        // logged (the handler is cancelled before `dispatch_request` returns).
+        // It therefore defaults to `None`, and a deployment that knows its
+        // handlers' upper bound sets it.
         //
-        // A request deadline is a feature worth having, but it has to be one
-        // the caller asks for. Until `PipelineConfig` carries one, matching the
-        // previous behaviour is the honest default.
-        body_timeout: NO_DEADLINE,
-        write_timeout: NO_DEADLINE,
+        // `write_timeout` defaults finite, because the failure it prevents is
+        // not a slow handler but a peer that stops reading. `armature-h1` caps
+        // neither connection count nor write duration, so an unbounded write
+        // deadline lets a client hold a worker's connection slot, its fd and
+        // its whole response buffer indefinitely by shrinking its receive
+        // window to zero — an unauthenticated hold costing one socket.
+        body_timeout: pipeline.request_timeout.unwrap_or(NO_DEADLINE),
+        write_timeout: pipeline.write_timeout.unwrap_or(NO_DEADLINE),
         // `header_timeout` is left at the default on purpose: it bounds how
         // long a peer may take to send a complete head once it has sent a
         // first byte, which is the slowloris defence, not a handler deadline.
@@ -329,6 +331,60 @@ mod tests {
         );
         assert!(!cfg.tcp.nodelay);
         assert_eq!(cfg.workers, 2);
+    }
+
+    /// The two deadlines default asymmetrically, and both directions matter:
+    /// a finite handler deadline would cancel long-polls the previous backend
+    /// allowed, and an infinite write deadline lets a peer that stops reading
+    /// hold a worker's connection slot indefinitely. Deleting either mapping is
+    /// a one-line edit, so both are pinned.
+    #[test]
+    fn the_request_and_write_deadlines_default_asymmetrically() {
+        let cfg = h1_config(addr(), &PipelineConfig::default(), None);
+
+        assert!(
+            cfg.limits.body_timeout >= Duration::from_secs(300 * 24 * 60 * 60),
+            "no handler deadline unless the caller asks for one: inheriting \
+             armature-h1's 30s default would cancel every long-poll and slow \
+             upload with a bare 408, no envelope, and nothing logged"
+        );
+        assert_eq!(
+            cfg.limits.write_timeout,
+            Duration::from_secs(300),
+            "a write deadline must stay finite: armature-h1 caps neither \
+             connection count nor write duration, so an unbounded one lets a \
+             client that stops reading hold a worker slot for free"
+        );
+    }
+
+    #[test]
+    fn a_configured_request_timeout_reaches_the_handler_deadline() {
+        let pipeline = PipelineConfig {
+            request_timeout: Some(Duration::from_secs(45)),
+            write_timeout: None,
+            ..PipelineConfig::default()
+        };
+        let cfg = h1_config(addr(), &pipeline, None);
+
+        assert_eq!(
+            cfg.limits.body_timeout,
+            Duration::from_secs(45),
+            "a deployment that knows its handlers' upper bound must be able to \
+             say so"
+        );
+        assert!(
+            cfg.limits.write_timeout >= Duration::from_secs(300 * 24 * 60 * 60),
+            "and must be able to opt out of the write deadline explicitly"
+        );
+    }
+
+    /// Pinning is the caller's runtime's decision: armature-h1 defaults it on,
+    /// which is right for a server owning the process, but here the caller's
+    /// own multi-threaded runtime is still running h2c listeners and filter
+    /// tasks on those same cores.
+    #[test]
+    fn core_pinning_is_left_to_the_caller() {
+        assert!(!h1_config(addr(), &PipelineConfig::default(), None).pin_cores);
     }
 
     #[test]

@@ -244,7 +244,7 @@ pub use extractors::{
 pub use form::*;
 pub use guard::*;
 pub use handler::{BoxedHandler, Handler, IntoHandler, OptimizedHandlerFn};
-pub use headers::{Header as HeaderEntry, HeaderMap, INLINE_HEADERS};
+pub use headers::{DuplicateField, Header as HeaderEntry, HeaderMap, INLINE_HEADERS};
 pub use health::*;
 pub use hmr::*;
 pub use http::*;

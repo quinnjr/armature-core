@@ -402,9 +402,7 @@ impl Application {
     /// plaintext. Fixing the call sites one by one leaves the mechanism intact:
     /// the next `listen_*` method to be written can pass `None` again and
     /// silently disable CORS a second time, and nothing would catch it. With no
-    /// parameter there is nothing to get wrong. See [`with_cors`](Self::with_cors)
-    /// for the consequence a caller has to know about, which is that a
-    /// registered `OPTIONS` route becomes unreachable once CORS is configured.
+    /// parameter there is nothing to get wrong.
     fn serve_state(&self) -> ServeState {
         ServeState {
             router: Arc::new(OptimizedRouter::from_router(&self.router)),
@@ -1941,7 +1939,7 @@ pub(crate) async fn handle_request(
         || req.headers().contains_key("access-control-request-method"),
         &state,
     ) {
-        return Ok(to_hyper_response_raw(preflight));
+        return Ok(to_hyper_response_raw(preflight, &method, path));
     }
 
     // Copy headers. One copy per value, because hyper's `HeaderValue` owns its
@@ -1970,7 +1968,12 @@ pub(crate) async fn handle_request(
     // undeclared bodies.
     let declared_len = declared_content_length(armature_req.headers.get("content-length"));
     if let Some(rejection) = declared_length_rejection(declared_len, &method, path, &state) {
-        return Ok(to_hyper_response(rejection, state.cors.as_deref()));
+        return Ok(to_hyper_response(
+            rejection,
+            state.cors.as_deref(),
+            &method,
+            path,
+        ));
     }
 
     // Read body into Bytes (zero-copy after this point), enforcing the
@@ -1988,6 +1991,8 @@ pub(crate) async fn handle_request(
             return Ok(to_hyper_response(
                 payload_too_large_response(),
                 state.cors.as_deref(),
+                &method,
+                path,
             ));
         }
         Err(err) => match err.downcast::<hyper::Error>() {
@@ -1997,6 +2002,8 @@ pub(crate) async fn handle_request(
                 return Ok(to_hyper_response(
                     HttpResponse::new(400),
                     state.cors.as_deref(),
+                    &method,
+                    path,
                 ));
             }
         },
@@ -2012,6 +2019,8 @@ pub(crate) async fn handle_request(
     Ok(to_hyper_response(
         dispatch_request(armature_req, &state, start).await,
         state.cors.as_deref(),
+        &method,
+        path,
     ))
 }
 
@@ -2057,7 +2066,7 @@ pub(crate) async fn dispatch_via_h1(
         // No CORS argument: the preflight answer already carries the full
         // preflight header set, and appending the per-response origin pair on
         // top of it would duplicate `Access-Control-Allow-Origin`.
-        return to_h1_response(preflight, None);
+        return to_h1_response(preflight, None, &method, head.path());
     }
 
     // Fast-path rejection, before any body byte is buffered — the same check
@@ -2068,7 +2077,7 @@ pub(crate) async fn dispatch_via_h1(
     // transports return.
     let declared_len = declared_content_length(head.get_str(&armature_h1::HeaderId::ContentLength));
     if let Some(rejection) = declared_length_rejection(declared_len, &method, head.path(), &state) {
-        return to_h1_response(rejection, state.cors.as_deref());
+        return to_h1_response(rejection, state.cors.as_deref(), &method, head.path());
     }
 
     // `collect` enforces the cap while reading rather than after, so an
@@ -2090,7 +2099,7 @@ pub(crate) async fn dispatch_via_h1(
             } else {
                 HttpResponse::new(status)
             };
-            return to_h1_response(response, state.cors.as_deref());
+            return to_h1_response(response, state.cors.as_deref(), &method, head.path());
         }
     };
 
@@ -2101,9 +2110,19 @@ pub(crate) async fn dispatch_via_h1(
         trace!(body_size = body_size, "Request body received (zero-copy)");
     }
 
+    // `head` is gone into the request by now, so the target is kept the way the
+    // hyper path keeps it: a `ByteStr` clone is a refcount bump on the read
+    // buffer, and `split_once` trims the query off it without allocating.
+    let target_handle = armature_req.path.clone();
+    let path = target_handle
+        .split_once('?')
+        .map_or(target_handle.as_str(), |(p, _)| p);
+
     to_h1_response(
         dispatch_request(armature_req, &state, start).await,
         state.cors.as_deref(),
+        &method,
+        path,
     )
 }
 
@@ -2152,7 +2171,14 @@ fn cors_preflight(
     response
         .headers
         .insert("Access-Control-Max-Age".into(), cors.max_age.to_string());
-    if cors.allow_credentials {
+    // Through the same decision the per-response path uses, because the
+    // preflight is a response too and the wildcard rule does not care which one
+    // it is. Its result reaches the adapters with `cors = None` — it carries the
+    // full preflight set already — so this is the only place the guard can run
+    // for it, and without it a wildcard-plus-credentials configuration went out
+    // as the invalid pair on the preflight while being correctly suppressed on
+    // every response that followed.
+    if response_wire::cors_additions(None, cors).credentials {
         response.headers.insert(
             "Access-Control-Allow-Credentials".into(),
             "true".to_string(),
@@ -2485,66 +2511,397 @@ async fn evaluate_scoped_guards(
     Ok(context.request)
 }
 
+/// The tests and decisions every response adapter owes, whichever transport it
+/// writes to.
+///
+/// This crate has two response adapters — [`to_hyper_response`] here and
+/// `to_h1_response` in the `armature-h1` bridge — and the shipped default build
+/// runs both: `armature-h1` serves HTTP/1.1 and hyper serves every HTTP/2
+/// stream through the fallback. Anything that decides what may go on the wire
+/// therefore has to live somewhere both can reach, or one transport enforces it
+/// and the other does not — which is not a smaller version of the same policy
+/// but a hole in it, reachable by asking for the protocol that skips the check.
+///
+/// It lives here rather than in the bridge because the bridge is compiled only
+/// with the `h1-backend` feature, while this module is compiled always: helpers
+/// kept there would vanish from the `--no-default-features` build that still
+/// serves every request through hyper. Nothing in here names a transport type;
+/// the inputs are a field name, a field value, and the CORS configuration.
+pub(crate) mod response_wire {
+    use super::{CorsConfig, HttpResponse};
+    use crate::logging::{debug, warn};
+
+    /// Whether a field name is a token, as RFC 9110 section 5.6.2 defines one.
+    pub(crate) fn name_is_token(name: &str) -> bool {
+        !name.is_empty()
+            && name.bytes().all(|b| {
+                b.is_ascii_alphanumeric()
+                    || matches!(
+                        b,
+                        b'!' | b'#'
+                            | b'$'
+                            | b'%'
+                            | b'&'
+                            | b'\''
+                            | b'*'
+                            | b'+'
+                            | b'-'
+                            | b'.'
+                            | b'^'
+                            | b'_'
+                            | b'`'
+                            | b'|'
+                            | b'~'
+                    )
+            })
+    }
+
+    /// Whether a field value carries nothing that would terminate the field
+    /// early.
+    ///
+    /// `armature-h1`'s writer runs the same test and answers it by dropping the
+    /// offending field and serving the rest of the response. That is the wrong
+    /// side to err on for a *response*: response splitting is prevented either
+    /// way, but the field that gets dropped is as likely to be a
+    /// `Content-Security-Policy`, an `X-Frame-Options`, or a `Set-Cookie`
+    /// carrying `Secure`/`HttpOnly` as it is to be decoration, and a page served
+    /// with its protections silently missing is worse than a page not served at
+    /// all. So both adapters ask the question first, where the whole response
+    /// can still be abandoned.
+    ///
+    /// The two transports do not reject the *same set*: `armature_h1`'s writer
+    /// permits control bytes other than CR, LF, and NUL, where hyper's
+    /// `HeaderValue` refuses every control byte
+    /// (`armature-h1/BACKENDS.md` records the difference). What they share is
+    /// the *outcome* this test buys — a field this returns `false` for never
+    /// reaches the wire under either, and the response carrying it is abandoned
+    /// rather than quietly stripped. Values in the gap between the two sets are
+    /// still handled: on the hyper side they fail when the builder refuses them,
+    /// and the same 500 is served.
+    pub(crate) fn value_is_emittable(value: &[u8]) -> bool {
+        !value.iter().any(|b| matches!(b, b'\r' | b'\n' | 0))
+    }
+
+    /// A field the transport decides rather than the handler.
+    pub(crate) enum TransportField {
+        /// A hop-by-hop field, or one that steers how the body is framed.
+        Framing,
+        /// `Content-Length`, which the writer computes from the bytes it
+        /// actually writes.
+        ContentLength,
+    }
+
+    /// Whether this field is the transport's to decide rather than the
+    /// handler's.
+    ///
+    /// The hop-by-hop set is RFC 9110 section 7.6.1's, plus `Content-Length`:
+    /// that one is not hop-by-hop, but both serve paths frame the body
+    /// themselves, and a handler-supplied length that disagrees with the bytes
+    /// actually written is a desync a pooling proxy reads as the start of the
+    /// next response.
+    ///
+    /// Matched on the name rather than on either transport's interned field
+    /// enum, so the two adapters cannot answer this differently.
+    pub(crate) fn transport_field(name: &str) -> Option<TransportField> {
+        const FRAMING: [&str; 8] = [
+            "connection",
+            "keep-alive",
+            "proxy-authenticate",
+            "proxy-authorization",
+            "te",
+            "trailer",
+            "transfer-encoding",
+            "upgrade",
+        ];
+        if name.eq_ignore_ascii_case("content-length") {
+            return Some(TransportField::ContentLength);
+        }
+        FRAMING
+            .iter()
+            .any(|known| name.eq_ignore_ascii_case(known))
+            .then_some(TransportField::Framing)
+    }
+
+    /// Report a field dropped because it belongs to the transport.
+    ///
+    /// Two levels, because the two cases say different things about the
+    /// handler. Setting `Content-Length` on a response is a common and harmless
+    /// habit — the writer computes the true length regardless — and warning
+    /// about it once per request buries the lines that matter. A `Connection`,
+    /// `Upgrade`, or `Transfer-Encoding` is a handler reaching for framing the
+    /// connection loop decides knowing things the handler does not: whether the
+    /// body was consumed, whether the connection is about to close. A response
+    /// that carried its own `Connection` would win over that decision —
+    /// `armature-h1`'s writer suppresses its own field when one was supplied —
+    /// so a handler reflecting a request's `connection: keep-alive` could talk
+    /// the server out of the `close` it is about to act on regardless, and a
+    /// pooling proxy would then keep a socket the server has already hung up.
+    ///
+    /// The name is safe to log here: it reached this point only by passing
+    /// [`name_is_token`].
+    pub(crate) fn report_transport_field(field: &TransportField, name: &str) {
+        match field {
+            TransportField::ContentLength => {
+                debug!(field = %name, "Dropping a handler-supplied Content-Length; the writer computes it");
+            }
+            TransportField::Framing => {
+                warn!(field = %name, "Dropping a hop-by-hop or framing header supplied by a handler");
+            }
+        }
+    }
+
+    /// Report the field that made a response unemittable, and why.
+    ///
+    /// Deliberately without the name or the value. The name is checked here too,
+    /// so a failing field may be failing *because* its name carries CR or LF —
+    /// and interpolating it would carry that injection straight into whatever
+    /// reads the log, forging log lines from the same bytes that were denied the
+    /// wire. Lengths and which half failed are enough to find the handler;
+    /// `method` and `path` say which request to look at.
+    pub(crate) fn report_unemittable(
+        name: &str,
+        value: &[u8],
+        method: &crate::Method,
+        path: &str,
+        what: &str,
+    ) {
+        warn!(
+            method = %method,
+            path = %path,
+            what,
+            name_ok = name_is_token(name),
+            name_len = name.len(),
+            value_len = value.len(),
+            "Handler produced an unwritable header; failing the response closed"
+        );
+    }
+
+    /// The `500` served in place of a response a handler made unemittable.
+    ///
+    /// The framework's own error envelope rather than an empty body, for the
+    /// reason the `max_body_bytes` note in `h1_backend::serve` gives for the 413
+    /// path: a bare status with no `Content-Type` and no CORS headers reaches a
+    /// browser doing a credentialed fetch as an opaque CORS failure, so the one
+    /// audience that can act on it is told nothing. Both adapters attach the
+    /// configured CORS pair to it as they would to any other response.
+    ///
+    /// The handler's own body is not carried over — it was written alongside a
+    /// field that cannot go on the wire, and that field may well be what the
+    /// body needed for protection.
+    pub(crate) fn internal_error_envelope() -> HttpResponse {
+        let body = serde_json::json!({
+            "error": "Internal Server Error",
+            "status": 500,
+        });
+        HttpResponse::new(500)
+            .with_json(&body)
+            .unwrap_or_else(|_| HttpResponse::new(500))
+    }
+
+    /// What the configured CORS policy adds to a response the handler has
+    /// already had its say on.
+    pub(crate) struct CorsAdditions {
+        /// The `Access-Control-Allow-Origin` to add, or `None` when the handler
+        /// supplied one and adding a second would make the browser reject the
+        /// response outright.
+        pub(crate) origin: Option<String>,
+        /// Whether to add `Access-Control-Allow-Credentials: true`.
+        pub(crate) credentials: bool,
+        /// Whether to add `Vary: Origin`.
+        pub(crate) vary_origin: bool,
+    }
+
+    /// Decide what the configured CORS policy adds, given whatever origin the
+    /// handler already set.
+    ///
+    /// One function for both adapters because this is a policy decision with no
+    /// transport in it, and written twice it had already drifted — one copy
+    /// compared origins case-insensitively, the other compared an exact
+    /// lowercase string.
+    ///
+    /// Three rules, in the order they bite:
+    ///
+    /// A handler that sets `Access-Control-Allow-Origin` itself has answered
+    /// more precisely than a static config can, and the configured value is not
+    /// added next to it: two `Allow-Origin` fields make a browser discard the
+    /// whole response, so the result would be worse than either answer alone.
+    /// Because the response then depends on the request's `Origin`, it also
+    /// earns `Vary: Origin` — without it a shared cache can serve one origin's
+    /// answer to another.
+    ///
+    /// Credentials are attached only when the origin actually going out is one
+    /// the configuration authorised — the configured origin itself, or no
+    /// handler origin at all. A handler that reflects the request's `Origin`
+    /// unchecked is the classic CORS mistake, and pairing that reflection with
+    /// `Allow-Credentials: true` turns it into a full credentialed cross-origin
+    /// read of the response for *any* site that asks. This crate is the last
+    /// place that can tell the difference, because only it knows which origin
+    /// the operator configured.
+    ///
+    /// And `*` never carries credentials: the pair is invalid, a browser
+    /// discards the response rather than downgrading it, so emitting both turns
+    /// a misconfiguration into a silently failing request.
+    pub(crate) fn cors_additions(handler_origin: Option<&str>, cors: &CorsConfig) -> CorsAdditions {
+        let effective_origin = handler_origin.unwrap_or(cors.allow_origin.as_str());
+        let authorised = match handler_origin {
+            None => true,
+            Some(origin) => origin.eq_ignore_ascii_case(&cors.allow_origin),
+        };
+        let credentials = if !cors.allow_credentials {
+            false
+        } else if !authorised {
+            warn!(
+                "Access-Control-Allow-Credentials withheld: the handler set an \
+                 Access-Control-Allow-Origin the CORS configuration does not \
+                 authorise, and credentials against an unvalidated origin would \
+                 allow any site to read this response"
+            );
+            false
+        } else if effective_origin == "*" {
+            warn!(
+                "Access-Control-Allow-Credentials withheld: it is invalid \
+                 alongside a wildcard origin, and a browser rejects the pair"
+            );
+            false
+        } else {
+            true
+        };
+        CorsAdditions {
+            origin: handler_origin.is_none().then(|| cors.allow_origin.clone()),
+            credentials,
+            vary_origin: handler_origin.is_some(),
+        }
+    }
+}
+
 /// Convert our HttpResponse to a hyper Response, adding no CORS headers.
 ///
 /// For a response that already carries every header it should — the CORS
 /// preflight answer, which sets the full preflight set itself and must not have
 /// the per-response `Allow-Origin` pair appended on top.
-fn to_hyper_response_raw(response: HttpResponse) -> Response<Full<bytes::Bytes>> {
-    to_hyper_response(response, None)
+fn to_hyper_response_raw(
+    response: HttpResponse,
+    method: &crate::Method,
+    path: &str,
+) -> Response<Full<bytes::Bytes>> {
+    to_hyper_response(response, None, method, path)
 }
 
 /// Convert our HttpResponse to a hyper Response, applying CORS headers.
+///
+/// `method` and `path` are carried only so the fail-closed 500 below can name
+/// the request that produced it; nothing else here reads them.
 fn to_hyper_response(
     response: HttpResponse,
     cors: Option<&CorsConfig>,
+    method: &crate::Method,
+    path: &str,
 ) -> Response<Full<bytes::Bytes>> {
+    use response_wire::{
+        cors_additions, name_is_token, report_transport_field, report_unemittable, transport_field,
+        value_is_emittable,
+    };
+
     let mut builder = Response::builder().status(response.status);
 
     for (key, value) in &response.headers {
+        // The same two tests, in the same order, as the `armature-h1` bridge —
+        // out of the same module, so this transport cannot end up enforcing a
+        // narrower rule than the other. Before they were shared, a handler that
+        // set `Content-Length: 999` on a five-byte body had it stripped over
+        // HTTP/1.1 and passed straight through here, which is a response desync
+        // reachable by asking for HTTP/2.
+        if !name_is_token(key) || !value_is_emittable(value.as_bytes()) {
+            report_unemittable(key, value.as_bytes(), method, path, "header");
+            return unemittable_hyper_response(cors);
+        }
+        if let Some(field) = transport_field(key) {
+            report_transport_field(&field, key);
+            continue;
+        }
         builder = builder.header(key, value);
     }
     for cookie_value in &response.cookies {
+        // The name is the literal `set-cookie`, so only the value is in
+        // question here.
+        if !value_is_emittable(cookie_value.as_bytes()) {
+            report_unemittable(
+                "set-cookie",
+                cookie_value.as_bytes(),
+                method,
+                path,
+                "set-cookie",
+            );
+            return unemittable_hyper_response(cors);
+        }
         builder = builder.header("Set-Cookie", cookie_value);
     }
     if let Some(cors) = cors {
-        // Mirrors `to_h1_response`. `builder.header` appends rather than
-        // replacing, so adding the configured origin unconditionally gives a
-        // handler that reflects `Origin` — the standard pattern for credentialed
-        // CORS — two `Access-Control-Allow-Origin` fields, and a browser rejects
-        // a response carrying two. Whichever origin is going out is then the one
-        // the credentials flag has to be judged against: `*` with
-        // `Allow-Credentials: true` is invalid and also rejected, so a handler
-        // that reflects `*` must not have credentials bolted onto it either.
         let handler_origin = response
             .headers
             .iter()
             .find(|(key, _)| key.eq_ignore_ascii_case("access-control-allow-origin"))
             .map(|(_, value)| value.as_str());
-        let effective_origin = handler_origin.unwrap_or(cors.allow_origin.as_str());
-        if handler_origin.is_none() {
-            builder = builder.header("Access-Control-Allow-Origin", &cors.allow_origin);
+        let additions = cors_additions(handler_origin, cors);
+        if let Some(origin) = &additions.origin {
+            builder = builder.header("Access-Control-Allow-Origin", origin);
         }
-        if cors.allow_credentials {
-            if effective_origin == "*" {
-                warn!(
-                    "Access-Control-Allow-Credentials withheld: it is invalid \
-                     alongside a wildcard origin, and a browser rejects the pair"
-                );
-            } else {
-                builder = builder.header("Access-Control-Allow-Credentials", "true");
-            }
+        if additions.credentials {
+            builder = builder.header("Access-Control-Allow-Credentials", "true");
+        }
+        if additions.vary_origin {
+            builder = builder.header("Vary", "Origin");
         }
     }
 
     // Zero-copy body passthrough to Hyper
     let body = Full::new(response.into_body_bytes());
     builder.body(body).unwrap_or_else(|_| {
-        // A handler produced a header hyper rejects; fail closed with a 500.
-        let mut fallback = Response::new(Full::new(bytes::Bytes::new()));
-        *fallback.status_mut() = hyper::StatusCode::INTERNAL_SERVER_ERROR;
-        fallback
+        // A field in the gap between the two writers' rules: hyper refuses
+        // every control byte, where the checks above refuse only the three that
+        // terminate a field. Same outcome, one step later.
+        warn!(
+            method = %method,
+            path = %path,
+            "hyper refused a handler header; failing the response closed"
+        );
+        unemittable_hyper_response(cors)
     })
+}
+
+/// The hyper form of the fail-closed 500, CORS included.
+///
+/// Built field by field rather than by handing the envelope back to
+/// [`to_hyper_response`]: that would be a recursion whose base case depends on
+/// the configured origin being emittable, and a configuration is not a thing
+/// this function gets to assume anything about.
+fn unemittable_hyper_response(cors: Option<&CorsConfig>) -> Response<Full<bytes::Bytes>> {
+    let envelope = response_wire::internal_error_envelope();
+    let mut builder = Response::builder().status(envelope.status);
+    for (key, value) in &envelope.headers {
+        builder = builder.header(key, value);
+    }
+    if let Some(cors) = cors {
+        // No handler origin: this response is the framework's, not the
+        // handler's, so the configured pair applies unconditionally.
+        let additions = response_wire::cors_additions(None, cors);
+        if let Some(origin) = &additions.origin {
+            builder = builder.header("Access-Control-Allow-Origin", origin);
+        }
+        if additions.credentials {
+            builder = builder.header("Access-Control-Allow-Credentials", "true");
+        }
+    }
+    builder
+        .body(Full::new(envelope.into_body_bytes()))
+        .unwrap_or_else(|_| {
+            // Only reachable from a configured origin hyper refuses, which is
+            // a misconfiguration rather than a request-shaped input. The status
+            // still has to reach the client.
+            let mut fallback = Response::new(Full::new(bytes::Bytes::new()));
+            *fallback.status_mut() = hyper::StatusCode::INTERNAL_SERVER_ERROR;
+            fallback
+        })
 }
 
 #[cfg(test)]
@@ -2587,6 +2944,12 @@ mod tests {
         assert!(body.contains("User not found"));
     }
 
+    /// Every conversion below answers the same nominal request. The method and
+    /// path reach the logs and nothing else, so one pair serves for all of them.
+    fn convert(response: HttpResponse, cors: Option<&CorsConfig>) -> Response<Full<bytes::Bytes>> {
+        to_hyper_response(response, cors, &crate::Method::Get, "/t")
+    }
+
     /// Parity with `to_h1_response`. `builder.header` appends, so a handler
     /// that reflects `Origin` would otherwise get two of them and the browser
     /// rejects the response — turning a working credentialed-CORS handler into
@@ -2600,7 +2963,7 @@ mod tests {
         );
         let cors = CorsConfig::new("https://configured.test");
 
-        let out = to_hyper_response(response, Some(&cors));
+        let out = convert(response, Some(&cors));
 
         let origins: Vec<_> = out
             .headers()
@@ -2614,6 +2977,13 @@ mod tests {
             "the handler's reflected origin must stand alone; a second field \
              makes the browser reject a response that was correct"
         );
+        assert_eq!(
+            out.headers()
+                .get("vary")
+                .map(|v| v.to_str().expect("ascii")),
+            Some("Origin"),
+            "the origin came from the handler, so the response varies by it"
+        );
     }
 
     /// `*` with `Allow-Credentials: true` is an invalid pair browsers reject,
@@ -2622,7 +2992,7 @@ mod tests {
     fn to_hyper_response_withholds_credentials_from_a_wildcard_origin() {
         let cors = CorsConfig::new("*").with_credentials();
 
-        let out = to_hyper_response(HttpResponse::new(200), Some(&cors));
+        let out = convert(HttpResponse::new(200), Some(&cors));
 
         assert!(
             out.headers()
@@ -2630,6 +3000,209 @@ mod tests {
                 .is_none(),
             "credentials must be withheld alongside a wildcard origin rather \
              than emitted as a pair no browser will honour"
+        );
+    }
+
+    /// The security half of the reflection fix: not duplicating the handler's
+    /// origin is only correct if the credentials flag is then judged against
+    /// *that* origin. A handler reflecting `Origin` unchecked, plus
+    /// `Allow-Credentials: true`, is a credentialed cross-origin read granted to
+    /// whoever asked.
+    #[test]
+    fn to_hyper_response_withholds_credentials_from_an_unauthorised_reflected_origin() {
+        let mut response = HttpResponse::new(200);
+        response.headers.insert(
+            "Access-Control-Allow-Origin".to_string(),
+            "https://evil.test".to_string(),
+        );
+        let cors = CorsConfig::new("https://configured.test").with_credentials();
+
+        let out = convert(response, Some(&cors));
+
+        assert_eq!(
+            out.headers()
+                .get("access-control-allow-origin")
+                .map(|v| v.to_str().expect("ascii")),
+            Some("https://evil.test")
+        );
+        assert!(
+            out.headers()
+                .get("access-control-allow-credentials")
+                .is_none(),
+            "credentials belong only to an origin the configuration authorised"
+        );
+    }
+
+    /// The origin the configuration *did* authorise still gets them.
+    #[test]
+    fn to_hyper_response_keeps_credentials_for_the_configured_origin() {
+        let mut response = HttpResponse::new(200);
+        response.headers.insert(
+            "Access-Control-Allow-Origin".to_string(),
+            "https://configured.test".to_string(),
+        );
+        let cors = CorsConfig::new("https://configured.test").with_credentials();
+
+        let out = convert(response, Some(&cors));
+
+        assert_eq!(
+            out.headers()
+                .get("access-control-allow-credentials")
+                .map(|v| v.to_str().expect("ascii")),
+            Some("true")
+        );
+    }
+
+    /// The mirror of the bridge's
+    /// `a_handler_cannot_override_the_connection_loops_framing`. Both adapters
+    /// ship in the default build — hyper serves every HTTP/2 stream — so a
+    /// filter enforced on one of them is a hole reachable by choosing the other
+    /// protocol.
+    #[test]
+    fn to_hyper_response_drops_handler_supplied_framing_headers() {
+        let mut response = HttpResponse::new(413);
+        response
+            .headers
+            .insert("Connection".to_string(), "keep-alive".to_string());
+        response
+            .headers
+            .insert("Transfer-Encoding".to_string(), "chunked".to_string());
+        response
+            .headers
+            .insert("Upgrade".to_string(), "websocket".to_string());
+        response
+            .headers
+            .insert("Content-Length".to_string(), "999".to_string());
+        response
+            .headers
+            .insert("Content-Type".to_string(), "text/plain".to_string());
+
+        let out = convert(response, None);
+
+        for field in [
+            "connection",
+            "transfer-encoding",
+            "upgrade",
+            "content-length",
+        ] {
+            assert!(
+                out.headers().get(field).is_none(),
+                "{field} is the transport's to decide, not the handler's — and \
+                 a handler-supplied Content-Length over a body of another \
+                 length is a desync a pooling proxy reads as the next response"
+            );
+        }
+        assert_eq!(
+            out.headers()
+                .get("content-type")
+                .map(|v| v.to_str().expect("ascii")),
+            Some("text/plain"),
+            "only the transport's own fields go; the rest survives"
+        );
+    }
+
+    /// Same fail-closed rule as the bridge, for the same reason: the field that
+    /// would be dropped is as likely to be a `Content-Security-Policy` as it is
+    /// to be decoration.
+    #[test]
+    fn to_hyper_response_fails_a_response_closed_on_an_unwritable_field() {
+        for (name, value) in [
+            ("X-Bad", "a\r\nx-injected: 1"),
+            ("X-Bad", "a\nb"),
+            ("X-Bad", "a\0b"),
+            ("X Bad", "fine"),
+            ("bad:name", "fine"),
+        ] {
+            let mut response = HttpResponse::new(200);
+            response.headers.insert(
+                "Content-Security-Policy".to_string(),
+                "default-src 'none'".to_string(),
+            );
+            response.headers.insert(name.to_string(), value.to_string());
+
+            let out = convert(response, None);
+
+            assert_eq!(
+                out.status(),
+                500,
+                "{name}: {value:?} must fail the whole response closed"
+            );
+            assert!(out.headers().get("content-security-policy").is_none());
+            assert_eq!(
+                out.headers()
+                    .get("content-type")
+                    .map(|v| v.to_str().expect("ascii")),
+                Some("application/json"),
+                "an envelope, not a bare status: a credentialed fetch has to be \
+                 able to tell a 500 from a network failure"
+            );
+        }
+    }
+
+    #[test]
+    fn the_hyper_fail_closed_500_carries_the_configured_cors_headers() {
+        let mut response = HttpResponse::new(200);
+        response
+            .headers
+            .insert("X Bad".to_string(), "fine".to_string());
+        let cors = CorsConfig::new("https://configured.test").with_credentials();
+
+        let out = convert(response, Some(&cors));
+
+        assert_eq!(out.status(), 500);
+        assert_eq!(
+            out.headers()
+                .get("access-control-allow-origin")
+                .map(|v| v.to_str().expect("ascii")),
+            Some("https://configured.test")
+        );
+        assert_eq!(
+            out.headers()
+                .get("access-control-allow-credentials")
+                .map(|v| v.to_str().expect("ascii")),
+            Some("true")
+        );
+    }
+
+    /// The preflight answer reaches the adapters with `cors = None`, so the
+    /// wildcard guard cannot run on it there — it has to run where the answer is
+    /// built, or a wildcard-plus-credentials configuration goes out as the
+    /// invalid pair on the preflight and is correctly suppressed on every
+    /// response after it.
+    #[test]
+    fn a_preflight_withholds_credentials_from_a_wildcard_origin() {
+        let state = Application::new(Container::new(), Router::new())
+            .with_cors(CorsConfig::new("*").with_credentials())
+            .serve_state();
+
+        let preflight = cors_preflight(&crate::Method::Options, || true, &state)
+            .expect("a preflight answer is owed");
+
+        assert_eq!(preflight.status, 204);
+        assert!(
+            preflight
+                .headers
+                .get("Access-Control-Allow-Credentials")
+                .is_none(),
+            "the pair is invalid, so a browser discards the preflight entirely"
+        );
+    }
+
+    #[test]
+    fn a_preflight_keeps_credentials_for_a_named_origin() {
+        let state = Application::new(Container::new(), Router::new())
+            .with_cors(CorsConfig::new("https://configured.test").with_credentials())
+            .serve_state();
+
+        let preflight = cors_preflight(&crate::Method::Options, || true, &state)
+            .expect("a preflight answer is owed");
+
+        assert_eq!(
+            preflight
+                .headers
+                .get("Access-Control-Allow-Credentials")
+                .map(String::as_str),
+            Some("true")
         );
     }
 
@@ -2641,7 +3214,7 @@ mod tests {
             .with_body(b"{}".to_vec());
         let cors = CorsConfig::new("https://example.com").with_credentials();
 
-        let hyper_resp = to_hyper_response(response, Some(&cors));
+        let hyper_resp = convert(response, Some(&cors));
         assert_eq!(hyper_resp.status(), 200);
         assert_eq!(
             hyper_resp.headers().get("Content-Type").unwrap(),

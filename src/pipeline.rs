@@ -169,6 +169,43 @@ pub struct PipelineConfig {
     /// crate does not currently supply.
     pub keep_alive_timeout: Duration,
 
+    /// How long a handler may run before the connection answers `408` and
+    /// closes, or `None` for no limit.
+    ///
+    /// **Wired on the `h1-backend` path**, to `armature-h1`'s
+    /// `Limits::body_timeout` — which despite its name races the *whole*
+    /// handler future, and so covers the handler's reads of the request body
+    /// as well as its own work.
+    ///
+    /// `None` by default, and deliberately: the hyper path supplies no
+    /// [`hyper::rt::Timer`] and therefore imposes no request deadline at all,
+    /// so defaulting this to a finite value would make a backend swap silently
+    /// cancel every long-poll, SSE stream and slow upload the previous
+    /// behaviour allowed. Set it when you know your handlers' upper bound —
+    /// a request deadline is worth having, but it has to be one you asked for.
+    ///
+    /// Note what this does *not* bound: a peer that has sent a complete head
+    /// and then trickles its body. That is the same deadline, so a deployment
+    /// exposed directly to the internet rather than behind a proxy that
+    /// enforces its own request timeout should set this.
+    pub request_timeout: Option<Duration>,
+
+    /// How long a single response write may take before the connection is torn
+    /// down, or `None` for no limit.
+    ///
+    /// **Wired on the `h1-backend` path**, to `armature-h1`'s
+    /// `Limits::write_timeout`.
+    ///
+    /// Unlike [`request_timeout`](Self::request_timeout) this defaults to a
+    /// finite value, because the failure it prevents is not a slow handler but
+    /// a peer that stops reading: `armature-h1` caps neither connection count
+    /// nor write duration, so an unbounded write deadline lets a client hold a
+    /// worker's connection slot, its file descriptor and its full response
+    /// buffer indefinitely by shrinking its receive window to zero. Five
+    /// minutes is generous enough for a large response over a slow link and
+    /// finite enough that the hold is not free.
+    pub write_timeout: Option<Duration>,
+
     /// Maximum requests per connection before forcing close.
     /// Helps prevent resource exhaustion.
     ///
@@ -230,6 +267,11 @@ impl Default for PipelineConfig {
             pipeline_flush: true,
             max_buffered_requests: 64,
             keep_alive_timeout: Duration::from_secs(60),
+            // No handler deadline unless asked for; a finite write deadline
+            // because a stalled reader is not a legitimate slow handler. See
+            // each field's documentation for why the two differ.
+            request_timeout: None,
+            write_timeout: Some(Duration::from_secs(300)),
             max_requests_per_connection: Some(10_000),
             tcp_nodelay: true,
             read_buffer_size: 8192,
@@ -253,6 +295,8 @@ impl PipelineConfig {
             pipeline_flush: true,
             max_buffered_requests: 128,
             keep_alive_timeout: Duration::from_secs(120),
+            request_timeout: None,
+            write_timeout: Some(Duration::from_secs(300)),
             max_requests_per_connection: Some(100_000),
             tcp_nodelay: true,
             read_buffer_size: 16384,
@@ -269,6 +313,10 @@ impl PipelineConfig {
             pipeline_flush: false,
             max_buffered_requests: 16,
             keep_alive_timeout: Duration::from_secs(30),
+            request_timeout: None,
+            // Tighter than the default: a configuration asking for low latency
+            // is not one that expects a client to spend five minutes reading.
+            write_timeout: Some(Duration::from_secs(60)),
             max_requests_per_connection: Some(1000),
             tcp_nodelay: true,
             read_buffer_size: 4096,
@@ -285,6 +333,8 @@ impl PipelineConfig {
             pipeline_flush: true,
             max_buffered_requests: 32,
             keep_alive_timeout: Duration::from_secs(30),
+            request_timeout: None,
+            write_timeout: Some(Duration::from_secs(300)),
             max_requests_per_connection: Some(1000),
             tcp_nodelay: false,
             read_buffer_size: 4096,

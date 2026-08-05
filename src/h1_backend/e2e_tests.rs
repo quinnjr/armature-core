@@ -68,12 +68,14 @@ where
         Some(1),
     );
     let (tx, rx) = tokio::sync::oneshot::channel();
+    // The result is kept rather than discarded, and asserted on below. See the
+    // teardown for why.
     let server = tokio::spawn(async move {
         let mut tx = Some(tx);
-        let _ = serve_bound(cfg, state, None, move |addr, handle| {
+        serve_bound(cfg, state, None, move |addr, handle| {
             let _ = tx.take().expect("bound once").send((addr, handle));
         })
-        .await;
+        .await
     });
 
     let (addr, handle) = tokio::time::timeout(Duration::from_secs(5), rx)
@@ -93,13 +95,29 @@ where
     // `spawn_blocking` inside `serve_bound`, so the runtime's own drop blocks
     // on them and the suite hangs with no test named as the one that failed.
     // Failing here names it.
-    tokio::time::timeout(Duration::from_secs(10), server)
+    let served = tokio::time::timeout(Duration::from_secs(10), server)
         .await
         .expect(
             "the server did not stop within 10s of being told to; its worker \
              threads are still held, and the runtime will block at drop",
         )
         .expect("the task running the server panicked");
+    // The third layer, and the one that is not about hanging. `serve_bound`
+    // distinguishes "the workers drained after a shutdown signal" from "the
+    // workers stopped without one" and returns `Err` for the second, so that a
+    // process which never served a byte cannot exit `main` with status 0.
+    // Nothing tested that arm's *complement*: invert the condition and every
+    // graceful shutdown in production starts returning `Err`, every `main`
+    // propagating it exits non-zero, and no test in this suite noticed —
+    // because every one of them threw the result away. Asserting it here buys
+    // that check on every e2e test below at no extra runtime.
+    assert!(
+        served.is_ok(),
+        "the server was shut down deliberately through its handle, so it must \
+         report a clean exit; an `Err` here means a graceful shutdown is being \
+         reported as a failure, which is what every caller's `main` propagates \
+         as a non-zero exit status: {served:?}"
+    );
     out
 }
 
@@ -891,6 +909,74 @@ async fn an_expect_continue_request_receives_the_interim_response_and_is_served(
     );
 }
 
+/// The case the test above names in its own comment and does not cover.
+///
+/// That comment says the two stacks' orderings only differ "for a request whose
+/// body is never read" — which is precisely a request whose body is never
+/// *sent*, because a client honouring `Expect: 100-continue` waits for the
+/// go-ahead before sending one. If the interim response is emitted lazily by
+/// the body reader and something on this path answers without reading the body
+/// (a guard refusal, a 404, a cached response), then the client is waiting for
+/// a `100` the server will never write and the server is waiting for a body the
+/// client will never send. Nothing in this suite would notice: the deadlock is
+/// silent on both sides.
+///
+/// So the assertion is not on *which* answer arrives but that one does, inside
+/// a bound. Silence here is the bug.
+#[tokio::test]
+async fn an_expect_continue_request_that_sends_no_body_is_answered_rather_than_stalled() {
+    let observed = with_server(test_state(DEFAULT_MAX_BODY_SIZE), |addr| async move {
+        let mut stream = tokio::net::TcpStream::connect(addr).await.expect("connect");
+        // The head only. A conforming client stops exactly here and waits.
+        stream
+            .write_all(
+                b"POST /echo HTTP/1.1\r\nHost: a\r\nExpect: 100-continue\r\n\
+                  Content-Length: 5\r\nConnection: close\r\n\r\n",
+            )
+            .await
+            .expect("write the head");
+
+        let mut buf = [0u8; 4096];
+        let observed =
+            match tokio::time::timeout(Duration::from_secs(2), stream.read(&mut buf)).await {
+                Ok(Ok(n)) => String::from_utf8_lossy(&buf[..n]).into_owned(),
+                // A close with nothing written is also an answer of a kind, and a
+                // very different one from a stall; kept distinguishable rather than
+                // folded into the timeout case.
+                Ok(Err(e)) => format!("<io error: {e}>"),
+                Err(_) => String::new(),
+            };
+
+        // Closed before the teardown runs, deliberately. The body this request
+        // declared is never coming, and `h1_config` sets no body deadline, so a
+        // connection left open here would still be waiting when `with_server`
+        // asks the server to stop — and the shutdown drain would hold its
+        // worker threads for the full grace period.
+        drop(stream);
+        observed
+    })
+    .await;
+
+    assert!(
+        !observed.is_empty(),
+        "nothing arrived in 2s for a request that sent its head and stopped. \
+         That is the deadlock this test exists for: the client is waiting for \
+         the go-ahead `100 Continue` before sending its body, and the server is \
+         waiting for the body before writing anything — neither side times out \
+         and the request hangs until somebody's socket does"
+    );
+    // Pinned as observed rather than as designed, for the same reason the test
+    // above pins its ordering: `armature-h1` writes the interim response from
+    // the body reader, so what arrives first is the `100`. If this ever becomes
+    // a final response instead, the mechanism changed — which is fine, and is a
+    // decision to take deliberately rather than a test to relax. What must not
+    // change is that *something* arrives.
+    assert!(
+        observed.starts_with("HTTP/1.1 100 Continue"),
+        "expected the interim go-ahead first: {observed:?}"
+    );
+}
+
 // ---------------------------------------------------------------------------
 // The exception-filter chain on this path.
 //
@@ -1091,9 +1177,42 @@ async fn echo_client_address(req: HttpRequest) -> Result<HttpResponse, Error> {
     Ok(HttpResponse::ok().with_body(format!("client={client}").into_bytes()))
 }
 
+/// Sets every kind of field an adapter has to make a decision about: three the
+/// transport owns, and one that repeats.
+///
+/// The parity corpus reached no handler like this, which meant it compared the
+/// two adapters on exactly the responses where nothing distinguishes them. A
+/// handler cannot be trusted with framing — `Content-Length`, `Connection` and
+/// `Transfer-Encoding` are decisions the connection loop makes knowing whether
+/// the body was consumed and whether the socket is about to close — and
+/// `Set-Cookie` is the canonical field that must emit twice rather than once
+/// comma-joined. Both are per-adapter conversion code, written twice, so both
+/// are where the two can silently disagree.
+///
+/// The declared `Content-Length` is deliberately a lie about the two-byte body:
+/// if it ever reaches the wire, the client is told to wait for 997 bytes that
+/// will never come.
+async fn hostile_headers(_req: HttpRequest) -> Result<HttpResponse, Error> {
+    let mut response = HttpResponse::ok().with_body(b"hi".to_vec());
+    response
+        .headers
+        .insert("Connection".to_string(), "keep-alive".to_string());
+    response
+        .headers
+        .insert("Content-Length".to_string(), "999".to_string());
+    response
+        .headers
+        .insert("Transfer-Encoding".to_string(), "chunked".to_string());
+    response.cookies.push("a=1; Secure".to_string());
+    response.cookies.push("b=2; HttpOnly".to_string());
+    Ok(response)
+}
+
 fn parity_state(max_body_size: usize) -> ServeState {
     let mut router = Router::new();
     router.add_route(Route::new(HttpMethod::GET, "/echo", echo_without_peer));
+    router.add_route(Route::new(HttpMethod::GET, "/hostile", hostile_headers));
+    router.add_route(Route::new(HttpMethod::OPTIONS, "/echo", echo_without_peer));
     router.add_route(Route::new(HttpMethod::POST, "/echo", echo_without_peer));
     router.add_route(Route::new(HttpMethod::GET, "/empty", empty_ok));
     router.add_route(Route::new(HttpMethod::GET, "/nothing", no_content));
@@ -1103,6 +1222,82 @@ fn parity_state(max_body_size: usize) -> ServeState {
         Arc::new(OptimizedRouter::from_router(&router)),
         max_body_size,
     )
+}
+
+/// What the hop-by-hop stripping in `to_h1_response` is actually for.
+///
+/// `a_handler_cannot_override_the_connection_loops_framing` asserts the same
+/// rule one layer up, on the `H1Response` the conversion returns. That cannot
+/// show what this does: the claim is not "the field was removed from a struct",
+/// it is "the connection loop framed the body itself and the client can read
+/// it". A conversion that dropped the field and a writer that then emitted the
+/// handler's value anyway would pass the unit test and produce a response
+/// claiming 999 bytes for a two-byte body — a client waits for the rest until
+/// it gives up, and a pooling proxy is told to keep a socket the server closed.
+#[tokio::test]
+async fn a_handlers_framing_headers_never_reach_the_wire() {
+    let response = with_server(parity_state(DEFAULT_MAX_BODY_SIZE), |addr| async move {
+        roundtrip(
+            addr,
+            b"GET /hostile HTTP/1.1\r\nHost: a\r\nConnection: close\r\n\r\n",
+        )
+        .await
+    })
+    .await;
+
+    assert!(response.starts_with("HTTP/1.1 200 OK"), "{response:?}");
+    let (head, body) = response
+        .split_once("\r\n\r\n")
+        .expect("a complete response head");
+
+    assert_eq!(
+        header_count(&response, "content-length"),
+        1,
+        "exactly one length: two would make the message unparseable, and zero \
+         on a 200 with a body leaves the client unable to tell where it ends: \
+         {head:?}"
+    );
+    let length = head
+        .lines()
+        .find_map(|line| {
+            line.split_once(':')
+                .filter(|(k, _)| k.trim().eq_ignore_ascii_case("content-length"))
+        })
+        .map(|(_, v)| v.trim().to_string())
+        .expect("the one content-length asserted above");
+    assert_eq!(
+        length,
+        body.len().to_string(),
+        "the length on the wire must be the body actually sent, not the 999 \
+         the handler declared; a client honouring the handler's value blocks \
+         waiting for 997 bytes that will never arrive: {response:?}"
+    );
+    assert_eq!(body, "hi", "the body itself must survive: {body:?}");
+
+    assert_eq!(
+        header_count(&response, "transfer-encoding"),
+        0,
+        "a handler claiming chunked encoding for a body the loop framed with a \
+         length gives the client two contradictory framings, which is the \
+         request-smuggling shape in the response direction: {head:?}"
+    );
+    assert!(
+        !head.to_ascii_lowercase().contains("connection: keep-alive"),
+        "the request asked for `close` and the loop is about to close; the \
+         handler's `keep-alive` must not talk it out of saying so, or a pooling \
+         proxy reuses a socket the server has hung up: {head:?}"
+    );
+
+    // The complement: stripping must be confined to the fields the transport
+    // owns. `Set-Cookie` repeats by design, and an adapter that flattened it
+    // would drop one of the two cookies with nothing else here noticing.
+    assert_eq!(
+        header_count(&response, "set-cookie"),
+        2,
+        "two cookies must emit two field lines, not one comma-joined value — a \
+         client parses only the first and the second cookie is silently lost: \
+         {head:?}"
+    );
 }
 
 /// Serve exactly one connection through the hyper adapter and return the raw
@@ -1151,6 +1346,78 @@ async fn hyper_roundtrip(state: ServeState, request: &[u8]) -> String {
         .expect("the hyper connection task finished within 5s")
         .expect("the hyper connection task panicked");
     String::from_utf8_lossy(&out).into_owned()
+}
+
+// ---------------------------------------------------------------------------
+// The preflight predicate, on the *other* adapter.
+//
+// "Is this a CORS preflight" is decided in two places — once in
+// `dispatch_via_h1` and once in `handle_request` — because each adapter reads
+// the question off its own request type. The h1 copy has three live-socket
+// tests above. The hyper copy had none, and both are live in a default build,
+// so a divergence between them shadows `Router::options` over HTTP/2 while the
+// HTTP/1.1 tests stay green.
+// ---------------------------------------------------------------------------
+
+/// The hyper-side counterpart of
+/// [`a_plain_options_request_routes_even_with_cors_configured`].
+#[tokio::test]
+async fn a_plain_options_request_routes_over_the_hyper_adapter_too() {
+    let state = parity_state(DEFAULT_MAX_BODY_SIZE)
+        .with_cors_for_test(crate::CorsConfig::new("https://example.test"));
+
+    // No `Access-Control-Request-Method`, so this is an ordinary `OPTIONS` —
+    // RFC 9110 §9.3.7's "what does this resource support", which has a
+    // registered handler.
+    let response = hyper_roundtrip(
+        state,
+        b"OPTIONS /echo HTTP/1.1\r\nHost: a\r\nConnection: close\r\n\r\n",
+    )
+    .await;
+
+    assert!(
+        response.starts_with("HTTP/1.1 200 OK"),
+        "configuring CORS must not make every `OPTIONS` route unreachable over \
+         HTTP/2; a 204 here is the canned preflight answering a request that \
+         was not one: {response:?}"
+    );
+    assert!(
+        response.contains("method=OPTIONS"),
+        "the registered handler must actually have run: {response:?}"
+    );
+}
+
+/// The complement, so the predicate is pinned in both directions rather than
+/// only in the one where intercepting nothing would pass.
+#[tokio::test]
+async fn a_real_preflight_is_intercepted_by_the_hyper_adapter() {
+    let state = parity_state(DEFAULT_MAX_BODY_SIZE)
+        .with_cors_for_test(crate::CorsConfig::new("https://example.test"));
+
+    let response = hyper_roundtrip(
+        state,
+        b"OPTIONS /echo HTTP/1.1\r\nHost: a\r\nOrigin: https://example.test\r\n\
+          Access-Control-Request-Method: POST\r\nConnection: close\r\n\r\n",
+    )
+    .await;
+
+    assert!(
+        response.starts_with("HTTP/1.1 204"),
+        "a preflight is answered before routing, or the browser never gets the \
+         permission it asked for and refuses the real request: {response:?}"
+    );
+    assert_eq!(
+        header_count(&response, "access-control-allow-origin"),
+        1,
+        "the preflight builds its own complete header set, so adding the \
+         per-response origin on top would duplicate it: {response:?}"
+    );
+    assert!(
+        response
+            .to_ascii_lowercase()
+            .contains("access-control-allow-methods"),
+        "the preflight set must be complete: {response:?}"
+    );
 }
 
 /// A raw response reduced to what the two adapters are obliged to agree on.
@@ -1213,9 +1480,37 @@ async fn the_two_adapters_answer_the_same_request_the_same_way() {
             b"POST /echo HTTP/1.1\r\nHost: a\r\nContent-Length: 100\r\nConnection: close\r\n\r\n",
         ),
         (
+            // A real preflight, which needs `Access-Control-Request-Method` to
+            // be one: preflight detection was narrowed to require it, and this
+            // case kept sending a bare `OPTIONS` afterwards. `parity_state`
+            // registered no `OPTIONS` route at the time, so both adapters 404ed
+            // and agreed trivially — the preflight response itself, a 204 with
+            // its four `Access-Control-*` fields, stopped being compared at all.
             "an OPTIONS preflight",
             parity_state(DEFAULT_MAX_BODY_SIZE).with_cors_for_test(cors.clone()),
+            b"OPTIONS /echo HTTP/1.1\r\nHost: a\r\nOrigin: https://example.test\r\n\
+              Access-Control-Request-Method: POST\r\nConnection: close\r\n\r\n",
+        ),
+        (
+            // The other side of the same predicate, which each adapter
+            // implements in its own copy of the closure: a bare `OPTIONS` is
+            // not a preflight and must reach the registered route. Comparing
+            // only the preflight branch would let one adapter intercept both
+            // and the other neither.
+            "a bare OPTIONS that is not a preflight",
+            parity_state(DEFAULT_MAX_BODY_SIZE).with_cors_for_test(cors.clone()),
             b"OPTIONS /echo HTTP/1.1\r\nHost: a\r\nConnection: close\r\n\r\n",
+        ),
+        (
+            // The divergence class the harness was missing entirely. Every
+            // other case reaches a handler that sets nothing the transport
+            // owns, so the two adapters had nothing to disagree about; the h1
+            // conversion strips handler-supplied framing fields and the hyper
+            // one has to strip the same ones, or the same response is framed
+            // one way over HTTP/1.1 and another over HTTP/2.
+            "a handler that sets framing headers and two cookies",
+            parity_state(DEFAULT_MAX_BODY_SIZE),
+            b"GET /hostile HTTP/1.1\r\nHost: a\r\nConnection: close\r\n\r\n",
         ),
         (
             "a guard refusal",

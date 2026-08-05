@@ -1202,6 +1202,21 @@ mod tests {
             "a chain containing an unusable hop must yield no address, not the \
              entry next to it"
         );
+
+        // The positive control: the same chain with the empty element filled in
+        // does resolve, and to the hop the empty one stood in for. Without this,
+        // a future change that made every multi-entry chain return `None` would
+        // keep the assertion above passing and this test's name would be a lie.
+        let mut intact = HttpRequest::new("GET", "/").with_peer(Some(proxy()));
+        intact
+            .headers
+            .insert("X-Forwarded-For", "198.51.100.9, 203.0.113.7");
+        assert_eq!(
+            intact.client_address(1),
+            ip("203.0.113.7"),
+            "the empty hop is why the address is None; a chain of the same \
+             shape without it must still resolve"
+        );
     }
 
     #[test]

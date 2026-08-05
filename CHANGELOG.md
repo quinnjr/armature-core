@@ -83,6 +83,20 @@ Publish in this order:
 
 ### Fixed
 
+- **HTTP/1.1-only HTTPS listeners no longer advertise ALPN `h2` and then hang
+  up on it.** `TlsConfig` offers `h2, http/1.1` unconditionally, so
+  `listen_https` and `listen_with_config` — which serve HTTP/1.1 only —
+  negotiated `h2` with every modern browser and then closed the connection
+  without a byte of HTTP. Both now strip `h2` from the offer, so the handshake
+  settles on `http/1.1` and the connection is served. `listen_https_h2` is
+  unaffected: it genuinely serves HTTP/2.
+
+  This was pre-existing rather than introduced by the backend swap — hyper's
+  HTTP/1.1 server also rejects an h2 preface — and the fix is applied on both
+  paths, so an h2-only client now receives a `no_application_protocol` TLS
+  alert instead of a successful handshake followed by silence. That is a
+  behaviour change on the hyper path too, and a more diagnosable one.
+
 - **`with_cors` was silently ignored by every TLS listener.** `listen_https`,
   `listen_https_h2`, `listen_with_config`, `listen_h2c` and `listen_dual_stack`
   all built their serve state with no CORS configuration, so an HTTPS server

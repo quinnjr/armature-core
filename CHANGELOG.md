@@ -10,6 +10,17 @@ Changes at or before `0.6.0` are recorded in the workspace
 
 ## [Unreleased]
 
+### Changed
+
+- Dependencies bumped to their latest releases: `simd-json` 0.18,
+  `compact_str` 0.10, `brotli` 9, `zstd` 0.14, `tokio-tungstenite` 0.30, and
+  minor bumps of `tokio`, `hyper`, `http`, `smallvec`, `flate2`, `uuid` and
+  `regex`. No source changes were needed. `compact_str` and `simd-json` are
+  public dependencies (`CompactString` fields in `fast_response`,
+  `memory_opt` and `route_params`; `json::Value` re-exports
+  `simd_json::OwnedValue` under the `simd-json` feature), so consumers naming
+  those types must move to `compact_str` 0.10 / `simd-json` 0.18 as well.
+
 ## [0.9.0] - 2026-08-05
 
 ### Release ordering

@@ -1,0 +1,82 @@
+[package]
+name = "armature-core-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2024"
+
+# Its own workspace root, matching `armature-h1/fuzz`. A fuzz crate pulls
+# `libfuzzer-sys`, which links a sanitizer runtime and only builds on nightly;
+# keeping it out of the main workspace means a plain `cargo build` at the root
+# never tries to compile it.
+[workspace]
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+arbitrary = { version = "1", features = ["derive"] }
+armature-core = { path = ".." }
+
+# Mirrors `armature-core`'s own requirement. A looser floor here would let a
+# `cargo update` in this crate resolve a different version than ships, so the
+# fuzzer would be exercising code the library never runs.
+bytes = "1.12"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+[[bin]]
+name = "http_request"
+path = "fuzz_targets/http_request.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "http_response"
+path = "fuzz_targets/http_response.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "routing"
+path = "fuzz_targets/routing.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "json"
+path = "fuzz_targets/json.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "url_parsing"
+path = "fuzz_targets/url_parsing.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "headers"
+path = "fuzz_targets/headers.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "query_params"
+path = "fuzz_targets/query_params.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "path_params"
+path = "fuzz_targets/path_params.rs"
+test = false
+doc = false
+bench = false

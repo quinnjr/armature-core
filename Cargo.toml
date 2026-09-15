@@ -23,14 +23,14 @@ matchit = "0.9"  # High-performance router (same as Axum)
 # through it rather than through hyper. The `tls` feature is what lets the
 # HTTPS listeners hand it a rustls config; hyper still serves HTTP/2.
 armature-h1 = { version = "0.3", features = ["tls"] }
-tokio = { version = "1.52", features = ["rt", "rt-multi-thread", "macros", "sync", "time", "net", "io-util", "fs", "signal"] }
-hyper = { version = "1.10", features = ["full"] }
+tokio = { version = "1.53", features = ["rt", "rt-multi-thread", "macros", "sync", "time", "net", "io-util", "fs", "signal"] }
+hyper = { version = "1.11", features = ["full"] }
 hyper-util = { version = "0.1", features = ["server", "http1", "http2", "tokio"] }
 http-body-util = "0.1"
-http = "1.4"
+http = "1.5"
 bytes = "1.12"
-smallvec = { version = "1.15", features = ["union", "const_generics"] }
-compact_str = "0.9"
+smallvec = { version = "1.16", features = ["union", "const_generics"] }
+compact_str = "0.10"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 
@@ -39,7 +39,7 @@ httparse = "1.10"
 memchr = "2.8"  # SIMD-optimized byte search
 
 # Optional SIMD JSON - significantly faster on x86_64 with AVX2
-simd-json = { version = "0.17", optional = true }
+simd-json = { version = "0.18", optional = true }
 
 # Arena allocator for per-request batch allocations
 bumpalo = { version = "3.20", features = ["collections"] }
@@ -47,15 +47,15 @@ serde_urlencoded = "0.7"
 urlencoding = "2.1"  # Fast URL encoding/decoding
 httpdate = "1.0"
 async-trait = "0.1"
-flate2 = "1.1.9"
-brotli = "8.0"
-zstd = "0.13"
-uuid = { version = "1.23", features = ["v4"] }
+flate2 = "1.1.10"
+brotli = "9.0"
+zstd = "0.14"
+uuid = { version = "1.26", features = ["v4"] }
 thiserror = "2.0"
-tokio-tungstenite = { version = "0.29", default-features = false, features = ["connect", "handshake"] }
+tokio-tungstenite = { version = "0.30", default-features = false, features = ["connect", "handshake"] }
 futures-util = "0.3"
 tokio-stream = "0.1"
-regex = "1.12"
+regex = "1.13"
 
 # Resilience patterns
 parking_lot = "0.12"

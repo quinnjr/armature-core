@@ -10,6 +10,10 @@ Changes at or before `0.6.0` are recorded in the workspace
 
 ## [Unreleased]
 
+### Security
+
+- Require `rustls` 0.23.45 or later, which fixes RUSTSEC-2026-0285 (TLS 1.3 handshake messages accepted across encryption-level boundaries).
+
 ### Changed
 
 - Dependencies bumped to their latest releases: `simd-json` 0.18,
@@ -470,7 +474,6 @@ change is a later one.
   hook `await`s, which starved concurrent registration under a write-preferring
   lock, deadlocked a hook that registered another hook, and caused
   `register_on_init_sync` to silently drop hooks registered from inside one.
-
 
 ### Removed
 

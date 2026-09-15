@@ -72,7 +72,7 @@ tracing-subscriber = { version = "0.3.23", features = ["json", "env-filter"] }
 tracing-appender = "0.2"
 
 # TLS/HTTPS support
-rustls = { version = "0.23", features = ["ring"] }
+rustls = { version = "0.23.45", features = ["ring"] }
 tokio-rustls = "0.26"
 rustls-pemfile = "2.2"
 rcgen = { version = "0.14", optional = true }

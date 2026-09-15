@@ -10,12 +10,11 @@ Changes at or before `0.6.0` are recorded in the workspace
 
 ## [Unreleased]
 
-### Security
-
-- Require `rustls` 0.23.45 or later, which fixes RUSTSEC-2026-0285 (TLS 1.3 handshake messages accepted across encryption-level boundaries).
+## [0.10.0] - 2026-09-15
 
 ### Changed
 
+- **Breaking:** `compact_str` (0.9 → 0.10) and `simd-json` (0.17 → 0.18) are public dependencies — `CompactString` fields and `json::Value` (`simd_json::OwnedValue`) appear in this crate's API — so their upgrade is breaking and the minor moves.
 - Dependencies bumped to their latest releases: `simd-json` 0.18,
   `compact_str` 0.10, `brotli` 9, `zstd` 0.14, `tokio-tungstenite` 0.30, and
   minor bumps of `tokio`, `hyper`, `http`, `smallvec`, `flate2`, `uuid` and
@@ -24,6 +23,10 @@ Changes at or before `0.6.0` are recorded in the workspace
   `memory_opt` and `route_params`; `json::Value` re-exports
   `simd_json::OwnedValue` under the `simd-json` feature), so consumers naming
   those types must move to `compact_str` 0.10 / `simd-json` 0.18 as well.
+
+### Security
+
+- Require `rustls` 0.23.45 or later, which fixes RUSTSEC-2026-0285 (TLS 1.3 handshake messages accepted across encryption-level boundaries).
 
 ## [0.9.0] - 2026-08-05
 

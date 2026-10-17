@@ -687,23 +687,36 @@ impl StaticAssetServer {
         // the way `Path::exists`/`Path::is_dir` do, and the metadata is handed
         // to `serve_file_with_metadata` so the same inode is not stat'd twice
         // on the way to reading it.
-        let Some(metadata) = stat_optional(&path).await else {
-            // Try fallback for SPA
-            if let Some(ref fallback) = self.config.fallback {
-                let fallback_path = self.config.root_dir.join(fallback);
-                if let Some(fallback_meta) = stat_optional(&fallback_path).await {
-                    return self
-                        .serve_file_with_metadata(&fallback_path, &fallback_meta, req)
-                        .await;
-                }
+        let metadata = match &path {
+            Some(path) => stat_optional(path).await,
+            None => None,
+        };
+        let (Some(path), Some(metadata)) = (path, metadata) else {
+            // Try fallback for SPA. The fallback is configuration, not request
+            // input, but it is still resolved and contained like any other
+            // candidate: a symlink there must not reach outside the root.
+            if let Some(ref fallback) = self.config.fallback
+                && let Some(fallback_path) =
+                    self.contained(&self.config.root_dir.join(fallback)).await
+                && let Some(fallback_meta) = stat_optional(&fallback_path).await
+            {
+                return self
+                    .serve_file_with_metadata(&fallback_path, &fallback_meta, req)
+                    .await;
             }
-            return Err(Error::NotFound(format!("File not found: {}", req.path)));
+            // Neither the path nor the query is echoed back (M9).
+            return Err(Error::NotFound("File not found".to_string()));
         };
 
         // If directory, try index files
         if metadata.is_dir() {
             for index_file in &self.config.index_files {
-                let index_path = path.join(index_file);
+                // An index file may itself be a symlink; resolve and contain it
+                // like the request path, or `dir/index.html -> /etc/passwd`
+                // would be served.
+                let Some(index_path) = self.contained(&path.join(index_file)).await else {
+                    continue;
+                };
                 if let Some(index_meta) = stat_optional(&index_path).await
                     && index_meta.is_file()
                 {
@@ -932,6 +945,12 @@ impl StaticAssetServer {
             path.extension().and_then(|e| e.to_str()).unwrap_or(""),
             algo.file_extension()
         ));
+        // The sibling is a different directory entry from the source the
+        // traversal check approved, so it gets its own check: `app.js.gz` may
+        // be a symlink out of the root even when `app.js` is not.
+        let Some(compressed_path) = self.contained(&compressed_path).await else {
+            return Ok(None);
+        };
 
         // One `metadata` call answers every question about the sibling — that
         // it exists, how old it is, how big it is — on the async executor,
@@ -1017,7 +1036,13 @@ impl StaticAssetServer {
     /// `request_path` must already have its query stripped — callers pass
     /// [`HttpRequest::path_only`], since the raw target carries `?v=2`-style
     /// cache busters that are not part of any filename.
-    async fn resolve_path(&self, request_path: &str) -> Result<PathBuf, Error> {
+    /// Resolve a request path to a canonical file path inside the root.
+    ///
+    /// `Ok(None)` when the path cannot be resolved (missing, a dangling
+    /// symlink, a permission error...): the caller answers 404 or the SPA
+    /// fallback. It fails closed — the unresolved, un-checked joined path is
+    /// never handed on, since nothing proved it stays inside the root.
+    async fn resolve_path(&self, request_path: &str) -> Result<Option<PathBuf>, Error> {
         // Remove leading slash
         let clean_path = request_path.trim_start_matches('/');
 
@@ -1027,12 +1052,8 @@ impl StaticAssetServer {
         // Security: prevent directory traversal. The root's realpath was
         // resolved at construction; only the request-derived half has to be
         // resolved here, and off the executor thread.
-        let canonical_path = match tokio::fs::canonicalize(&full_path).await {
-            Ok(p) => p,
-            Err(_) => {
-                // File doesn't exist, but path might be valid for fallback
-                return Ok(full_path);
-            }
+        let Ok(canonical_path) = tokio::fs::canonicalize(&full_path).await else {
+            return Ok(None);
         };
 
         if !canonical_path.starts_with(&self.canonical_root) {
@@ -1041,7 +1062,18 @@ impl StaticAssetServer {
             ));
         }
 
-        Ok(canonical_path)
+        Ok(Some(canonical_path))
+    }
+
+    /// Canonicalize `path` and return it only if it resolves inside the root.
+    ///
+    /// `None` when it does not exist, cannot be resolved, or escapes the root
+    /// (e.g. through a symlink) — every case where serving it is unproven safe.
+    async fn contained(&self, path: &Path) -> Option<PathBuf> {
+        let canonical = tokio::fs::canonicalize(path).await.ok()?;
+        canonical
+            .starts_with(&self.canonical_root)
+            .then_some(canonical)
     }
 
     /// Generate ETag for a file with compression info.
@@ -1302,6 +1334,79 @@ mod tests {
         let resp = server.serve(&get_req("/app.js?v=2")).await.unwrap();
         assert_eq!(resp.status, 200);
         assert_eq!(resp.body_ref(), b"console.log(1)");
+    }
+
+    /// M9: the 404 body names neither the path nor the query.
+    #[tokio::test]
+    async fn not_found_does_not_echo_the_request_target() {
+        let dir = TempDir::new();
+        let server = StaticAssetServer::new(StaticAssetsConfig::new(dir.path.clone())).unwrap();
+        let err = server
+            .serve(&get_req("/missing-file.js?token=secret"))
+            .await
+            .unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            !msg.contains("missing-file") && !msg.contains("secret"),
+            "{msg}"
+        );
+    }
+
+    /// L4: an index file that is a symlink out of the root is not served.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn index_symlink_outside_root_is_not_served() {
+        let outside = TempDir::new();
+        outside.write("secret.html", b"outside the root");
+        let dir = TempDir::new();
+        std::fs::create_dir(dir.path.join("sub")).unwrap();
+        std::os::unix::fs::symlink(
+            outside.path.join("secret.html"),
+            dir.path.join("sub/index.html"),
+        )
+        .unwrap();
+
+        let server = StaticAssetServer::new(StaticAssetsConfig::new(dir.path.clone())).unwrap();
+        let result = server.serve(&get_req("/sub/")).await;
+        match result {
+            Ok(resp) => panic!("served {:?}", resp.body_ref()),
+            Err(e) => assert!(e.status_code() == 403 || e.status_code() == 404, "{e}"),
+        }
+    }
+
+    /// L4: a pre-compressed sibling that is a symlink out of the root is
+    /// ignored even though its source is inside.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn precompressed_symlink_outside_root_is_ignored() {
+        let outside = TempDir::new();
+        outside.write("leak.gz", b"outside the root");
+        let dir = TempDir::new();
+        dir.write("app.js", b"inside");
+        std::os::unix::fs::symlink(outside.path.join("leak.gz"), dir.path.join("app.js.gz"))
+            .unwrap();
+        let server = StaticAssetServer::new(StaticAssetsConfig::new(dir.path.clone())).unwrap();
+        let source = dir.path.join("app.js").canonicalize().unwrap();
+        let modified = std::fs::metadata(&source).unwrap().modified().ok();
+        let got = server
+            .locate_precompressed(&source, CompressionAlgorithm::Gzip, modified)
+            .await
+            .unwrap();
+        assert!(got.is_none(), "{got:?}");
+    }
+
+    /// L4: a request whose path cannot be canonicalized fails closed (404),
+    /// it does not fall through with the raw joined path.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn dangling_symlink_is_not_found() {
+        let dir = TempDir::new();
+        std::os::unix::fs::symlink("/nonexistent/armature/target", dir.path.join("dangling"))
+            .unwrap();
+        let server = StaticAssetServer::new(StaticAssetsConfig::new(dir.path.clone())).unwrap();
+        assert_eq!(server.resolve_path("/dangling").await.unwrap(), None);
+        let err = server.serve(&get_req("/dangling")).await.unwrap_err();
+        assert_eq!(err.status_code(), 404);
     }
 
     /// Resolve *and* read a pre-compressed sibling the way a request would, so

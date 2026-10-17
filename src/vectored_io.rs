@@ -35,6 +35,7 @@
 //! let chunks = response.into_io_slices();
 //! ```
 
+use crate::simd_parser::{is_valid_header_name, is_valid_header_value};
 use bytes::{BufMut, Bytes, BytesMut};
 use std::borrow::Cow;
 use std::collections::HashMap;
@@ -211,14 +212,29 @@ impl ResponseChunks {
         };
 
         // Headers - estimate size: avg 30 bytes per header
+        //
+        // Fields are validated here, the last point before the bytes reach the
+        // wire: a name that is not a token, or a value containing CR, LF or
+        // NUL, would split the response. Such a field is dropped (and logged),
+        // exactly as `armature-h1`'s writer does.
         let mut headers_buf = BytesMut::with_capacity((headers.len() + cookies.len()) * 30 + 32);
+        let mut caller_set_content_length = false;
         for (name, value) in headers {
+            if !is_valid_header_name(name.as_bytes()) || !is_valid_header_value(value.as_bytes()) {
+                tracing::warn!("dropping response header with an invalid field name or value");
+                continue;
+            }
+            caller_set_content_length |= name.eq_ignore_ascii_case("content-length");
             headers_buf.extend_from_slice(name.as_bytes());
             headers_buf.extend_from_slice(HEADER_SEP);
             headers_buf.extend_from_slice(value.as_bytes());
             headers_buf.extend_from_slice(CRLF);
         }
         for cookie_value in cookies {
+            if !is_valid_header_value(cookie_value.as_bytes()) {
+                tracing::warn!("dropping Set-Cookie with an invalid value");
+                continue;
+            }
             headers_buf.extend_from_slice(b"Set-Cookie");
             headers_buf.extend_from_slice(HEADER_SEP);
             headers_buf.extend_from_slice(cookie_value.as_bytes());
@@ -233,9 +249,7 @@ impl ResponseChunks {
         // Only auto-emit when the caller hasn't already set a Content-Length
         // header (matched case-insensitively): emitting a second one produces
         // two Content-Length headers, which is a message-framing violation.
-        let caller_set_content_length = headers
-            .keys()
-            .any(|k| k.eq_ignore_ascii_case("content-length"));
+        // (`caller_set_content_length` only counts a field that was written.)
         if caller_set_content_length {
             // Respect the caller-provided Content-Length verbatim.
         } else if !body.is_empty() {
@@ -695,5 +709,31 @@ mod tests {
         let bytes = chunks.to_bytes();
         let s = String::from_utf8_lossy(&bytes);
         assert!(s.contains("Content-Length: 5"));
+    }
+
+    /// L6: a header or cookie that would split the response is dropped.
+    #[test]
+    fn test_invalid_fields_are_dropped() {
+        let mut headers = HashMap::new();
+        headers.insert("X-Ok".to_string(), "fine".to_string());
+        headers.insert("X-Bad".to_string(), "a\r\nInjected: yes".to_string());
+        headers.insert("Bad Name".to_string(), "v".to_string());
+        headers.insert("X-Nul".to_string(), "a\0b".to_string());
+        // An invalid caller Content-Length is dropped, so the real one is
+        // still emitted.
+        headers.insert("Content-Length".to_string(), "5\r\nX: y".to_string());
+        let chunks = ResponseChunks::with_cookies(
+            200,
+            &headers,
+            &["ok=1".to_string(), "bad=1\r\nInjected: yes".to_string()],
+            Bytes::from_static(b"hi"),
+        );
+        let wire = String::from_utf8(chunks.to_bytes().to_vec()).unwrap();
+        assert!(wire.contains("X-Ok: fine\r\n"), "{wire}");
+        assert!(wire.contains("Set-Cookie: ok=1\r\n"), "{wire}");
+        assert!(wire.contains("Content-Length: 2\r\n"), "{wire}");
+        assert!(!wire.contains("Injected"), "{wire}");
+        assert!(!wire.contains("Bad Name"), "{wire}");
+        assert!(!wire.contains("X-Nul"), "{wire}");
     }
 }

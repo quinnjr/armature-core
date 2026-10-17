@@ -1279,8 +1279,8 @@ impl Application {
         let socket_tuning = self.epoll_config.clone();
         #[cfg(unix)]
         if let Some(ref tuning) = socket_tuning {
-            use std::os::unix::io::AsRawFd;
-            apply_socket_tuning(listener.as_raw_fd(), tuning, "listener");
+            use std::os::fd::AsFd;
+            apply_socket_tuning(listener.as_fd(), tuning, "listener");
         }
 
         info!(
@@ -1314,8 +1314,8 @@ impl Application {
             // Apply opt-in socket tuning to the accepted socket
             #[cfg(unix)]
             if let Some(ref tuning) = socket_tuning {
-                use std::os::unix::io::AsRawFd;
-                apply_socket_tuning(stream.as_raw_fd(), tuning, "accepted connection");
+                use std::os::fd::AsFd;
+                apply_socket_tuning(stream.as_fd(), tuning, "accepted connection");
             }
 
             let io = TokioIo::new(stream);
@@ -1438,8 +1438,8 @@ impl Application {
         let socket_tuning = self.epoll_config.clone();
         #[cfg(unix)]
         if let Some(ref tuning) = socket_tuning {
-            use std::os::unix::io::AsRawFd;
-            apply_socket_tuning(listener.as_raw_fd(), tuning, "listener");
+            use std::os::fd::AsFd;
+            apply_socket_tuning(listener.as_fd(), tuning, "listener");
         }
 
         info!(
@@ -1476,8 +1476,8 @@ impl Application {
             // Apply opt-in socket tuning to the accepted socket
             #[cfg(unix)]
             if let Some(ref tuning) = socket_tuning {
-                use std::os::unix::io::AsRawFd;
-                apply_socket_tuning(stream.as_raw_fd(), tuning, "accepted connection");
+                use std::os::fd::AsFd;
+                apply_socket_tuning(stream.as_fd(), tuning, "accepted connection");
             }
 
             let acceptor = acceptor.clone();
@@ -1652,8 +1652,8 @@ impl Application {
         let socket_tuning = self.epoll_config.clone();
         #[cfg(unix)]
         if let Some(ref tuning) = socket_tuning {
-            use std::os::unix::io::AsRawFd;
-            apply_socket_tuning(listener.as_raw_fd(), tuning, "listener");
+            use std::os::fd::AsFd;
+            apply_socket_tuning(listener.as_fd(), tuning, "listener");
         }
 
         println!("🔒 HTTPS Server listening on https://{}", https_addr);
@@ -1675,8 +1675,8 @@ impl Application {
             // Apply opt-in socket tuning to the accepted socket
             #[cfg(unix)]
             if let Some(ref tuning) = socket_tuning {
-                use std::os::unix::io::AsRawFd;
-                apply_socket_tuning(stream.as_raw_fd(), tuning, "accepted connection");
+                use std::os::fd::AsFd;
+                apply_socket_tuning(stream.as_fd(), tuning, "accepted connection");
             }
 
             let acceptor = acceptor.clone();
@@ -1732,8 +1732,8 @@ impl Application {
         let socket_tuning = self.epoll_config.clone();
         #[cfg(unix)]
         if let Some(ref tuning) = socket_tuning {
-            use std::os::unix::io::AsRawFd;
-            apply_socket_tuning(listener.as_raw_fd(), tuning, "listener");
+            use std::os::fd::AsFd;
+            apply_socket_tuning(listener.as_fd(), tuning, "listener");
         }
 
         info!(
@@ -1773,8 +1773,8 @@ impl Application {
             // Apply opt-in socket tuning to the accepted socket
             #[cfg(unix)]
             if let Some(ref tuning) = socket_tuning {
-                use std::os::unix::io::AsRawFd;
-                apply_socket_tuning(stream.as_raw_fd(), tuning, "accepted connection");
+                use std::os::fd::AsFd;
+                apply_socket_tuning(stream.as_fd(), tuning, "accepted connection");
             }
 
             let io = TokioIo::new(stream);
@@ -1859,8 +1859,8 @@ impl Application {
         let socket_tuning = self.epoll_config.clone();
         #[cfg(unix)]
         if let Some(ref tuning) = socket_tuning {
-            use std::os::unix::io::AsRawFd;
-            apply_socket_tuning(listener.as_raw_fd(), tuning, "listener");
+            use std::os::fd::AsFd;
+            apply_socket_tuning(listener.as_fd(), tuning, "listener");
         }
 
         info!(
@@ -1890,8 +1890,8 @@ impl Application {
             // Apply opt-in socket tuning to the accepted socket
             #[cfg(unix)]
             if let Some(ref tuning) = socket_tuning {
-                use std::os::unix::io::AsRawFd;
-                apply_socket_tuning(stream.as_raw_fd(), tuning, "accepted connection");
+                use std::os::fd::AsFd;
+                apply_socket_tuning(stream.as_fd(), tuning, "accepted connection");
             }
 
             let acceptor = acceptor.clone();
@@ -2108,10 +2108,14 @@ fn without_h2_alpn(tls: Arc<rustls::ServerConfig>) -> Arc<rustls::ServerConfig> 
     Arc::new(stripped)
 }
 
-/// Apply the configured socket tuning options to a raw fd, logging a
+/// Apply the configured socket tuning options to a borrowed socket, logging a
 /// warning on failure. Never fails the caller.
 #[cfg(unix)]
-fn apply_socket_tuning(fd: std::os::unix::io::RawFd, config: &EpollConfig, socket: &'static str) {
+fn apply_socket_tuning(
+    fd: std::os::fd::BorrowedFd<'_>,
+    config: &EpollConfig,
+    socket: &'static str,
+) {
     if let Err(e) = crate::epoll_tuning::configure_socket(fd, config) {
         warn!(error = %e, socket, "Failed to apply socket tuning");
     }

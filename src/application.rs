@@ -2,23 +2,25 @@
 
 use crate::epoll_tuning::EpollConfig;
 use crate::exception_filter::{ExceptionFilter, ExceptionFilterChain};
-use crate::guard::{Guard, GuardContext};
+use crate::guard::Guard;
 use crate::http2::{Http2Builder, Http2Config, Http2Stats};
 use crate::http3::{Http3Config, Http3Stats};
 use crate::logging::{debug, error, info, trace, warn};
+use crate::middleware::{Middleware, MiddlewareChain};
 use crate::pipeline::{PipelineConfig, PipelineStats};
-use crate::route_cache::OptimizedRouter;
+use crate::route_cache::{OptimizedRouter, ResolvedRoute};
 use crate::{
     Container, Error, HttpRequest, HttpResponse, HttpsConfig, LifecycleManager, Module, Router,
     TlsConfig,
 };
-use http_body_util::{BodyExt, Full, Limited};
-use hyper::server::conn::http1;
+use bytes::Bytes;
+use http_body_util::Full;
 use hyper::service::service_fn;
 use hyper::{Request, Response, body::Incoming as IncomingBody};
 use hyper_util::rt::TokioIo;
 use std::net::SocketAddr;
 use std::sync::Arc;
+use std::task::{Context, Poll};
 use std::time::Duration;
 use tokio::net::TcpListener;
 
@@ -49,13 +51,21 @@ pub struct Application {
     http3_stats: Arc<Http3Stats>,
     /// Optional CORS configuration applied to every response
     cors_config: Option<Arc<CorsConfig>>,
-    /// Guards evaluated before routing. Each is scoped to a URL path prefix:
-    /// module guards to their declaring module's controller base paths, and
-    /// manually-added guards (via [`Application::with_guard`]) to the empty
-    /// (all-matching) prefix. See [`ScopedGuard`].
-    guards: Vec<ScopedGuard>,
+    /// Global guards (see [`Application::with_guard`]), evaluated for every
+    /// request after global middleware and before routing. Module guards are
+    /// not here: they are bound to their module's routes at registration (see
+    /// [`Application::register_module`]).
+    guards: Vec<Arc<dyn Guard>>,
+    /// Global middleware (see [`Application::use_middleware`]), run before
+    /// every guard.
+    middleware: MiddlewareChain,
     /// Maximum request body size in bytes; larger bodies are rejected with 413
     max_body_size: usize,
+    /// How long a client may take to deliver a request body.
+    body_read: BodyReadPolicy,
+    /// Hosts the HTTP→HTTPS redirect server may redirect to (see
+    /// [`Application::with_https_redirect_hosts`]).
+    redirect_hosts: Vec<String>,
     /// Optional socket tuning applied to listener and accepted sockets
     #[cfg_attr(not(unix), allow(dead_code))]
     epoll_config: Option<EpollConfig>,
@@ -68,36 +78,135 @@ pub struct Application {
 /// Default maximum request body size (10 MB).
 pub const DEFAULT_MAX_BODY_SIZE: usize = 10 * 1024 * 1024;
 
-/// A guard paired with the URL path prefix it applies to.
+/// How long a client may take to deliver a request body.
 ///
-/// Module guards are *not* global: a guard declared by a module is scoped to
-/// the base paths of the controllers registered by that **same** module (see
-/// [`Application::register_module`]), so it runs only for requests whose path
-/// falls under one of those base paths. Guards added manually via
-/// [`Application::with_guard`] use an empty prefix and therefore run for every
-/// request (a genuinely global guard).
-#[derive(Clone)]
-struct ScopedGuard {
-    /// URL path prefix this guard applies to. An empty prefix (or `"/"`)
-    /// matches every request path.
-    prefix: String,
-    /// The guard to evaluate for matching requests.
-    guard: Arc<dyn Guard>,
+/// Enforced while the body is read, on every transport, and independent of
+/// any handler deadline ([`PipelineConfig::request_timeout`]): a long-poll or
+/// a slow handler is not affected, only a client that stops (or nearly stops)
+/// sending the body it declared.
+///
+/// Two rules, either of which ends the read with `408 Request Timeout`:
+///
+/// - **inactivity**: no body bytes for [`idle_timeout`](Self::idle_timeout);
+/// - **minimum rate**: the read may take at most `idle_timeout` plus one
+///   second per [`min_bytes_per_sec`](Self::min_bytes_per_sec) bytes received
+///   so far, so trickling one byte just inside every idle window does not keep
+///   a connection (and its buffered body) alive indefinitely. `0` disables the
+///   rate rule.
+///
+/// ```
+/// use armature_core::BodyReadPolicy;
+/// use std::time::Duration;
+///
+/// let policy = BodyReadPolicy::default();
+/// assert_eq!(policy.idle_timeout, Duration::from_secs(30));
+/// assert!(policy.min_bytes_per_sec > 0);
+/// ```
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BodyReadPolicy {
+    /// Longest silence allowed before the first body chunk and between two.
+    pub idle_timeout: Duration,
+    /// Minimum average transfer rate in bytes per second, after a grace period
+    /// of `idle_timeout`. `0` disables the rate rule.
+    pub min_bytes_per_sec: u64,
 }
 
-impl ScopedGuard {
-    /// Returns `true` if this guard should run for the given request path.
-    ///
-    /// Matching is path-segment aware: prefix `/admin` matches `/admin` and
-    /// `/admin/...` but **not** `/administrators`. An empty or `/` prefix
-    /// matches every path (a global guard).
-    fn matches(&self, path: &str) -> bool {
-        let prefix = self.prefix.trim_end_matches('/');
-        if prefix.is_empty() {
-            return true;
+impl Default for BodyReadPolicy {
+    fn default() -> Self {
+        Self {
+            idle_timeout: Duration::from_secs(30),
+            // Slow enough for any real client on a bad mobile link, fast
+            // enough that holding a connection costs the attacker bandwidth.
+            min_bytes_per_sec: 1024,
         }
-        path == prefix || path.starts_with(&format!("{}/", prefix))
     }
+}
+
+impl BodyReadPolicy {
+    /// How long the next chunk may take to arrive, given how long the read has
+    /// run and how much it has received; `None` once the budget is spent.
+    fn next_wait(&self, elapsed: Duration, received: usize) -> Option<Duration> {
+        if self.min_bytes_per_sec == 0 {
+            return Some(self.idle_timeout);
+        }
+        let earned_ms = (received as u64).saturating_mul(1000) / self.min_bytes_per_sec;
+        let budget = self
+            .idle_timeout
+            .saturating_add(Duration::from_millis(earned_ms));
+        budget
+            .checked_sub(elapsed)
+            .filter(|left| !left.is_zero())
+            .map(|left| left.min(self.idle_timeout))
+    }
+}
+
+/// Why [`read_body`] stopped short of a complete body.
+#[derive(Debug)]
+pub(crate) enum BodyReadError<E> {
+    /// More than the configured cap arrived.
+    TooLarge,
+    /// The client broke the [`BodyReadPolicy`].
+    TimedOut,
+    /// The transport failed underneath the read.
+    Source(E),
+}
+
+/// Read a whole request body from a poll-style chunk source, enforcing the
+/// size cap as bytes accumulate and the [`BodyReadPolicy`] between chunks.
+///
+/// One loop for every transport — `armature-h1`, hyper (HTTP/1.1 and HTTP/2)
+/// and HTTP/3 — so the slow-body defence cannot be present on one and missing
+/// on another.
+pub(crate) async fn read_body<E>(
+    mut poll_next: impl FnMut(&mut Context<'_>) -> Poll<Option<Result<Bytes, E>>>,
+    cap: usize,
+    policy: BodyReadPolicy,
+) -> Result<Bytes, BodyReadError<E>> {
+    let started = tokio::time::Instant::now();
+    let mut first: Option<Bytes> = None;
+    let mut acc: Option<Vec<u8>> = None;
+    let mut total = 0usize;
+    loop {
+        let wait = policy
+            .next_wait(started.elapsed(), total)
+            .ok_or(BodyReadError::TimedOut)?;
+        let next = tokio::time::timeout(wait, std::future::poll_fn(&mut poll_next))
+            .await
+            .map_err(|_| BodyReadError::TimedOut)?;
+        let chunk = match next {
+            None => break,
+            Some(Err(e)) => return Err(BodyReadError::Source(e)),
+            Some(Ok(chunk)) => chunk,
+        };
+        if chunk.is_empty() {
+            continue;
+        }
+        total = total.saturating_add(chunk.len());
+        if total > cap {
+            return Err(BodyReadError::TooLarge);
+        }
+        match (&mut acc, first.take()) {
+            // Single-chunk bodies — the common case — pass straight through
+            // without a copy.
+            (None, None) => first = Some(chunk),
+            (None, Some(f)) => {
+                let mut v = Vec::with_capacity(f.len() + chunk.len());
+                v.extend_from_slice(&f);
+                v.extend_from_slice(&chunk);
+                acc = Some(v);
+            }
+            (Some(v), _) => v.extend_from_slice(&chunk),
+        }
+    }
+    Ok(match acc {
+        Some(v) => Bytes::from(v),
+        None => first.unwrap_or_default(),
+    })
+}
+
+/// The `408` for a body that broke the [`BodyReadPolicy`].
+fn body_timeout_response() -> HttpResponse {
+    Error::RequestTimeout("request body was not received in time".to_string()).to_client_response()
 }
 
 /// Shared state captured by every connection's request handler.
@@ -111,8 +220,13 @@ impl ScopedGuard {
 pub(crate) struct ServeState {
     router: Arc<OptimizedRouter>,
     cors: Option<Arc<CorsConfig>>,
-    guards: Arc<[ScopedGuard]>,
+    /// Global guards; route-scoped guards live on the routes themselves.
+    guards: Arc<[Arc<dyn Guard>]>,
+    /// Global middleware, `None` when none is configured so the common case
+    /// skips building a chain per request.
+    middleware: Option<MiddlewareChain>,
     max_body_size: usize,
+    body_read: BodyReadPolicy,
     /// Global exception filter chain (see [`Application::use_global_filter`]).
     /// `None` preserves the original behavior: errors go straight to
     /// [`Error::to_client_response`] via [`error_response`].
@@ -133,36 +247,54 @@ impl ServeState {
     /// The serve path's own tests need a `ServeState` without an `Application`
     /// behind it; every other field takes the value it has when nothing is
     /// configured, which is what those tests want to hold constant.
-    #[cfg(all(test, feature = "h1-backend"))]
+    #[cfg(test)]
     pub(crate) fn for_test(router: Arc<OptimizedRouter>, max_body_size: usize) -> Self {
+        Self::for_router(router, max_body_size)
+    }
+
+    /// A state serving `router` with nothing else configured.
+    ///
+    /// Also what [`Http3Server::new`](crate::http3::Http3Server) builds when it
+    /// is used on its own, outside an `Application`.
+    #[cfg(any(test, feature = "http3"))]
+    pub(crate) fn for_router(router: Arc<OptimizedRouter>, max_body_size: usize) -> Self {
         Self {
             router,
             cors: None,
             guards: Vec::new().into(),
+            middleware: None,
             max_body_size,
+            body_read: BodyReadPolicy::default(),
             filter_chain: None,
             peer: None,
         }
     }
 
     /// Serve with CORS configured, for tests.
-    #[cfg(all(test, feature = "h1-backend"))]
+    #[cfg(all(test, any(feature = "h1-backend", feature = "http3")))]
     pub(crate) fn with_cors_for_test(mut self, cors: CorsConfig) -> Self {
         self.cors = Some(Arc::new(cors));
         self
     }
 
-    /// Serve with one globally-scoped guard, for tests.
-    ///
-    /// An empty prefix, matching [`Application::with_guard`], so the guard runs
-    /// for every request path.
-    #[cfg(all(test, feature = "h1-backend"))]
+    /// Serve with one global guard, for tests.
+    #[cfg(test)]
     pub(crate) fn with_guard_for_test(mut self, guard: Arc<dyn Guard>) -> Self {
-        self.guards = vec![ScopedGuard {
-            prefix: String::new(),
-            guard,
-        }]
-        .into();
+        self.guards = vec![guard].into();
+        self
+    }
+
+    /// Serve with global middleware, for tests.
+    #[cfg(all(test, feature = "h1-backend"))]
+    pub(crate) fn with_middleware_for_test(mut self, middleware: MiddlewareChain) -> Self {
+        self.middleware = Some(middleware);
+        self
+    }
+
+    /// Serve with a body-read policy, for tests.
+    #[cfg(all(test, feature = "h1-backend"))]
+    pub(crate) fn with_body_read_for_test(mut self, policy: BodyReadPolicy) -> Self {
+        self.body_read = policy;
         self
     }
 
@@ -177,6 +309,25 @@ impl ServeState {
     pub(crate) fn with_filter_chain_for_test(mut self, chain: ExceptionFilterChain) -> Self {
         self.filter_chain = Some(Arc::new(chain));
         self
+    }
+
+    /// This state with its body cap lowered to `cap` if `cap` is smaller.
+    #[cfg(feature = "http3")]
+    pub(crate) fn with_max_body_size_at_most(mut self, cap: usize) -> Self {
+        self.max_body_size = self.max_body_size.min(cap);
+        self
+    }
+
+    /// The peer of the connection this state serves, if known.
+    #[cfg(feature = "http3")]
+    pub(crate) fn peer(&self) -> Option<SocketAddr> {
+        self.peer
+    }
+
+    /// The body cap this state enforces.
+    #[cfg(all(test, feature = "h1-backend"))]
+    pub(crate) fn max_body_size(&self) -> usize {
+        self.max_body_size
     }
 
     /// The same state, serving one connection whose peer is known.
@@ -235,7 +386,10 @@ impl Application {
             http3_stats: Arc::new(Http3Stats::new()),
             cors_config: None,
             guards: Vec::new(),
+            middleware: MiddlewareChain::new(),
             max_body_size: DEFAULT_MAX_BODY_SIZE,
+            body_read: BodyReadPolicy::default(),
+            redirect_hosts: Vec::new(),
             epoll_config: None,
             filter_chain: None,
         }
@@ -245,16 +399,12 @@ impl Application {
     ///
     /// Filters run in priority order (highest first); the first filter
     /// whose `catch()` returns `Some(response)` wins and its response is
-    /// returned to the client. Wired into every HTTP/1.1 and HTTP/2 request
-    /// path: every `service_fn` closure across [`Application::listen`],
-    /// [`Application::listen_on`], HTTP/2 cleartext, and HTTPS/TLS+ALPN
-    /// listeners funnels through the same shared `handle_request`, so both
-    /// the guard-rejection error path and the routing/handler error path try
-    /// the filter chain before falling back to
-    /// [`Error::to_client_response`]. HTTP/3 ([`Application::listen_h3`] /
-    /// [`Application::listen_dual_stack`]'s QUIC side) does **not** yet go
-    /// through the filter chain -- it's served by a separate `Http3Server`
-    /// code path (see `http3.rs`) that doesn't call `handle_request`.
+    /// returned to the client. Wired into every request path — HTTP/1.1,
+    /// HTTP/2 and HTTP/3 ([`Application::listen_h3`] /
+    /// [`Application::listen_dual_stack`]'s QUIC side) all funnel through the
+    /// same shared dispatch, so both the guard-rejection error path and the
+    /// routing/handler error path try the filter chain before falling back to
+    /// [`Error::to_client_response`].
     ///
     /// A registered filter's `catch()` runs with panic and timeout
     /// isolation (see `respond_to_error`): a panicking or hanging filter
@@ -311,20 +461,78 @@ impl Application {
         self
     }
 
-    /// Add a **global** guard evaluated for every request before routing.
+    /// Add a **global** guard, evaluated for every request after global
+    /// middleware and before routing.
     ///
-    /// Manually-added guards use an empty (all-matching) path prefix, so they
-    /// run for every request path regardless of which controller handles it.
-    /// This is different from guards declared by a module, which are scoped to
-    /// the base paths of that module's own controllers (see
-    /// [`Application::register_module`]). Module guards are registered
-    /// automatically during [`Application::create`]; use this to add global
-    /// guards manually.
+    /// Guards declared by a module are different: they are bound to the routes
+    /// of that module's own controllers (see [`Application::register_module`])
+    /// and run after these. Module guards are registered automatically during
+    /// [`Application::create`]; use this to add global guards manually.
     pub fn with_guard(mut self, guard: Arc<dyn Guard>) -> Self {
-        self.guards.push(ScopedGuard {
-            prefix: String::new(),
-            guard,
-        });
+        self.guards.push(guard);
+        self
+    }
+
+    /// Add **global** middleware, run for every request before any guard.
+    ///
+    /// The request pipeline follows NestJS: global middleware (in the order
+    /// added, first = outermost) → global guards ([`with_guard`](Self::with_guard))
+    /// → route-scoped middleware and guards (module guards,
+    /// [`RouteGroup`](crate::RouteGroup) layers) → handler. Put
+    /// authentication middleware here — e.g. `armature_auth::JwtAuthMiddleware`
+    /// — so the verified identity it attaches exists when guards such as
+    /// [`AuthenticationGuard`](crate::AuthenticationGuard) and
+    /// [`RolesGuard`](crate::RolesGuard) look for it.
+    ///
+    /// Middleware sees the canonical request path (see
+    /// [`canonicalize_path`](crate::routing::canonicalize_path)) and the full
+    /// body. It also runs for requests that match no route, so the 404 it
+    /// produces passes through it like any other response.
+    ///
+    /// ```
+    /// use armature_core::{Application, Container, LoggingMiddleware, Router};
+    ///
+    /// let app = Application::new(Container::new(), Router::new())
+    ///     .use_middleware(LoggingMiddleware::new());
+    /// # let _ = app;
+    /// ```
+    pub fn use_middleware<M: Middleware + 'static>(mut self, middleware: M) -> Self {
+        self.middleware.use_middleware(middleware);
+        self
+    }
+
+    /// Set how long a client may take to deliver a request body. Defaults to
+    /// [`BodyReadPolicy::default`]: 30 s of inactivity, 1 KiB/s minimum rate.
+    pub fn with_body_read_policy(mut self, policy: BodyReadPolicy) -> Self {
+        self.body_read = policy;
+        self
+    }
+
+    /// The hosts the HTTP→HTTPS redirect server
+    /// ([`HttpsConfig::with_http_redirect`]) may send clients to.
+    ///
+    /// The redirect's `Location` is built from the request's `Host` only when
+    /// that host (port and case aside) is in this list; any other `Host` is
+    /// answered `400`, so the server cannot be used as an open redirect or to
+    /// poison a cache with an attacker's hostname. Required whenever a redirect
+    /// address is configured: [`listen_with_config`](Self::listen_with_config)
+    /// refuses to start without it.
+    ///
+    /// ```
+    /// use armature_core::{Application, Container, Router};
+    ///
+    /// let app = Application::new(Container::new(), Router::new())
+    ///     .with_https_redirect_hosts(["example.com", "www.example.com"]);
+    /// # let _ = app;
+    /// ```
+    pub fn with_https_redirect_hosts(
+        mut self,
+        hosts: impl IntoIterator<Item = impl Into<String>>,
+    ) -> Self {
+        self.redirect_hosts = hosts
+            .into_iter()
+            .map(|h| h.into().to_ascii_lowercase())
+            .collect();
         self
     }
 
@@ -408,7 +616,9 @@ impl Application {
             router: Arc::new(OptimizedRouter::from_router(&self.router)),
             cors: self.cors_config.clone(),
             guards: self.guards.clone().into(),
+            middleware: (!self.middleware.is_empty()).then(|| self.middleware.clone()),
             max_body_size: self.max_body_size,
+            body_read: self.body_read,
             filter_chain: self.filter_chain.clone().map(Arc::new),
             // Set per connection by the accept loops; this is the template.
             peer: None,
@@ -526,7 +736,27 @@ impl Application {
     /// [`LifecycleManager::call_bootstrap_hooks`] results themselves (e.g. by
     /// driving lifecycle manually instead of via `create`) or check logs/
     /// metrics for hook failures after `create` returns.
+    ///
+    /// # Panics
+    ///
+    /// Panics if module registration fails — today, when a module's guard
+    /// cannot be instantiated. A guard that fails to construct must not leave
+    /// its module's routes reachable unguarded, so startup stops instead. Use
+    /// [`Application::try_create`] to handle the error yourself.
     pub async fn create<M: Module + Default>() -> Self {
+        match Self::try_create::<M>().await {
+            Ok(app) => app,
+            Err(e) => panic!("Armature application bootstrap failed: {e}"),
+        }
+    }
+
+    /// [`Application::create`], returning module-registration failures instead
+    /// of panicking.
+    ///
+    /// Fails closed: if any module's guard factory returns an error, no
+    /// application is built, so none of that module's routes can be served
+    /// without the guard.
+    pub async fn try_create<M: Module + Default>() -> Result<Self, Error> {
         info!("Bootstrapping Armature application");
         debug!(
             module_type = std::any::type_name::<M>(),
@@ -556,15 +786,8 @@ impl Application {
         info!("Registering modules and dependencies");
 
         // Register all providers and controllers from the module tree
-        let mut guards: Vec<ScopedGuard> = Vec::new();
         let mut visited = std::collections::HashSet::new();
-        Self::register_module(
-            &container,
-            &mut router,
-            &mut guards,
-            &mut visited,
-            &root_module,
-        );
+        Self::register_module(&container, &mut router, &mut visited, &root_module)?;
 
         info!("Executing lifecycle hooks");
 
@@ -596,7 +819,7 @@ impl Application {
 
         info!("Application bootstrap complete");
 
-        Self {
+        Ok(Self {
             container,
             router: Arc::new(router),
             lifecycle,
@@ -607,11 +830,14 @@ impl Application {
             http3_config: Http3Config::default(),
             http3_stats: Arc::new(Http3Stats::new()),
             cors_config: None,
-            guards,
+            guards: Vec::new(),
+            middleware: MiddlewareChain::new(),
             max_body_size: DEFAULT_MAX_BODY_SIZE,
+            body_read: BodyReadPolicy::default(),
+            redirect_hosts: Vec::new(),
             epoll_config: None,
             filter_chain: None,
-        }
+        })
     }
 
     /// Get a reference to the lifecycle manager
@@ -720,23 +946,30 @@ impl Application {
     ///
     /// # Guard scoping
     ///
-    /// Guards declared by a module are **not** application-global. Each
-    /// module's guards are scoped to the base paths of the controllers that the
-    /// **same** module registers (via `module.controllers()`): a guard `G` in a
-    /// module whose controllers have base paths `[P1, P2]` is stored once per
-    /// base path and runs only for requests whose path falls under `P1` or
-    /// `P2`. Recursion does not widen this: an imported or child module's guards
-    /// scope to that child's own controllers, never to the parent's. A module
-    /// that declares guards but registers no controllers has nothing to scope
-    /// to, so its guards are inert (a warning is emitted). Manually-added guards
-    /// (see [`Application::with_guard`]) use an empty prefix and stay global.
+    /// Guards declared by a module are **not** application-global. They are
+    /// bound to the routes the **same** module's controllers register: every
+    /// route a controller's registrar adds is wrapped so the module's guards
+    /// run before its handler (see [`Router::layer_routes`]). Binding to the
+    /// route rather than to a URL prefix is what makes the scope exact — no
+    /// spelling of the path (`//admin/x`, `%2e`-segments, a base path with a
+    /// `:param` in it) reaches the handler around the guard, and a guard never
+    /// leaks onto a sibling path that merely shares a prefix. Recursion does not
+    /// widen this: an imported or child module's guards bind to that child's
+    /// own routes, never to the parent's. A module that declares guards but
+    /// registers no controllers has nothing to bind to, so its guards are inert
+    /// (a warning is emitted). Manually-added guards (see
+    /// [`Application::with_guard`]) stay global.
+    ///
+    /// # Errors
+    ///
+    /// Fails if a module's guard factory fails. Registration stops there, so
+    /// that module's controllers are never registered without their guard.
     fn register_module(
         container: &Container,
         router: &mut Router,
-        guards: &mut Vec<ScopedGuard>,
         visited: &mut std::collections::HashSet<std::any::TypeId>,
         module: &dyn Module,
-    ) {
+    ) -> Result<(), Error> {
         // Dedup by the *concrete* module's `TypeId` (`Module::module_type_id`),
         // not `std::any::type_name_of_val(module)`. The latter resolves its
         // type parameter from the *static* type of the `module: &dyn Module`
@@ -757,7 +990,7 @@ impl Application {
                 module_type = module_type,
                 "Module already registered, skipping"
             );
-            return;
+            return Ok(());
         }
         debug!(module_type = module_type, "Registering module");
 
@@ -770,7 +1003,7 @@ impl Application {
                 "Registering imported modules"
             );
             for imported_module in imports {
-                Self::register_module(container, router, guards, visited, imported_module.as_ref());
+                Self::register_module(container, router, visited, imported_module.as_ref())?;
             }
         }
 
@@ -783,13 +1016,7 @@ impl Application {
                 "Registering re-exported modules"
             );
             for re_exported_module in re_exports {
-                Self::register_module(
-                    container,
-                    router,
-                    guards,
-                    visited,
-                    re_exported_module.as_ref(),
-                );
+                Self::register_module(container, router, visited, re_exported_module.as_ref())?;
             }
         }
 
@@ -810,58 +1037,27 @@ impl Application {
             );
         }
 
-        // Register all guards.
-        //
-        // Module guards are scoped to the base paths of the controllers that
-        // THIS SAME module registers, so a guard runs only for requests to its
-        // own module's controllers — not for every request, and not for
-        // controllers belonging to imported/child modules. A module that
-        // declares guards but has no controllers has nothing to scope to, so
-        // those guards are inert and a warning is emitted.
+        // Instantiate this module's guards. They are bound below to the routes
+        // THIS SAME module's controllers register — not to every request, and
+        // not to controllers of imported/child modules. A factory failure
+        // aborts registration before any of those routes exist, so a guard
+        // that cannot be built never leaves its routes reachable unguarded.
         let guard_regs = module.guards();
-        if !guard_regs.is_empty() {
-            // Base paths of this module's own controllers to scope guards to.
-            let controller_paths: Vec<&'static str> =
-                module.controllers().iter().map(|c| c.base_path).collect();
-            debug!(
-                module_type = module_type,
-                guard_count = guard_regs.len(),
-                controller_count = controller_paths.len(),
-                "Registering guards"
-            );
-            for guard_reg in guard_regs {
-                match (guard_reg.factory)(container) {
-                    Ok(guard) => {
-                        if controller_paths.is_empty() {
-                            warn!(
-                                module_type = module_type,
-                                guard = guard_reg.type_name,
-                                "Module declares a guard but registers no controllers; \
-                                 the guard is inert and will not run for any request"
-                            );
-                        } else {
-                            for base_path in &controller_paths {
-                                guards.push(ScopedGuard {
-                                    prefix: base_path.to_string(),
-                                    guard: guard.clone(),
-                                });
-                            }
-                            debug!(
-                                module_type = module_type,
-                                guard = guard_reg.type_name,
-                                scoped_to = ?controller_paths,
-                                "Guard registered (scoped to module's controller base paths)"
-                            );
-                        }
-                    }
-                    Err(e) => {
-                        error!(
-                            module_type = module_type,
-                            guard = guard_reg.type_name,
-                            error = %e,
-                            "Failed to instantiate guard"
-                        );
-                    }
+        let mut module_guards: Vec<Arc<dyn Guard>> = Vec::with_capacity(guard_regs.len());
+        for guard_reg in guard_regs {
+            match (guard_reg.factory)(container) {
+                Ok(guard) => module_guards.push(guard),
+                Err(e) => {
+                    error!(
+                        module_type = module_type,
+                        guard = guard_reg.type_name,
+                        error = %e,
+                        "Failed to instantiate guard; aborting module registration"
+                    );
+                    return Err(Error::Internal(format!(
+                        "module {module_type}: failed to instantiate guard {}: {e}",
+                        guard_reg.type_name
+                    )));
                 }
             }
         }
@@ -871,9 +1067,20 @@ impl Application {
         debug!(
             module_type = module_type,
             controller_count = controllers.len(),
+            guard_count = module_guards.len(),
             "Registering controllers"
         );
+        if !module_guards.is_empty() && controllers.is_empty() {
+            warn!(
+                module_type = module_type,
+                "Module declares guards but registers no controllers; \
+                 the guards are inert and will not run for any request"
+            );
+        }
         for controller_reg in controllers {
+            // Every route this controller's registrar adds lands in this
+            // range, which is what the module's guards are bound to.
+            let first_route = router.routes.len();
             // Instantiate controller with DI
             match (controller_reg.factory)(container) {
                 Ok(controller_instance) => {
@@ -905,9 +1112,16 @@ impl Application {
                     );
                 }
             }
+            // Bound even when the registrar failed part-way: whatever routes it
+            // did add are reachable and must carry the guards.
+            let added = first_route..router.routes.len();
+            if !module_guards.is_empty() && !added.is_empty() {
+                router.layer_routes(added, &[], &module_guards);
+            }
         }
 
         debug!(module_type = module_type, "Module registration complete");
+        Ok(())
     }
 
     /// Start the HTTP server on the specified port
@@ -1047,7 +1261,8 @@ impl Application {
     #[cfg(feature = "h1-backend")]
     async fn listen_on_h1(self, addr: SocketAddr) -> Result<(), Error> {
         let state = self.serve_state();
-        let cfg = crate::h1_backend::h1_config(addr, &self.pipeline_config, None);
+        let cfg =
+            crate::h1_backend::h1_config(addr, &self.pipeline_config, self.max_body_size, None);
         crate::h1_backend::serve(cfg, state, None).await
     }
 
@@ -1082,8 +1297,10 @@ impl Application {
             Arc::clone(&self.pipeline_stats),
         );
         let pipeline_stats = Arc::clone(&self.pipeline_stats);
+        let limit = ConnectionLimit::new(self.pipeline_config.max_connections);
 
         loop {
+            let permit = limit.acquire().await;
             let (stream, client_addr) = listener.accept().await?;
             trace!(client_address = %client_addr, "Connection accepted");
 
@@ -1110,6 +1327,7 @@ impl Application {
             stats.connection_opened();
 
             tokio::spawn(async move {
+                let _permit = permit;
                 let stats_for_close = Arc::clone(&stats);
                 let service = service_fn(move |req: Request<IncomingBody>| {
                     let state = state.clone();
@@ -1196,7 +1414,9 @@ impl Application {
         } else {
             without_h2_alpn(tls_config.server_config)
         };
-        let cfg = crate::h1_backend::h1_config(addr, &self.pipeline_config, None).with_tls(tls);
+        let cfg =
+            crate::h1_backend::h1_config(addr, &self.pipeline_config, self.max_body_size, None)
+                .with_tls(tls);
         let h2 = with_h2.then(|| {
             Http2Builder::with_stats(self.http2_config.clone(), Arc::clone(&self.http2_stats))
                 .configure_hyper_builder()
@@ -1239,8 +1459,10 @@ impl Application {
             Arc::clone(&self.pipeline_stats),
         );
         let pipeline_stats = Arc::clone(&self.pipeline_stats);
+        let limit = ConnectionLimit::new(self.pipeline_config.max_connections);
 
         loop {
+            let permit = limit.acquire().await;
             let (stream, client_addr) = listener.accept().await?;
             trace!(client_address = %client_addr, "HTTPS connection accepted");
 
@@ -1267,8 +1489,9 @@ impl Application {
             stats.connection_opened();
 
             tokio::spawn(async move {
+                let _permit = permit;
                 let stats_for_close = Arc::clone(&stats);
-                match acceptor.accept(stream).await {
+                match tls_accept(&acceptor, stream).await {
                     Ok(tls_stream) => {
                         debug!(client = %client_addr, "TLS handshake successful");
                         let io = TokioIo::new(tls_stream);
@@ -1321,31 +1544,47 @@ impl Application {
     /// `http/1.1` over ALPN even though [`TlsConfig`] offers `h2` as well. See
     /// [`listen_on`](Self::listen_on) for what the default `h1-backend` feature
     /// changes about every HTTP/1.1 listener on this type.
+    ///
+    /// # Errors
+    ///
+    /// Fails before binding anything if an HTTP redirect address is configured
+    /// without [`with_https_redirect_hosts`](Self::with_https_redirect_hosts):
+    /// a redirect built from the client's own `Host` header is an open
+    /// redirect.
     pub async fn listen_with_config(self, config: HttpsConfig) -> Result<(), Error> {
         let state = self.serve_state();
-
-        // Start HTTP redirect server if configured
-        if let Some(ref http_addr) = config.http_redirect_addr {
-            let https_port = config
-                .https_addr
-                .split(':')
-                .next_back()
-                .and_then(|p| p.parse::<u16>().ok())
-                .unwrap_or(443);
-
-            let http_addr = http_addr.clone();
-            tokio::spawn(async move {
-                if let Err(e) = start_http_redirect_server(&http_addr, https_port).await {
-                    eprintln!("HTTP redirect server failed: {}", e);
-                }
-            });
-        }
 
         // Parse HTTPS address
         let https_addr: SocketAddr = config
             .https_addr
             .parse()
             .map_err(|e| Error::Internal(format!("Invalid HTTPS address: {}", e)))?;
+
+        // Start HTTP redirect server if configured
+        if let Some(ref http_addr) = config.http_redirect_addr {
+            if self.redirect_hosts.is_empty() {
+                return Err(Error::Internal(
+                    "an HTTP→HTTPS redirect needs Application::with_https_redirect_hosts; \
+                     redirecting to the client-supplied Host is an open redirect"
+                        .to_string(),
+                ));
+            }
+            let http_addr: SocketAddr = http_addr
+                .parse()
+                .map_err(|e| Error::Internal(format!("Invalid HTTP redirect address: {}", e)))?;
+            let listener = TcpListener::bind(http_addr).await?;
+            println!("↪️  HTTP redirect server listening on http://{}", http_addr);
+            let redirect = Arc::new(RedirectTarget {
+                hosts: self.redirect_hosts.clone(),
+                https_port: https_addr.port(),
+            });
+            let max_connections = self.pipeline_config.max_connections;
+            tokio::spawn(async move {
+                if let Err(e) = serve_http_redirect(listener, redirect, max_connections).await {
+                    error!(error = %e, "HTTP redirect server failed");
+                }
+            });
+        }
 
         // See `listen_on` for why this is a `cfg`-selected binding and not a
         // branch, and why the trailing `served` is not a redundant rebind.
@@ -1378,8 +1617,13 @@ impl Application {
         state: ServeState,
     ) -> Result<(), Error> {
         let redirecting = config.http_redirect_addr.is_some();
-        let cfg = crate::h1_backend::h1_config(https_addr, &self.pipeline_config, None)
-            .with_tls(without_h2_alpn(config.tls.server_config));
+        let cfg = crate::h1_backend::h1_config(
+            https_addr,
+            &self.pipeline_config,
+            self.max_body_size,
+            None,
+        )
+        .with_tls(without_h2_alpn(config.tls.server_config));
         // Announced from `on_bound`, which runs once the listener exists.
         // Printing before the bind means a port conflict shows the operator
         // "listening on https://…" and then the error that says it never
@@ -1420,8 +1664,11 @@ impl Application {
         // HTTP/1.1 only here too — see `without_h2_alpn`, and
         // `listen_with_config_h1` for why this listener does not gain HTTP/2.
         let acceptor = TlsAcceptor::from(without_h2_alpn(config.tls.server_config));
+        let h1_builder = PipelinedHttp1Builder::new(self.pipeline_config.clone());
+        let limit = ConnectionLimit::new(self.pipeline_config.max_connections);
 
         loop {
+            let permit = limit.acquire().await;
             let (stream, client_addr) = listener.accept().await?;
             trace!(client_address = %client_addr, "TLS connection accepted");
 
@@ -1434,9 +1681,11 @@ impl Application {
 
             let acceptor = acceptor.clone();
             let state = state.for_peer(client_addr);
+            let http_builder = h1_builder.configure_hyper_builder();
 
             tokio::spawn(async move {
-                match acceptor.accept(stream).await {
+                let _permit = permit;
+                match tls_accept(&acceptor, stream).await {
                     Ok(tls_stream) => {
                         let io = TokioIo::new(tls_stream);
 
@@ -1445,13 +1694,12 @@ impl Application {
                             async move { handle_request(req, state).await }
                         });
 
-                        if let Err(err) = http1::Builder::new().serve_connection(io, service).await
-                        {
-                            eprintln!("Error serving HTTPS connection: {:?}", err);
+                        if let Err(err) = http_builder.serve_connection(io, service).await {
+                            error!(error = %err, client = %client_addr, "Error serving HTTPS connection");
                         }
                     }
                     Err(err) => {
-                        eprintln!("TLS handshake failed: {:?}", err);
+                        debug!(error = %err, client = %client_addr, "TLS handshake failed");
                     }
                 }
             });
@@ -1495,12 +1743,30 @@ impl Application {
         );
         warn!("HTTP/2 cleartext (h2c) is not recommended for production. Use HTTPS.");
 
+        #[cfg(unix)]
+        let tuning = socket_tuning;
+        #[cfg(not(unix))]
+        let tuning = None;
+        self.serve_h2c(listener, tuning).await
+    }
+
+    /// The accept loop behind [`listen_h2c`](Self::listen_h2c), over an
+    /// already-bound listener so tests can serve an ephemeral port.
+    pub(crate) async fn serve_h2c(
+        self,
+        listener: TcpListener,
+        socket_tuning: Option<EpollConfig>,
+    ) -> Result<(), Error> {
+        #[cfg(not(unix))]
+        let _ = &socket_tuning;
         let state = self.serve_state();
         let h2_builder =
             Http2Builder::with_stats(self.http2_config.clone(), Arc::clone(&self.http2_stats));
         let h2_stats = Arc::clone(&self.http2_stats);
+        let limit = ConnectionLimit::new(self.pipeline_config.max_connections);
 
         loop {
+            let permit = limit.acquire().await;
             let (stream, client_addr) = listener.accept().await?;
             trace!(client_address = %client_addr, "HTTP/2 connection accepted");
 
@@ -1520,6 +1786,7 @@ impl Application {
             stats.connection_opened();
 
             tokio::spawn(async move {
+                let _permit = permit;
                 let stats_for_close = Arc::clone(&stats);
                 let service = service_fn(move |req: Request<IncomingBody>| {
                     let state = state.clone();
@@ -1613,8 +1880,10 @@ impl Application {
             Http2Builder::with_stats(self.http2_config.clone(), Arc::clone(&self.http2_stats));
         let h1_stats = Arc::clone(&self.pipeline_stats);
         let h2_stats = Arc::clone(&self.http2_stats);
+        let limit = ConnectionLimit::new(self.pipeline_config.max_connections);
 
         loop {
+            let permit = limit.acquire().await;
             let (stream, client_addr) = listener.accept().await?;
             trace!(client_address = %client_addr, "Connection accepted, starting TLS handshake");
 
@@ -1633,7 +1902,8 @@ impl Application {
             let h2_stats = Arc::clone(&h2_stats);
 
             tokio::spawn(async move {
-                match acceptor.accept(stream).await {
+                let _permit = permit;
+                match tls_accept(&acceptor, stream).await {
                     Ok(tls_stream) => {
                         // Check negotiated ALPN protocol
                         let (_, session) = tls_stream.get_ref();
@@ -1730,12 +2000,9 @@ impl Application {
             "Starting HTTP/3 (QUIC) server"
         );
 
-        // Compile the linear router into the O(1) optimized router once,
-        // matching the TCP serve paths.
-        let optimized = Arc::new(crate::route_cache::OptimizedRouter::from_router(
-            &self.router,
-        ));
-        let server = Http3Server::new(self.http3_config.clone(), optimized);
+        // The same serve state as every TCP listener — guards, middleware,
+        // CORS, filters, body limits — so QUIC is not a way around any of it.
+        let server = Http3Server::from_state(self.http3_config.clone(), self.serve_state());
 
         server.listen(addr, tls_config.server_config).await
     }
@@ -1776,16 +2043,15 @@ impl Application {
             "Starting dual-stack server (HTTP/3 + HTTPS)"
         );
 
-        // Clone for the two servers
+        // Clone for the two servers. The QUIC side gets the same serve state as
+        // the TCP side, so a guarded route is guarded on both.
         let tls_config_h3 = tls_config.clone();
-        let router_h3 = Arc::new(crate::route_cache::OptimizedRouter::from_router(
-            &self.router,
-        ));
+        let state_h3 = self.serve_state();
         let http3_config = self.http3_config.clone();
 
         // Start HTTP/3 server (UDP)
         let h3_handle = tokio::spawn(async move {
-            let server = Http3Server::new(http3_config, router_h3);
+            let server = Http3Server::from_state(http3_config, state_h3);
             if let Err(e) = server.listen(addr, tls_config_h3.server_config).await {
                 error!(error = %e, "HTTP/3 server error");
             }
@@ -1851,54 +2117,184 @@ fn apply_socket_tuning(fd: std::os::unix::io::RawFd, config: &EpollConfig, socke
     }
 }
 
-/// Start HTTP server that redirects all requests to HTTPS
-async fn start_http_redirect_server(addr: &str, https_port: u16) -> Result<(), Error> {
-    let addr: SocketAddr = addr
-        .parse()
-        .map_err(|e| Error::Internal(format!("Invalid HTTP redirect address: {}", e)))?;
+/// Bounds how many connections one accept loop serves at once.
+///
+/// The permit is taken *before* `accept`, so a full server stops accepting and
+/// lets the kernel's listen backlog absorb the burst, rather than accepting
+/// sockets it cannot serve and holding their memory.
+#[derive(Clone)]
+struct ConnectionLimit(Arc<tokio::sync::Semaphore>);
 
-    let listener = TcpListener::bind(addr).await?;
+impl ConnectionLimit {
+    fn new(max: usize) -> Self {
+        Self(Arc::new(tokio::sync::Semaphore::new(
+            max.clamp(1, tokio::sync::Semaphore::MAX_PERMITS),
+        )))
+    }
 
-    println!("↪️  HTTP redirect server listening on http://{}", addr);
+    async fn acquire(&self) -> tokio::sync::OwnedSemaphorePermit {
+        // The semaphore is never closed, so this cannot fail; the `expect`
+        // names the invariant rather than hiding it.
+        Arc::clone(&self.0)
+            .acquire_owned()
+            .await
+            .expect("connection-limit semaphore is never closed")
+    }
+}
 
+/// How long a TLS handshake may take before the connection is dropped.
+///
+/// Matches the head deadline `armature-h1` applies to its own handshakes, so a
+/// peer that opens a socket and never finishes a ClientHello holds a task and
+/// a connection slot for this long at most, on every serve path.
+#[cfg(not(feature = "h1-backend"))]
+pub(crate) const TLS_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// `acceptor.accept(stream)` under [`TLS_HANDSHAKE_TIMEOUT`].
+#[cfg(not(feature = "h1-backend"))]
+async fn tls_accept(
+    acceptor: &TlsAcceptor,
+    stream: tokio::net::TcpStream,
+) -> std::io::Result<tokio_rustls::server::TlsStream<tokio::net::TcpStream>> {
+    tokio::time::timeout(TLS_HANDSHAKE_TIMEOUT, acceptor.accept(stream))
+        .await
+        .unwrap_or_else(|_| {
+            Err(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                "TLS handshake timed out",
+            ))
+        })
+}
+
+/// Where the HTTP→HTTPS redirect server may send clients.
+#[derive(Debug, Clone)]
+struct RedirectTarget {
+    /// Allowed hosts, lowercase; the first is canonical.
+    hosts: Vec<String>,
+    /// The HTTPS listener's port.
+    https_port: u16,
+}
+
+/// Split a `Host` header value into its host (lowercased, IPv6 literals kept
+/// in brackets) and validate any port; `None` if it is not a valid authority.
+fn host_of_authority(value: &str) -> Option<String> {
+    let (host, port) = if let Some(rest) = value.strip_prefix('[') {
+        let (inside, after) = rest.split_once(']')?;
+        if inside.is_empty()
+            || !inside
+                .bytes()
+                .all(|b| b.is_ascii_hexdigit() || b == b':' || b == b'.')
+        {
+            return None;
+        }
+        let port = match after {
+            "" => None,
+            p => Some(p.strip_prefix(':')?),
+        };
+        (format!("[{}]", inside), port)
+    } else {
+        let (host, port) = match value.split_once(':') {
+            Some((h, p)) => (h, Some(p)),
+            None => (value, None),
+        };
+        if host.is_empty()
+            || !host
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'.')
+        {
+            return None;
+        }
+        (host.to_string(), port)
+    };
+    if let Some(port) = port
+        && (port.is_empty() || port.parse::<u16>().is_err())
+    {
+        return None;
+    }
+    Some(host.to_ascii_lowercase())
+}
+
+/// The `Location` for a plaintext request, or `None` when its `Host` is not
+/// one the redirect may name (answered `400`).
+///
+/// The host comes from the configured allowlist, never verbatim from the
+/// request, and the request's path **and query** are preserved.
+fn redirect_location(
+    target: &RedirectTarget,
+    host_header: Option<&str>,
+    path_and_query: &str,
+) -> Option<String> {
+    let host = match host_header {
+        Some(value) => {
+            let host = host_of_authority(value.trim())?;
+            target
+                .hosts
+                .iter()
+                .find(|allowed| **allowed == host)?
+                .clone()
+        }
+        // HTTP/1.0 without a Host: the canonical host.
+        None => target.hosts.first()?.clone(),
+    };
+    let path_and_query = if path_and_query.starts_with('/') {
+        path_and_query
+    } else {
+        "/"
+    };
+    Some(if target.https_port == 443 {
+        format!("https://{host}{path_and_query}")
+    } else {
+        format!("https://{host}:{}{path_and_query}", target.https_port)
+    })
+}
+
+/// Serve HTTP→HTTPS redirects on `listener`.
+async fn serve_http_redirect(
+    listener: TcpListener,
+    target: Arc<RedirectTarget>,
+    max_connections: usize,
+) -> Result<(), Error> {
+    let limit = ConnectionLimit::new(max_connections);
     loop {
-        let (stream, _) = listener.accept().await?;
+        let permit = limit.acquire().await;
+        let (stream, client_addr) = listener.accept().await?;
         let io = TokioIo::new(stream);
+        let target = Arc::clone(&target);
 
         tokio::spawn(async move {
-            let service = service_fn(move |req: Request<IncomingBody>| async move {
-                // Redirect to HTTPS
-                let host = req
-                    .headers()
-                    .get("host")
-                    .and_then(|h| h.to_str().ok())
-                    .unwrap_or("localhost");
-
-                // Remove port from host if present
-                let host_without_port = host.split(':').next().unwrap_or(host);
-
-                let location = if https_port == 443 {
-                    format!("https://{}{}", host_without_port, req.uri().path())
-                } else {
-                    format!(
-                        "https://{}:{}{}",
-                        host_without_port,
-                        https_port,
-                        req.uri().path()
-                    )
-                };
-
-                let response = Response::builder()
-                    .status(301)
-                    .header("Location", location)
-                    .body(Full::new(bytes::Bytes::from("Redirecting to HTTPS...")))
-                    .unwrap();
-
-                Ok::<_, hyper::Error>(response)
+            let _permit = permit;
+            let service = service_fn(move |req: Request<IncomingBody>| {
+                let target = Arc::clone(&target);
+                async move {
+                    let host = req.headers().get("host").and_then(|h| h.to_str().ok());
+                    let path_and_query = req.uri().path_and_query().map_or("/", |pq| pq.as_str());
+                    let response = match redirect_location(&target, host, path_and_query).and_then(
+                        |location| {
+                            Response::builder()
+                                .status(301)
+                                .header("Location", location)
+                                .body(Full::new(Bytes::from_static(b"Redirecting to HTTPS...")))
+                                .ok()
+                        },
+                    ) {
+                        Some(response) => response,
+                        None => {
+                            let mut bad = Response::new(Full::new(Bytes::from_static(
+                                b"Bad Request: unknown host",
+                            )));
+                            *bad.status_mut() = hyper::StatusCode::BAD_REQUEST;
+                            bad
+                        }
+                    };
+                    Ok::<_, hyper::Error>(response)
+                }
             });
 
-            if let Err(err) = http1::Builder::new().serve_connection(io, service).await {
-                eprintln!("Error serving HTTP redirect: {:?}", err);
+            if let Err(err) = crate::pipeline::hardened_http1_builder()
+                .serve_connection(io, service)
+                .await
+            {
+                debug!(error = %err, client = %client_addr, "Error serving HTTP redirect");
             }
         });
     }
@@ -1925,23 +2321,6 @@ pub(crate) async fn handle_request(
 
     let mut armature_req = HttpRequest::new(method.clone(), target).with_peer(state.peer);
 
-    // Guards and routing each consume `armature_req` by value, so the target
-    // has to be kept separately for logging and guard-scope prefix matching.
-    // A `ByteStr` clone is a refcount bump, not a second copy of the target,
-    // and `path_only` trims the query off it without allocating.
-    let target_handle = armature_req.path.clone();
-    let path = target_handle
-        .split_once('?')
-        .map_or(target_handle.as_str(), |(p, _)| p);
-
-    if let Some(preflight) = cors_preflight(
-        &method,
-        || req.headers().contains_key("access-control-request-method"),
-        &state,
-    ) {
-        return Ok(to_hyper_response_raw(preflight, &method, path));
-    }
-
     // Copy headers. One copy per value, because hyper's `HeaderValue` owns its
     // own buffer and cannot be projected into our `Bytes`; the name goes in as
     // a `&str`, so it costs nothing for a well-known header.
@@ -1963,73 +2342,118 @@ pub(crate) async fn handle_request(
         );
     }
 
-    // Fast-path rejection, before any body byte is buffered. The streaming
-    // `Limited` wrapper below still enforces the limit for chunked or
-    // undeclared bodies.
-    let declared_len = declared_content_length(armature_req.headers.get("content-length"));
-    if let Some(rejection) = declared_length_rejection(declared_len, &method, path, &state) {
-        return Ok(to_hyper_response(
-            rejection,
-            state.cors.as_deref(),
-            &method,
-            path,
-        ));
-    }
-
-    // Read body into Bytes (zero-copy after this point), enforcing the
-    // configured size limit before the body is buffered in memory.
-    let limited = Limited::new(req.into_body(), state.max_body_size);
-    let body_bytes = match limited.collect().await {
-        Ok(collected) => collected.to_bytes(),
-        Err(err) if err.is::<http_body_util::LengthLimitError>() => {
-            warn!(
-                method = %method,
-                path = %path,
-                limit = state.max_body_size,
-                "Request body exceeds configured limit"
-            );
+    let resolution = match admit(&mut armature_req, &state).await {
+        Admission::Proceed(resolution) => resolution,
+        Admission::Respond(response, with_cors) => {
+            let cors = if with_cors {
+                state.cors.as_deref()
+            } else {
+                None
+            };
             return Ok(to_hyper_response(
-                payload_too_large_response(),
-                state.cors.as_deref(),
+                response,
+                cors,
                 &method,
-                path,
+                armature_req.path_only(),
             ));
         }
-        Err(err) => match err.downcast::<hyper::Error>() {
-            Ok(hyper_err) => return Err(*hyper_err),
-            Err(other) => {
-                warn!(method = %method, path = %path, error = %other, "Failed to read request body");
-                return Ok(to_hyper_response(
-                    HttpResponse::new(400),
-                    state.cors.as_deref(),
-                    &method,
-                    path,
-                ));
+    };
+
+    // Read the body under the size cap and the slow-body policy.
+    let mut body = req.into_body();
+    let read = read_body(
+        |cx| {
+            use hyper::body::Body as _;
+            loop {
+                return match std::pin::Pin::new(&mut body).poll_frame(cx) {
+                    Poll::Pending => Poll::Pending,
+                    Poll::Ready(None) => Poll::Ready(None),
+                    Poll::Ready(Some(Err(e))) => Poll::Ready(Some(Err(e))),
+                    Poll::Ready(Some(Ok(frame))) => match frame.into_data() {
+                        Ok(data) => Poll::Ready(Some(Ok(data))),
+                        // Trailers carry no body bytes.
+                        Err(_) => continue,
+                    },
+                };
             }
         },
+        state.max_body_size,
+        state.body_read,
+    )
+    .await;
+    let body_bytes = match read {
+        Ok(bytes) => bytes,
+        Err(BodyReadError::Source(hyper_err)) => return Err(hyper_err),
+        Err(err) => {
+            return Ok(to_hyper_response(
+                body_read_rejection(&err, &method, armature_req.path_only(), &state),
+                state.cors.as_deref(),
+                &method,
+                armature_req.path_only(),
+            ));
+        }
     };
-    let body_size = body_bytes.len();
-
-    // Use zero-copy body storage
-    if body_size > 0 {
+    if !body_bytes.is_empty() {
+        let body_size = body_bytes.len();
         armature_req.set_body_bytes(body_bytes);
         trace!(body_size = body_size, "Request body received (zero-copy)");
     }
 
+    let target_handle = armature_req.path.clone();
+    let path = target_handle
+        .split_once('?')
+        .map_or(target_handle.as_str(), |(p, _)| p);
     Ok(to_hyper_response(
-        dispatch_request(armature_req, &state, start).await,
+        dispatch_request(armature_req, &state, start, resolution).await,
         state.cors.as_deref(),
         &method,
         path,
     ))
 }
 
+/// The response for a body read that failed for a reason the client caused
+/// (too large, too slow).
+fn body_read_rejection<E>(
+    err: &BodyReadError<E>,
+    method: &crate::Method,
+    path: &str,
+    state: &ServeState,
+) -> HttpResponse {
+    match err {
+        BodyReadError::TooLarge => {
+            warn!(
+                method = %method,
+                path = %path,
+                limit = state.max_body_size,
+                "Request body exceeds configured limit"
+            );
+            payload_too_large_response()
+        }
+        BodyReadError::TimedOut => {
+            warn!(
+                method = %method,
+                path = %path,
+                idle_timeout = ?state.body_read.idle_timeout,
+                min_bytes_per_sec = state.body_read.min_bytes_per_sec,
+                "Request body not received in time"
+            );
+            body_timeout_response()
+        }
+        BodyReadError::Source(_) => {
+            warn!(method = %method, path = %path, "Failed to read request body");
+            HttpResponse::new(400)
+        }
+    }
+}
+
 /// Serve one request that arrived over `armature-h1`.
 ///
 /// The counterpart to [`handle_request`], and deliberately the same shape: both
-/// build an [`HttpRequest`], answer a CORS preflight before touching the body,
-/// enforce the body limit, and then hand off to [`dispatch_request`], which is
-/// where all the actual policy lives. Only the transport-facing edges differ.
+/// build an [`HttpRequest`], run [`admit`] (path canonicalization, CORS
+/// preflight, declared-length cap, route resolution) before touching the body,
+/// read the body under the cap and the [`BodyReadPolicy`], and then hand off to
+/// [`dispatch_request`], which is where all the actual policy lives. Only the
+/// transport-facing edges differ.
 ///
 /// Returns an `armature_h1::Response` rather than a `Result`, because there is
 /// no error to report to: `armature-h1` owns the connection and every failure
@@ -2049,47 +2473,38 @@ pub(crate) async fn dispatch_via_h1(
         peer,
     } = req;
     let method = head.method.clone();
+    // The head moves into the request without copying a header value; the
+    // body stays behind, unread, until `admit` has had its say.
+    let mut armature_req = request_from_head(head, peer);
 
-    if let Some(preflight) = cors_preflight(
-        &method,
-        || {
-            // `Access-Control-Request-Method` is outside armature-h1's
-            // well-known table, so this compares names rather than interning a
-            // needle. It runs only for an `OPTIONS` request on a
-            // CORS-configured server.
-            head.headers
-                .iter()
-                .any(|(id, _)| id.as_str() == "access-control-request-method")
-        },
-        &state,
-    ) {
-        // No CORS argument: the preflight answer already carries the full
-        // preflight header set, and appending the per-response origin pair on
-        // top of it would duplicate `Access-Control-Allow-Origin`.
-        return to_h1_response(preflight, None, &method, head.path());
-    }
+    let resolution = match admit(&mut armature_req, &state).await {
+        Admission::Proceed(resolution) => resolution,
+        Admission::Respond(response, with_cors) => {
+            let cors = if with_cors {
+                state.cors.as_deref()
+            } else {
+                None
+            };
+            return to_h1_response(response, cors, &method, armature_req.path_only());
+        }
+    };
 
-    // Fast-path rejection, before any body byte is buffered — the same check
-    // the hyper path makes, through the same helper. `armature-h1`
-    // independently caps the body at `Limits::max_body_bytes`, but that cap
-    // produces a bare 413 from the connection loop; going through
-    // `payload_too_large_response` here keeps the body this framework's other
-    // transports return.
-    let declared_len = declared_content_length(head.get_str(&armature_h1::HeaderId::ContentLength));
-    if let Some(rejection) = declared_length_rejection(declared_len, &method, head.path(), &state) {
-        return to_h1_response(rejection, state.cors.as_deref(), &method, head.path());
-    }
-
-    // `collect` enforces the cap while reading rather than after, so an
-    // undeclared or chunked body over the limit is refused mid-stream instead
-    // of being buffered whole first.
-    let body_bytes = match body.collect(state.max_body_size as u64).await {
+    // The cap is enforced while reading rather than after, so an undeclared or
+    // chunked body over the limit is refused mid-stream instead of being
+    // buffered whole first.
+    let read = read_body(
+        |cx| body.poll_chunk(cx),
+        state.max_body_size,
+        state.body_read,
+    )
+    .await;
+    let body_bytes = match read {
         Ok(b) => b,
-        Err(err) => {
+        Err(BodyReadError::Source(err)) => {
             let status = err.status();
             warn!(
                 method = %method,
-                path = head.path(),
+                path = armature_req.path_only(),
                 error = %err,
                 status,
                 "Failed to read request body"
@@ -2099,31 +2514,199 @@ pub(crate) async fn dispatch_via_h1(
             } else {
                 HttpResponse::new(status)
             };
-            return to_h1_response(response, state.cors.as_deref(), &method, head.path());
+            return to_h1_response(
+                response,
+                state.cors.as_deref(),
+                &method,
+                armature_req.path_only(),
+            );
+        }
+        Err(err) => {
+            let response = body_read_rejection(&err, &method, armature_req.path_only(), &state);
+            return to_h1_response(
+                response,
+                state.cors.as_deref(),
+                &method,
+                armature_req.path_only(),
+            );
         }
     };
 
-    let mut armature_req = request_from_head(head, peer);
     if !body_bytes.is_empty() {
         let body_size = body_bytes.len();
         armature_req.set_body_bytes(body_bytes);
         trace!(body_size = body_size, "Request body received (zero-copy)");
     }
 
-    // `head` is gone into the request by now, so the target is kept the way the
-    // hyper path keeps it: a `ByteStr` clone is a refcount bump on the read
-    // buffer, and `split_once` trims the query off it without allocating.
+    // The target is kept the way the hyper path keeps it: a `ByteStr` clone is
+    // a refcount bump, and `split_once` trims the query off it without
+    // allocating.
     let target_handle = armature_req.path.clone();
     let path = target_handle
         .split_once('?')
         .map_or(target_handle.as_str(), |(p, _)| p);
 
     to_h1_response(
-        dispatch_request(armature_req, &state, start).await,
+        dispatch_request(armature_req, &state, start, resolution).await,
         state.cors.as_deref(),
         &method,
         path,
     )
+}
+
+/// Serve one HTTP/3 request through the same pipeline as every TCP transport.
+///
+/// `armature_req` is the request built from the HTTP/3 head; `poll_body`
+/// yields its DATA chunks. The answer is a hyper response built by the same
+/// [`to_hyper_response`] the HTTP/1.1 and HTTP/2 paths use, so CORS headers,
+/// the transport-field rules and the fail-closed 500 are identical too.
+#[cfg(feature = "http3")]
+pub(crate) async fn dispatch_via_h3<E: std::fmt::Display>(
+    mut armature_req: HttpRequest,
+    poll_body: impl FnMut(&mut Context<'_>) -> Poll<Option<Result<Bytes, E>>>,
+    state: &ServeState,
+) -> Response<Full<Bytes>> {
+    let start = std::time::Instant::now();
+    let method = armature_req.method.clone();
+
+    let resolution = match admit(&mut armature_req, state).await {
+        Admission::Proceed(resolution) => resolution,
+        Admission::Respond(response, with_cors) => {
+            let cors = if with_cors {
+                state.cors.as_deref()
+            } else {
+                None
+            };
+            return to_hyper_response(response, cors, &method, armature_req.path_only());
+        }
+    };
+
+    match read_body(poll_body, state.max_body_size, state.body_read).await {
+        Ok(body) => {
+            if !body.is_empty() {
+                armature_req.set_body_bytes(body);
+            }
+        }
+        Err(err) => {
+            if let BodyReadError::Source(source) = &err {
+                warn!(method = %method, path = armature_req.path_only(), error = %source, "Failed to read HTTP/3 request body");
+            }
+            return to_hyper_response(
+                body_read_rejection(&err, &method, armature_req.path_only(), state),
+                state.cors.as_deref(),
+                &method,
+                armature_req.path_only(),
+            );
+        }
+    }
+
+    let target_handle = armature_req.path.clone();
+    let path = target_handle
+        .split_once('?')
+        .map_or(target_handle.as_str(), |(p, _)| p);
+    to_hyper_response(
+        dispatch_request(armature_req, state, start, resolution).await,
+        state.cors.as_deref(),
+        &method,
+        path,
+    )
+}
+
+/// What a serve path does with a request whose head has arrived and whose body
+/// has not been read.
+pub(crate) enum Admission {
+    /// Answer now, without reading the body. The flag says whether the
+    /// configured CORS headers belong on the answer (the preflight carries its
+    /// own full set and must not get the per-response pair on top).
+    Respond(HttpResponse, bool),
+    /// Read the body, then dispatch with this resolution.
+    Proceed(Resolution),
+}
+
+/// How far routing got before the body was read.
+///
+/// Unboxed on purpose: the resolved params live inline in a `SmallVec`, and
+/// boxing them would put a heap allocation on every request's path to save
+/// stack space in a value that lives for one call.
+#[allow(clippy::large_enum_variant)]
+pub(crate) enum Resolution {
+    /// Global middleware may still change the request; resolve after it.
+    Deferred,
+    /// The route the request will be dispatched to.
+    Resolved(ResolvedRoute),
+    /// No route matches; global guards still run before the `404`.
+    NotFound,
+}
+
+/// Everything a serve path decides from the head alone, shared by every
+/// transport so none of them can skip a step:
+///
+/// 1. canonicalize the path ([`canonicalize_path`](crate::routing::canonicalize_path))
+///    and rewrite the request's target to it, or answer `400`;
+/// 2. answer a CORS preflight;
+/// 3. refuse a declared body over the cap with `413`;
+/// 4. resolve the route — and, when no global middleware or guard could
+///    change the outcome, answer an unmatched request `404` without reading
+///    its body.
+pub(crate) async fn admit(req: &mut HttpRequest, state: &ServeState) -> Admission {
+    // 1. One spelling of the path for everything downstream.
+    let canonical = match crate::routing::canonicalize_path(req.path_only()) {
+        Ok(std::borrow::Cow::Borrowed(_)) => None,
+        Ok(std::borrow::Cow::Owned(path)) => Some(path),
+        Err(rejection) => {
+            warn!(method = %req.method, reason = %rejection, "Rejected a non-canonical request path");
+            return Admission::Respond(
+                Error::BadRequest(rejection.to_string()).to_client_response(),
+                true,
+            );
+        }
+    };
+    if let Some(mut path) = canonical {
+        if let Some((_, query)) = req.path.split_once('?') {
+            path.push('?');
+            path.push_str(query);
+        }
+        req.path = path.into();
+    }
+
+    // 2. CORS preflight, before the body.
+    if let Some(preflight) = cors_preflight(
+        &req.method,
+        || req.headers.contains_key("access-control-request-method"),
+        state,
+    ) {
+        return Admission::Respond(preflight, false);
+    }
+
+    // 3. Declared body over the cap.
+    let declared_len = declared_content_length(req.headers.get("content-length"));
+    if let Some(rejection) =
+        declared_length_rejection(declared_len, &req.method, req.path_only(), state)
+    {
+        return Admission::Respond(rejection, true);
+    }
+
+    // 4. Route resolution. Global middleware can rewrite the request, so with
+    //    any configured the route is resolved after it instead.
+    if state.middleware.is_some() {
+        return Admission::Proceed(Resolution::Deferred);
+    }
+    match state.router.resolve(&req.method, req.path_only()) {
+        Some(resolved) => Admission::Proceed(Resolution::Resolved(resolved)),
+        // A global guard answers before routing does (an unauthenticated
+        // caller learns nothing about which paths exist), so with one
+        // configured the 404 waits for it.
+        None if !state.guards.is_empty() => Admission::Proceed(Resolution::NotFound),
+        None => {
+            debug!(method = %req.method, path = req.path_only(), "No route found; answering before the body");
+            let err = Error::RouteNotFound(format!("{} {}", req.method, req.path_only()));
+            let ctx = state.filter_chain.as_ref().map(|_| req.clone());
+            Admission::Respond(
+                respond_to_error(err, ctx, state.filter_chain.clone()).await,
+                true,
+            )
+        }
+    }
 }
 
 /// The CORS preflight answer for this request, if one is owed.
@@ -2235,21 +2818,25 @@ fn declared_length_rejection(
     Some(payload_too_large_response())
 }
 
-/// Guards, routing, and error mapping for a fully-formed request.
+/// Middleware, guards, routing, and error mapping for a fully-formed request.
 ///
 /// Everything between "an [`HttpRequest`] exists, body included" and "an
-/// [`HttpResponse`] is ready", with no transport type in the signature. Both
-/// serve paths — hyper and `armature-h1` — funnel through here, so the guard
-/// ordering, the filter-chain snapshot, and the error mapping have exactly one
-/// implementation rather than two that drift.
+/// [`HttpResponse`] is ready", with no transport type in the signature. Every
+/// serve path — hyper, `armature-h1`, HTTP/3 — funnels through here, so the
+/// pipeline order, the filter-chain snapshot, and the error mapping have
+/// exactly one implementation rather than several that drift.
+///
+/// The order is NestJS's: global middleware → global guards → route-scoped
+/// middleware and guards (bound to the route itself) → handler.
 ///
 /// `start` is passed in rather than taken here because the duration that
 /// matters is measured from the point the transport handed the request over,
 /// which is upstream of this call.
 async fn dispatch_request(
-    mut armature_req: HttpRequest,
+    armature_req: HttpRequest,
     state: &ServeState,
     start: std::time::Instant,
+    resolution: Resolution,
 ) -> HttpResponse {
     let method = armature_req.method.clone();
     let target_handle = armature_req.path.clone();
@@ -2257,12 +2844,6 @@ async fn dispatch_request(
         .split_once('?')
         .map_or(target_handle.as_str(), |(p, _)| p);
 
-    // The arrival record, emitted here rather than in each adapter so both
-    // transports produce it. It was previously written only by the hyper
-    // adapter, so moving the serve path onto `armature-h1` silently removed
-    // every per-request trace for HTTP/1.1 — the first record for a request
-    // became "Routing request", which is emitted after body handling and never
-    // at all for one rejected before that.
     trace!(
         method = %method,
         path = %path,
@@ -2273,46 +2854,33 @@ async fn dispatch_request(
     // Only needed when a global exception filter chain is configured: a
     // filter's `catch()` receives the original request for context (path,
     // headers, request id, ...), matching `ExceptionContext::from_request`.
-    // Guard evaluation and routing below each consume `armature_req` by
-    // value, so it must be captured before either runs.
+    // The pipeline below consumes `armature_req` by value, so it must be
+    // captured before it runs.
     //
     // Limitation (documented, not confirmed to be a bug): because this clone
-    // is taken *before* guards run and *before* routing populates path
-    // params, `ExceptionContext::request` as seen by a filter's `catch()` is
-    // a pre-guard/pre-routing snapshot. Guard-added request extensions and
-    // resolved route/path params are therefore never visible to a filter --
-    // only headers, method, path, and body as they arrived on the wire.
+    // is taken *before* middleware and guards run and *before* routing
+    // populates path params, `ExceptionContext::request` as seen by a filter's
+    // `catch()` is a pre-pipeline snapshot.
     let filter_ctx_request = state.filter_chain.as_ref().map(|_| armature_req.clone());
 
-    // Evaluate guards before routing.
-    //
-    // Only guards whose scope prefix matches this request path are evaluated:
-    // module guards are scoped to the base paths of the declaring module's own
-    // controllers, while guards added via `Application::with_guard` use an empty
-    // prefix and match every path. Guards always run before routing.
-    if !state.guards.is_empty() {
-        match evaluate_scoped_guards(&state.guards, path, armature_req).await {
-            Ok(req) => armature_req = req,
-            Err(GuardRejection::Reject) => {
-                warn!(method = %method, path = %path, "Request rejected by guard");
-                let body = serde_json::json!({
-                    "error": "Forbidden",
-                    "status": 403,
-                });
-                return HttpResponse::new(403)
-                    .with_json(&body)
-                    .unwrap_or_else(|_| HttpResponse::new(403));
-            }
-            Err(GuardRejection::Error(err)) => {
-                warn!(method = %method, path = %path, error = %err, "Guard returned an error");
-                return respond_to_error(err, filter_ctx_request, state.filter_chain.clone()).await;
-            }
-        }
-    }
-
-    // Route the request
     debug!(method = %method, path = %path, "Routing request");
-    let response = match state.router.route(armature_req).await {
+    let outcome = match &state.middleware {
+        None => guarded_route(&state.guards, &state.router, armature_req, resolution).await,
+        Some(chain) => {
+            let guards = Arc::clone(&state.guards);
+            let router = Arc::clone(&state.router);
+            let terminal: crate::middleware::HandlerFn = Arc::new(move |req| {
+                let guards = Arc::clone(&guards);
+                let router = Arc::clone(&router);
+                Box::pin(
+                    async move { guarded_route(&guards, &router, req, Resolution::Deferred).await },
+                )
+            });
+            chain.apply(armature_req, terminal).await
+        }
+    };
+
+    let response = match outcome {
         Ok(resp) => {
             debug!(method = %method, path = %path, status = resp.status, "Request handled successfully");
             resp
@@ -2333,6 +2901,32 @@ async fn dispatch_request(
     );
 
     response
+}
+
+/// Global guards, then the route (whose own layers run its scoped middleware
+/// and guards before the handler).
+async fn guarded_route(
+    guards: &[Arc<dyn Guard>],
+    router: &OptimizedRouter,
+    request: HttpRequest,
+    resolution: Resolution,
+) -> Result<HttpResponse, Error> {
+    let request = match crate::routing::run_guards(guards, request).await? {
+        Ok(request) => request,
+        Err(forbidden) => {
+            warn!("Request rejected by a global guard");
+            return Ok(forbidden);
+        }
+    };
+    match resolution {
+        Resolution::Resolved(resolved) => router.dispatch(resolved, request).await,
+        Resolution::Deferred => router.route(request).await,
+        Resolution::NotFound => Err(Error::RouteNotFound(format!(
+            "{} {}",
+            request.method,
+            request.path_only()
+        ))),
+    }
 }
 
 /// Convert a handler error into a client-safe HTTP response.
@@ -2360,7 +2954,7 @@ const DEFAULT_EXCEPTION_FILTER_TIMEOUT: Duration = Duration::from_secs(5);
 /// [`error_response`].
 ///
 /// Both `filter_chain` and `ctx_request` are `None` unless a filter has
-/// actually been registered (see `handle_request`'s `filter_ctx_request`),
+/// actually been registered (see `dispatch_request`'s `filter_ctx_request`),
 /// so the fallback path is exercised for every request when no filter is
 /// configured -- identical to this framework's behavior before
 /// `use_global_filter` existed.
@@ -2471,44 +3065,6 @@ fn payload_too_large_response() -> HttpResponse {
     HttpResponse::new(413)
         .with_json(&body)
         .unwrap_or_else(|_| HttpResponse::new(413))
-}
-
-/// Reason a request was rejected while evaluating scoped guards.
-enum GuardRejection {
-    /// A guard rejected the request (`Ok(false)`) — respond with 403.
-    Reject,
-    /// A guard returned an error — respond with the error's client response.
-    Error(Error),
-}
-
-/// Evaluate the guards whose scope prefix matches `path`, in order.
-///
-/// Module guards are scoped to the base paths of the declaring module's own
-/// controllers (see [`Application::register_module`]); guards added via
-/// [`Application::with_guard`] use an empty prefix and match every path. Guards
-/// that do not match `path` are skipped entirely. Evaluation stops at the first
-/// guard that rejects or errors.
-///
-/// On success returns the (possibly guard-mutated) request so routing can
-/// continue; on rejection returns why the request was denied.
-async fn evaluate_scoped_guards(
-    guards: &[ScopedGuard],
-    path: &str,
-    request: HttpRequest,
-) -> Result<HttpRequest, GuardRejection> {
-    let matching: Vec<&ScopedGuard> = guards.iter().filter(|g| g.matches(path)).collect();
-    if matching.is_empty() {
-        return Ok(request);
-    }
-    let context = GuardContext::new(request);
-    for scoped in matching {
-        match scoped.guard.can_activate(&context).await {
-            Ok(true) => {}
-            Ok(false) => return Err(GuardRejection::Reject),
-            Err(err) => return Err(GuardRejection::Error(err)),
-        }
-    }
-    Ok(context.request)
 }
 
 /// The tests and decisions every response adapter owes, whichever transport it
@@ -2774,19 +3330,6 @@ pub(crate) mod response_wire {
     }
 }
 
-/// Convert our HttpResponse to a hyper Response, adding no CORS headers.
-///
-/// For a response that already carries every header it should — the CORS
-/// preflight answer, which sets the full preflight set itself and must not have
-/// the per-response `Allow-Origin` pair appended on top.
-fn to_hyper_response_raw(
-    response: HttpResponse,
-    method: &crate::Method,
-    path: &str,
-) -> Response<Full<bytes::Bytes>> {
-    to_hyper_response(response, None, method, path)
-}
-
 /// Convert our HttpResponse to a hyper Response, applying CORS headers.
 ///
 /// `method` and `path` are carried only so the fail-closed 500 below can name
@@ -2907,6 +3450,8 @@ fn unemittable_hyper_response(cors: Option<&CorsConfig>) -> Response<Full<bytes:
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::GuardContext;
+    use hyper::server::conn::http1;
 
     #[test]
     fn test_with_socket_tuning_stores_config() {
@@ -3334,73 +3879,6 @@ mod tests {
         }
     }
 
-    struct RecordingGuard {
-        ran: Arc<std::sync::atomic::AtomicBool>,
-    }
-    #[async_trait::async_trait]
-    impl Guard for RecordingGuard {
-        async fn can_activate(&self, _ctx: &GuardContext) -> Result<bool, Error> {
-            self.ran.store(true, std::sync::atomic::Ordering::SeqCst);
-            Ok(true)
-        }
-    }
-
-    #[test]
-    fn test_scoped_guard_matches_is_segment_aware() {
-        let g = ScopedGuard {
-            prefix: "/admin".to_string(),
-            guard: Arc::new(AllowGuard),
-        };
-        assert!(g.matches("/admin"));
-        assert!(g.matches("/admin/users"));
-        // Segment-aware: /administrators must NOT match /admin.
-        assert!(!g.matches("/administrators"));
-        assert!(!g.matches("/public"));
-
-        // Empty prefix is a genuinely global guard.
-        let global = ScopedGuard {
-            prefix: String::new(),
-            guard: Arc::new(AllowGuard),
-        };
-        assert!(global.matches("/anything"));
-        assert!(global.matches("/"));
-
-        // A "/" prefix is also global.
-        let root = ScopedGuard {
-            prefix: "/".to_string(),
-            guard: Arc::new(AllowGuard),
-        };
-        assert!(root.matches("/anything"));
-    }
-
-    #[tokio::test]
-    async fn test_scoped_guard_runs_only_for_its_controller_path() {
-        let ran = Arc::new(std::sync::atomic::AtomicBool::new(false));
-        let guards = vec![ScopedGuard {
-            prefix: "/admin".to_string(),
-            guard: Arc::new(RecordingGuard { ran: ran.clone() }),
-        }];
-
-        // Matches /admin/x → guard runs.
-        let req = HttpRequest::new("GET", "/admin/x".to_string());
-        let decision = evaluate_scoped_guards(&guards, "/admin/x", req).await;
-        assert!(decision.is_ok());
-        assert!(ran.load(std::sync::atomic::Ordering::SeqCst));
-
-        // Does NOT match /public/y → guard is not evaluated.
-        ran.store(false, std::sync::atomic::Ordering::SeqCst);
-        let req = HttpRequest::new("GET", "/public/y".to_string());
-        let decision = evaluate_scoped_guards(&guards, "/public/y", req).await;
-        assert!(decision.is_ok());
-        assert!(!ran.load(std::sync::atomic::Ordering::SeqCst));
-
-        // /administrators must NOT match /admin → guard not evaluated.
-        ran.store(false, std::sync::atomic::Ordering::SeqCst);
-        let req = HttpRequest::new("GET", "/administrators".to_string());
-        let _ = evaluate_scoped_guards(&guards, "/administrators", req).await;
-        assert!(!ran.load(std::sync::atomic::Ordering::SeqCst));
-    }
-
     fn admin_guard_registration() -> crate::module::GuardRegistration {
         crate::module::GuardRegistration {
             type_id: std::any::TypeId::of::<AllowGuard>(),
@@ -3460,41 +3938,544 @@ mod tests {
     }
 
     #[test]
-    fn test_register_module_scopes_guard_to_controller_base_path() {
-        let container = Container::new();
-        let mut router = Router::new();
-        let mut guards: Vec<ScopedGuard> = Vec::new();
-        let mut visited = std::collections::HashSet::new();
-        Application::register_module(
-            &container,
-            &mut router,
-            &mut guards,
-            &mut visited,
-            &AdminModule,
-        );
-
-        assert_eq!(guards.len(), 1);
-        assert_eq!(guards[0].prefix, "/admin");
-        assert!(guards[0].matches("/admin/users"));
-        assert!(!guards[0].matches("/public"));
-    }
-
-    #[test]
     fn test_register_module_guard_without_controllers_is_inert() {
         let container = Container::new();
         let mut router = Router::new();
-        let mut guards: Vec<ScopedGuard> = Vec::new();
         let mut visited = std::collections::HashSet::new();
-        Application::register_module(
-            &container,
-            &mut router,
-            &mut guards,
-            &mut visited,
-            &GuardOnlyModule,
+        Application::register_module(&container, &mut router, &mut visited, &GuardOnlyModule)
+            .unwrap();
+
+        // No controllers, so no routes for the guard to bind to.
+        assert!(router.routes.is_empty());
+        // `AdminModule`'s registrar adds no routes either; registering it must
+        // still succeed.
+        let mut visited = std::collections::HashSet::new();
+        Application::register_module(&container, &mut router, &mut visited, &AdminModule).unwrap();
+    }
+
+    // ---- C1 / H5: module guards are bound to their routes -----------------
+
+    async fn ok_handler(_req: HttpRequest) -> Result<HttpResponse, Error> {
+        Ok(HttpResponse::ok().with_body(b"secret".to_vec()))
+    }
+
+    struct DenyGuard;
+
+    #[async_trait::async_trait]
+    impl Guard for DenyGuard {
+        async fn can_activate(&self, _ctx: &crate::GuardContext) -> Result<bool, Error> {
+            Ok(false)
+        }
+    }
+
+    fn deny_guard_registration() -> crate::module::GuardRegistration {
+        crate::module::GuardRegistration {
+            type_id: std::any::TypeId::of::<DenyGuard>(),
+            type_name: "DenyGuard",
+            factory: |_c| Ok(Arc::new(DenyGuard) as Arc<dyn Guard>),
+        }
+    }
+
+    /// `/admin` controller whose registrar adds `GET /admin/users`.
+    fn admin_routes_registration() -> crate::ControllerRegistration {
+        crate::ControllerRegistration {
+            type_id: std::any::TypeId::of::<u8>(),
+            type_name: "AdminController",
+            base_path: "/admin",
+            factory: |_c| Ok(Box::new(()) as Box<dyn std::any::Any + Send + Sync>),
+            route_registrar: |_c, r, _b| {
+                r.get("/admin/users", ok_handler);
+                Ok(())
+            },
+        }
+    }
+
+    /// Controller with a `:param` in its base path.
+    fn tenant_routes_registration() -> crate::ControllerRegistration {
+        crate::ControllerRegistration {
+            type_id: std::any::TypeId::of::<u16>(),
+            type_name: "TenantController",
+            base_path: "/tenants/:tenant",
+            factory: |_c| Ok(Box::new(()) as Box<dyn std::any::Any + Send + Sync>),
+            route_registrar: |_c, r, _b| {
+                r.get("/tenants/:tenant/users", ok_handler);
+                Ok(())
+            },
+        }
+    }
+
+    /// A public route registered by a module with no guards.
+    fn public_routes_registration() -> crate::ControllerRegistration {
+        crate::ControllerRegistration {
+            type_id: std::any::TypeId::of::<u32>(),
+            type_name: "PublicController",
+            base_path: "/administrators",
+            factory: |_c| Ok(Box::new(()) as Box<dyn std::any::Any + Send + Sync>),
+            route_registrar: |_c, r, _b| {
+                r.get("/administrators", ok_handler);
+                Ok(())
+            },
+        }
+    }
+
+    struct GuardedModule;
+    impl Module for GuardedModule {
+        fn providers(&self) -> Vec<crate::ProviderRegistration> {
+            vec![]
+        }
+        fn controllers(&self) -> Vec<crate::ControllerRegistration> {
+            vec![admin_routes_registration(), tenant_routes_registration()]
+        }
+        fn guards(&self) -> Vec<crate::module::GuardRegistration> {
+            vec![deny_guard_registration()]
+        }
+        fn imports(&self) -> Vec<Box<dyn Module>> {
+            vec![Box::new(PublicModule)]
+        }
+        fn exports(&self) -> Vec<std::any::TypeId> {
+            vec![]
+        }
+    }
+
+    struct PublicModule;
+    impl Module for PublicModule {
+        fn providers(&self) -> Vec<crate::ProviderRegistration> {
+            vec![]
+        }
+        fn controllers(&self) -> Vec<crate::ControllerRegistration> {
+            vec![public_routes_registration()]
+        }
+        fn imports(&self) -> Vec<Box<dyn Module>> {
+            vec![]
+        }
+        fn exports(&self) -> Vec<std::any::TypeId> {
+            vec![]
+        }
+    }
+
+    fn guarded_router() -> Router {
+        let container = Container::new();
+        let mut router = Router::new();
+        let mut visited = std::collections::HashSet::new();
+        Application::register_module(&container, &mut router, &mut visited, &GuardedModule)
+            .unwrap();
+        router
+    }
+
+    /// Drive one request through the shared pipeline every transport uses:
+    /// `admit` (canonicalization, early 404) then `dispatch_request`.
+    async fn through_pipeline(state: &ServeState, method: &str, target: &str) -> HttpResponse {
+        let mut req = HttpRequest::new(method, target.to_string());
+        match admit(&mut req, state).await {
+            Admission::Respond(response, _) => response,
+            Admission::Proceed(resolution) => {
+                dispatch_request(req, state, std::time::Instant::now(), resolution).await
+            }
+        }
+    }
+
+    /// The C1 regression: no spelling of a guarded path reaches the handler.
+    #[tokio::test]
+    async fn module_guards_cannot_be_bypassed_by_path_spelling() {
+        let state = ServeState::for_test(
+            Arc::new(OptimizedRouter::from_router(&guarded_router())),
+            DEFAULT_MAX_BODY_SIZE,
+        );
+        for (target, expected) in [
+            ("/admin/users", 403),
+            ("//admin/users", 403),
+            ("/admin//users", 403),
+            ("/admin/users/", 403),
+            ("/%61dmin/users", 403),
+            ("/./admin/users", 400),
+            ("/admin/../admin/users", 400),
+            ("/admin/%2e%2e/admin/users", 400),
+            ("/%2Fadmin/users", 400),
+            ("/admin%2Fusers", 400),
+            ("/admin\\users", 400),
+            // A base path with a `:param` is guarded too.
+            ("/tenants/acme/users", 403),
+            ("//tenants/acme/users", 403),
+        ] {
+            let response = through_pipeline(&state, "GET", target).await;
+            assert_eq!(response.status, expected, "{target}");
+            assert_ne!(
+                &response.body[..],
+                b"secret",
+                "{target} reached the handler"
+            );
+        }
+        // The guard is scoped to its own module's routes: a sibling path that
+        // merely shares the `/admin` prefix, registered by another module, is
+        // not guarded.
+        let response = through_pipeline(&state, "GET", "/administrators").await;
+        assert_eq!(response.status, 200);
+    }
+
+    fn failing_guard_registration() -> crate::module::GuardRegistration {
+        crate::module::GuardRegistration {
+            type_id: std::any::TypeId::of::<DenyGuard>(),
+            type_name: "BrokenGuard",
+            factory: |_c| Err(Error::Internal("dependency missing".to_string())),
+        }
+    }
+
+    struct BrokenGuardModule;
+    impl Module for BrokenGuardModule {
+        fn providers(&self) -> Vec<crate::ProviderRegistration> {
+            vec![]
+        }
+        fn controllers(&self) -> Vec<crate::ControllerRegistration> {
+            vec![admin_routes_registration()]
+        }
+        fn guards(&self) -> Vec<crate::module::GuardRegistration> {
+            vec![failing_guard_registration()]
+        }
+        fn imports(&self) -> Vec<Box<dyn Module>> {
+            vec![]
+        }
+        fn exports(&self) -> Vec<std::any::TypeId> {
+            vec![]
+        }
+    }
+
+    impl Default for BrokenGuardModule {
+        fn default() -> Self {
+            Self
+        }
+    }
+
+    /// H5: a guard that cannot be built must not leave its routes reachable.
+    #[tokio::test]
+    async fn a_failing_guard_factory_aborts_registration() {
+        let container = Container::new();
+        let mut router = Router::new();
+        let mut visited = std::collections::HashSet::new();
+        let err =
+            Application::register_module(&container, &mut router, &mut visited, &BrokenGuardModule)
+                .unwrap_err();
+        assert!(err.to_string().contains("BrokenGuard"), "{err}");
+        assert!(
+            router.routes.is_empty(),
+            "the module's controllers must not be registered without their guard"
         );
 
-        // No controllers to scope to → guard registers nothing.
-        assert!(guards.is_empty());
+        assert!(
+            Application::try_create::<BrokenGuardModule>()
+                .await
+                .is_err()
+        );
+    }
+
+    /// Records the order pipeline stages run in.
+    struct Stage(Arc<std::sync::Mutex<Vec<&'static str>>>, &'static str);
+
+    #[async_trait::async_trait]
+    impl crate::middleware::Middleware for Stage {
+        async fn handle(
+            &self,
+            req: HttpRequest,
+            next: crate::middleware::Next,
+        ) -> Result<HttpResponse, Error> {
+            self.0.lock().unwrap().push(self.1);
+            next(req).await
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl Guard for Stage {
+        async fn can_activate(&self, _ctx: &crate::GuardContext) -> Result<bool, Error> {
+            self.0.lock().unwrap().push(self.1);
+            Ok(true)
+        }
+    }
+
+    /// Middleware that plays an authentication layer: it attaches a verified
+    /// identity, which a guard then requires.
+    struct AttachIdentity;
+
+    #[async_trait::async_trait]
+    impl crate::middleware::Middleware for AttachIdentity {
+        async fn handle(
+            &self,
+            mut req: HttpRequest,
+            next: crate::middleware::Next,
+        ) -> Result<HttpResponse, Error> {
+            req.extensions
+                .insert(crate::guard::VerifiedIdentity::new("user-1"));
+            next(req).await
+        }
+    }
+
+    /// H5: NestJS order — global middleware → global guards → route guards →
+    /// handler — so an identity attached by middleware is visible to guards.
+    #[tokio::test]
+    async fn global_middleware_runs_before_global_and_route_guards() {
+        let log = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let mut router = Router::new();
+        router.get("/x", ok_handler);
+        let route_guards: Vec<Arc<dyn Guard>> = vec![
+            Arc::new(Stage(log.clone(), "route guard")),
+            Arc::new(crate::AuthenticationGuard),
+        ];
+        router.layer_routes(0..1, &[], &route_guards);
+
+        let app = Application::new(Container::new(), router)
+            .use_middleware(Stage(log.clone(), "global middleware"))
+            .use_middleware(AttachIdentity)
+            .with_guard(Arc::new(Stage(log.clone(), "global guard")));
+        let state = app.serve_state();
+
+        let response = through_pipeline(&state, "GET", "/x").await;
+        assert_eq!(response.status, 200);
+        assert_eq!(
+            *log.lock().unwrap(),
+            vec!["global middleware", "global guard", "route guard"]
+        );
+
+        // Without the identity middleware the same guard fails closed.
+        let mut router = Router::new();
+        router.get("/x", ok_handler);
+        router.layer_routes(
+            0..1,
+            &[],
+            &[Arc::new(crate::AuthenticationGuard) as Arc<dyn Guard>],
+        );
+        let state = Application::new(Container::new(), router).serve_state();
+        let response = through_pipeline(&state, "GET", "/x").await;
+        assert_eq!(response.status, 401);
+    }
+
+    /// Global middleware also sees requests that match no route.
+    #[tokio::test]
+    async fn global_middleware_runs_for_unmatched_routes() {
+        let log = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let state = Application::new(Container::new(), Router::new())
+            .use_middleware(Stage(log.clone(), "global middleware"))
+            .serve_state();
+        let response = through_pipeline(&state, "GET", "/nowhere").await;
+        assert_eq!(response.status, 404);
+        assert_eq!(*log.lock().unwrap(), vec!["global middleware"]);
+    }
+
+    /// With a global guard, an unauthenticated caller learns nothing about
+    /// which paths exist: the guard answers before the 404.
+    #[tokio::test]
+    async fn a_global_guard_answers_before_the_404() {
+        let state = Application::new(Container::new(), Router::new())
+            .with_guard(Arc::new(DenyGuard))
+            .serve_state();
+        let response = through_pipeline(&state, "GET", "/nowhere").await;
+        assert_eq!(response.status, 403);
+    }
+
+    /// H1: a real HTTP/2 client through the h2c listener, past the point the
+    /// keep-alive ping arms. Without a timer on the builder hyper panics
+    /// ("You must supply a timer.") on the first connection, which under
+    /// `panic = "abort"` is a one-packet process kill.
+    #[tokio::test]
+    async fn h2c_serves_a_real_client_past_the_keep_alive_ping() {
+        use http_body_util::{BodyExt, Empty};
+
+        let mut router = Router::new();
+        router.get("/ping", ok_handler);
+        let config = Http2Config {
+            keep_alive_interval: Some(Duration::from_millis(50)),
+            keep_alive_timeout: Duration::from_secs(5),
+            ..Http2Config::default()
+        };
+        let app = Application::new(Container::new(), router).with_http2_config(config);
+        let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(app.serve_h2c(listener, None));
+
+        let stream = tokio::net::TcpStream::connect(addr).await.unwrap();
+        let (mut sender, conn) = hyper::client::conn::http2::handshake(
+            hyper_util::rt::TokioExecutor::new(),
+            TokioIo::new(stream),
+        )
+        .await
+        .expect("h2 handshake");
+        tokio::spawn(conn);
+
+        for _ in 0..3 {
+            let request = Request::get("http://localhost/ping")
+                .body(Empty::<Bytes>::new())
+                .unwrap();
+            let response =
+                tokio::time::timeout(Duration::from_secs(5), sender.send_request(request))
+                    .await
+                    .expect("answered within 5s")
+                    .expect("the h2 connection survived");
+            assert_eq!(response.status(), 200);
+            let body = response.into_body().collect().await.unwrap().to_bytes();
+            assert_eq!(&body[..], b"secret");
+            // Long enough for several keep-alive pings to be scheduled.
+            tokio::time::sleep(Duration::from_millis(150)).await;
+        }
+    }
+
+    // ---- H2: HTTP/3 goes through the shared pipeline ------------------------
+
+    #[cfg(feature = "http3")]
+    async fn echo_body_handler(req: HttpRequest) -> Result<HttpResponse, Error> {
+        Ok(HttpResponse::ok().with_body(req.body.to_vec()))
+    }
+
+    #[cfg(feature = "http3")]
+    async fn h3_dispatch(
+        state: &ServeState,
+        target: &str,
+        chunks: Vec<&'static [u8]>,
+    ) -> Response<Full<Bytes>> {
+        let request = HttpRequest::new("POST", target.to_string());
+        let mut chunks = chunks.into_iter();
+        dispatch_via_h3(
+            request,
+            move |_cx| {
+                Poll::Ready(
+                    chunks
+                        .next()
+                        .map(|c| Ok::<_, std::io::Error>(Bytes::from_static(c))),
+                )
+            },
+            state,
+        )
+        .await
+    }
+
+    #[cfg(feature = "http3")]
+    #[tokio::test]
+    async fn http3_requests_go_through_global_and_route_guards() {
+        // Route-bound (module) guard.
+        let state = ServeState::for_test(
+            Arc::new(OptimizedRouter::from_router(&guarded_router())),
+            DEFAULT_MAX_BODY_SIZE,
+        );
+        let mut get = HttpRequest::new("GET", "//admin/users".to_string());
+        get.headers.insert("x", "y");
+        let response = dispatch_via_h3(
+            get,
+            |_cx| Poll::Ready(None::<Result<Bytes, std::io::Error>>),
+            &state,
+        )
+        .await;
+        assert_eq!(response.status(), 403);
+
+        // Global guard.
+        let mut router = Router::new();
+        router.post("/echo", echo_body_handler);
+        let state = ServeState::for_test(
+            Arc::new(OptimizedRouter::from_router(&router)),
+            DEFAULT_MAX_BODY_SIZE,
+        )
+        .with_guard_for_test(Arc::new(DenyGuard));
+        assert_eq!(h3_dispatch(&state, "/echo", vec![]).await.status(), 403);
+    }
+
+    #[cfg(feature = "http3")]
+    #[tokio::test]
+    async fn http3_bodies_arrive_whole_and_capped() {
+        use http_body_util::BodyExt;
+
+        let mut router = Router::new();
+        router.post("/echo", echo_body_handler);
+        let state = ServeState::for_test(Arc::new(OptimizedRouter::from_router(&router)), 8)
+            .with_cors_for_test(CorsConfig::new("https://example.test"));
+
+        let response = h3_dispatch(&state, "/echo", vec![b"ab", b"cd", b"ef"]).await;
+        assert_eq!(response.status(), 200);
+        assert_eq!(
+            response
+                .headers()
+                .get("access-control-allow-origin")
+                .unwrap(),
+            "https://example.test",
+            "HTTP/3 responses get the configured CORS headers"
+        );
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        assert_eq!(&body[..], b"abcdef");
+
+        let response = h3_dispatch(&state, "/echo", vec![b"0123", b"45678"]).await;
+        assert_eq!(response.status(), 413);
+    }
+
+    // ---- L1: the HTTP→HTTPS redirect ---------------------------------------
+
+    #[test]
+    fn the_redirect_names_only_allowlisted_hosts_and_keeps_the_query() {
+        let target = RedirectTarget {
+            hosts: vec!["example.com".to_string(), "[::1]".to_string()],
+            https_port: 443,
+        };
+        assert_eq!(
+            redirect_location(&target, Some("Example.COM:80"), "/a/b?x=1&y=2").as_deref(),
+            Some("https://example.com/a/b?x=1&y=2")
+        );
+        assert_eq!(
+            redirect_location(&target, Some("[::1]:8080"), "/").as_deref(),
+            Some("https://[::1]/")
+        );
+        // No Host (HTTP/1.0): the canonical host.
+        assert_eq!(
+            redirect_location(&target, None, "/p").as_deref(),
+            Some("https://example.com/p")
+        );
+        // Anything else is refused rather than echoed into Location.
+        for host in [
+            "evil.example",
+            "example.com.evil.example",
+            "example.com@evil.example",
+            "example.com:notaport",
+            "[::1",
+            "",
+        ] {
+            assert_eq!(redirect_location(&target, Some(host), "/"), None, "{host}");
+        }
+
+        let target = RedirectTarget {
+            hosts: vec!["example.com".to_string()],
+            https_port: 8443,
+        };
+        assert_eq!(
+            redirect_location(&target, Some("example.com"), "/x?q").as_deref(),
+            Some("https://example.com:8443/x?q")
+        );
+    }
+
+    #[cfg(feature = "self-signed-certs")]
+    #[tokio::test]
+    async fn listen_with_config_refuses_a_redirect_without_allowed_hosts() {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let Ok(tls) = crate::TlsConfig::self_signed(&["localhost"]) else {
+            return;
+        };
+        let config = HttpsConfig::new("127.0.0.1:0", tls).with_http_redirect("127.0.0.1:0");
+        let err = Application::new(Container::new(), Router::new())
+            .listen_with_config(config)
+            .await
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("with_https_redirect_hosts"),
+            "{err}"
+        );
+    }
+
+    /// The canonical path, not the raw one, is what handlers see.
+    #[tokio::test]
+    async fn the_handler_sees_the_canonical_target_with_its_query() {
+        async fn echo_target(req: HttpRequest) -> Result<HttpResponse, Error> {
+            Ok(HttpResponse::ok().with_body(req.path.as_bytes().to_vec()))
+        }
+        let mut router = Router::new();
+        router.get("/a/b", echo_target);
+        let state = ServeState::for_test(
+            Arc::new(OptimizedRouter::from_router(&router)),
+            DEFAULT_MAX_BODY_SIZE,
+        );
+        let response = through_pipeline(&state, "GET", "//a//%62?x=%2F..").await;
+        assert_eq!(response.status, 200);
+        assert_eq!(&response.body[..], b"/a/b?x=%2F..");
     }
 
     // ---- register_module dedups by concrete module type, not the erased
@@ -3614,15 +4595,9 @@ mod tests {
     fn test_register_module_registers_all_distinct_imported_modules() {
         let container = Container::new();
         let mut router = Router::new();
-        let mut guards: Vec<ScopedGuard> = Vec::new();
         let mut visited = std::collections::HashSet::new();
-        Application::register_module(
-            &container,
-            &mut router,
-            &mut guards,
-            &mut visited,
-            &DistinctRootModule,
-        );
+        Application::register_module(&container, &mut router, &mut visited, &DistinctRootModule)
+            .unwrap();
 
         assert!(
             container.has::<DistinctProviderA>(),
@@ -3726,15 +4701,9 @@ mod tests {
     fn test_register_module_diamond_import_registers_shared_module_once() {
         let container = Container::new();
         let mut router = Router::new();
-        let mut guards: Vec<ScopedGuard> = Vec::new();
         let mut visited = std::collections::HashSet::new();
-        Application::register_module(
-            &container,
-            &mut router,
-            &mut guards,
-            &mut visited,
-            &DiamondRootModule,
-        );
+        Application::register_module(&container, &mut router, &mut visited, &DiamondRootModule)
+            .unwrap();
 
         assert!(
             container.has::<SharedDiamondProvider>(),
@@ -3960,8 +4929,7 @@ mod tests {
         let app =
             Application::new(Container::new(), Router::new()).with_guard(Arc::new(AllowGuard));
         assert_eq!(app.guards.len(), 1);
-        assert!(app.guards[0].prefix.is_empty());
-        assert!(app.guards[0].matches("/any/path"));
+        assert_eq!(app.serve_state().guards.len(), 1);
     }
 
     // ---- Application::create wires lifecycle hooks (Finding 1) ------------
@@ -4129,18 +5097,12 @@ mod tests {
             ),
         );
 
-        let state = ServeState {
-            router: Arc::new(OptimizedRouter::from_router(&Router::new())),
-            cors: None,
-            guards: vec![ScopedGuard {
-                prefix: String::new(),
-                guard: Arc::new(AlwaysNotFoundGuard),
-            }]
-            .into(),
-            max_body_size: DEFAULT_MAX_BODY_SIZE,
-            filter_chain: Some(filter_chain),
-            peer: None,
-        };
+        let mut state = ServeState::for_test(
+            Arc::new(OptimizedRouter::from_router(&Router::new())),
+            DEFAULT_MAX_BODY_SIZE,
+        )
+        .with_guard_for_test(Arc::new(AlwaysNotFoundGuard));
+        state.filter_chain = Some(filter_chain);
 
         let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
         let addr = listener.local_addr().unwrap();
@@ -4218,16 +5180,13 @@ mod tests {
         let mut router = Router::new();
         router.get("/broken", always_erroring_handler);
 
-        let state = ServeState {
-            router: Arc::new(OptimizedRouter::from_router(&router)),
-            cors: None,
-            // No guards at all: this response must come from the router's
-            // handler-error path, not guard rejection.
-            guards: Vec::new().into(),
-            max_body_size: DEFAULT_MAX_BODY_SIZE,
-            filter_chain: Some(filter_chain),
-            peer: None,
-        };
+        // No guards at all: this response must come from the router's
+        // handler-error path, not guard rejection.
+        let mut state = ServeState::for_test(
+            Arc::new(OptimizedRouter::from_router(&router)),
+            DEFAULT_MAX_BODY_SIZE,
+        );
+        state.filter_chain = Some(filter_chain);
 
         let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
         let addr = listener.local_addr().unwrap();

@@ -427,27 +427,52 @@ impl Http3Stats {
 #[cfg(feature = "http3")]
 mod server {
     use super::*;
+    use crate::application::{ServeState, dispatch_via_h3};
     use crate::{Error, HttpRequest, route_cache::OptimizedRouter};
     use bytes::{Buf, Bytes};
     use h3_quinn::quinn;
     use http::Response;
+    use http_body_util::BodyExt;
     use std::sync::Arc;
+    use std::task::Poll;
     use tracing::{debug, error, info};
 
     /// HTTP/3 Server
+    ///
+    /// Every request goes through the same pipeline as the TCP transports —
+    /// path canonicalization, global middleware and guards, route-scoped
+    /// guards, CORS, body limits, the slow-body policy and exception filters —
+    /// so serving a route over QUIC is never a way around its protection.
     pub struct Http3Server {
         config: Http3Config,
         stats: Arc<Http3Stats>,
-        router: Arc<OptimizedRouter>,
+        state: ServeState,
     }
 
     impl Http3Server {
-        /// Create a new HTTP/3 server
+        /// Create a standalone HTTP/3 server for `router`.
+        ///
+        /// Route-scoped guards and middleware bound to the router's routes are
+        /// enforced; there are no global guards, middleware, CORS or filters.
+        /// `Application::listen_h3` builds the server from the application's
+        /// full serve state instead.
         pub fn new(config: Http3Config, router: Arc<OptimizedRouter>) -> Self {
+            let state = ServeState::for_router(router, config.max_request_body_size);
             Self {
                 config,
                 stats: Arc::new(Http3Stats::new()),
-                router,
+                state,
+            }
+        }
+
+        /// A server sharing an application's serve state. The body cap is the
+        /// smaller of the application's and `config.max_request_body_size`.
+        pub(crate) fn from_state(config: Http3Config, state: ServeState) -> Self {
+            let state = state.with_max_body_size_at_most(config.max_request_body_size);
+            Self {
+                config,
+                stats: Arc::new(Http3Stats::new()),
+                state,
             }
         }
 
@@ -496,16 +521,12 @@ mod server {
 
             info!(address = %addr, "HTTP/3 server listening (QUIC/UDP)");
 
-            let max_request_body_size = self.config.max_request_body_size;
-
             while let Some(incoming) = endpoint.accept().await {
                 let stats = Arc::clone(&self.stats);
-                let router = Arc::clone(&self.router);
+                let state = self.state.clone();
 
                 tokio::spawn(async move {
-                    if let Err(e) =
-                        handle_connection(incoming, router, stats, max_request_body_size).await
-                    {
+                    if let Err(e) = handle_connection(incoming, state, stats).await {
                         error!(error = %e, "HTTP/3 connection error");
                     }
                 });
@@ -555,9 +576,8 @@ mod server {
     /// Handle a single QUIC connection
     async fn handle_connection(
         incoming: quinn::Incoming,
-        router: Arc<OptimizedRouter>,
+        state: ServeState,
         stats: Arc<Http3Stats>,
-        max_request_body_size: usize,
     ) -> Result<(), Error> {
         // Accept the connection. When the server config advertises early data
         // (0-RTT enabled), `into_0rtt` succeeds and lets the peer send early
@@ -586,6 +606,9 @@ mod server {
         stats.connection_opened();
         let remote_addr = conn.remote_address();
         debug!(client = %remote_addr, "HTTP/3 connection established");
+        // Known here and nowhere downstream: QUIC gives the address on the
+        // connection, and a stream has no notion of one.
+        let state = state.for_peer(remote_addr);
 
         // Create HTTP/3 connection
         let mut h3_conn = h3::server::Connection::new(h3_quinn::Connection::new(conn))
@@ -597,22 +620,11 @@ mod server {
             match h3_conn.accept().await {
                 Ok(Some(resolver)) => {
                     stats.stream_created();
-                    let router = Arc::clone(&router);
+                    let state = state.clone();
                     let stats = Arc::clone(&stats);
 
                     tokio::spawn(async move {
-                        if let Err(e) = handle_request_resolver(
-                            resolver,
-                            router,
-                            stats,
-                            max_request_body_size,
-                            // Known here and nowhere downstream: QUIC gives
-                            // the address on the connection, and a stream
-                            // has no notion of one.
-                            Some(remote_addr),
-                        )
-                        .await
-                        {
+                        if let Err(e) = handle_request_resolver(resolver, state, stats).await {
                             error!(error = %e, "HTTP/3 request error");
                         }
                     });
@@ -661,22 +673,35 @@ mod server {
         // Copy headers. One copy per value, because `HeaderValue` owns its own
         // buffer; the name goes in as a `&str`, so a well-known header name
         // costs nothing.
+        //
+        // `append`, not `insert`, for the reason `handle_request` gives: a
+        // repeated field (`X-Forwarded-For`) must reach the policy above with
+        // every occurrence, the same over QUIC as over TCP.
         for (name, value) in request.headers() {
             armature_req
                 .headers
-                .insert(name.as_str(), Bytes::copy_from_slice(value.as_bytes()));
+                .append(name.as_str(), Bytes::copy_from_slice(value.as_bytes()));
         }
 
         armature_req
     }
 
+    /// Every byte of a received DATA chunk.
+    ///
+    /// A `Buf` may span several non-contiguous slices; `chunk()` returns only
+    /// the first, so reading it alone silently truncated bodies — a signature
+    /// computed by a proxy over the full body would then disagree with the
+    /// bytes the handler saw.
+    pub(super) fn buf_to_bytes(mut buf: impl Buf) -> Bytes {
+        let remaining = buf.remaining();
+        buf.copy_to_bytes(remaining)
+    }
+
     /// Handle a request using the RequestResolver API (h3 0.0.8+)
     async fn handle_request_resolver(
         resolver: h3::server::RequestResolver<h3_quinn::Connection, Bytes>,
-        router: Arc<OptimizedRouter>,
+        state: ServeState,
         stats: Arc<Http3Stats>,
-        max_request_body_size: usize,
-        peer: Option<SocketAddr>,
     ) -> Result<(), Error> {
         // Resolve the request to get the request and stream
         let (request, mut stream) = resolver
@@ -686,67 +711,30 @@ mod server {
 
         stats.request_processed();
 
-        // Convert to Armature request, including percent-decoded query
-        // parameters (see `build_armature_request`).
-        let mut armature_req = build_armature_request(&request, peer);
+        let armature_req = build_armature_request(&request, state.peer());
 
-        // Read body if present (using Buf trait), enforcing the configured size limit
-        let mut body: Vec<u8> = Vec::new();
-        let mut payload_too_large = false;
-        while let Some(chunk) = stream
-            .recv_data()
-            .await
-            .map_err(|e| Error::Internal(format!("Failed to read body: {}", e)))?
-        {
-            let data = chunk.chunk();
-            if body.len() + data.len() > max_request_body_size {
-                payload_too_large = true;
-                break;
-            }
-            body.extend_from_slice(data);
-        }
+        // The shared pipeline: canonical path, preflight, declared length,
+        // early 404, body read under the cap and the slow-body policy, then
+        // middleware → guards → route, with the same response rules (CORS,
+        // fail-closed headers) as the TCP transports.
+        let response = dispatch_via_h3(
+            armature_req,
+            |cx| match stream.poll_recv_data(cx) {
+                Poll::Pending => Poll::Pending,
+                Poll::Ready(Ok(Some(buf))) => Poll::Ready(Some(Ok(buf_to_bytes(buf)))),
+                Poll::Ready(Ok(None)) => Poll::Ready(None),
+                Poll::Ready(Err(e)) => Poll::Ready(Some(Err(e))),
+            },
+            &state,
+        )
+        .await;
 
-        // Reject oversized requests with 413 Payload Too Large
-        if payload_too_large {
-            let http_response: http::Response<()> = Response::builder()
-                .status(413)
-                .body(())
-                .map_err(|e| Error::Internal(format!("Failed to build response: {}", e)))?;
-            stream
-                .send_response(http_response)
-                .await
-                .map_err(|e| Error::Internal(format!("Failed to send response: {}", e)))?;
-            stream
-                .finish()
-                .await
-                .map_err(|e| Error::Internal(format!("Failed to finish stream: {}", e)))?;
-            stats.stream_closed();
-            return Ok(());
-        }
-        // `Bytes::from` takes over the accumulator's allocation rather than copying.
-        armature_req.body = Bytes::from(body);
-
-        // Route the request using the async router. A routing error is mapped
-        // through the canonical client-safe response so HTTP/3 returns proper
-        // 404/400/403 (etc.) with a JSON body, matching HTTP/1 and HTTP/2 —
-        // rather than collapsing every error to a bare 500. 5xx messages are
-        // still redacted by `to_client_response`.
-        let response = match router.route(armature_req).await {
-            Ok(resp) => resp,
-            Err(err) => err.to_client_response(),
+        let (parts, body) = response.into_parts();
+        let body = match body.collect().await {
+            Ok(collected) => collected.to_bytes(),
+            Err(never) => match never {},
         };
-
-        // Build HTTP/3 response, copying headers and cookies
-        let mut builder = Response::builder().status(response.status);
-        for (name, value) in &response.headers {
-            builder = builder.header(name.as_str(), value.as_str());
-        }
-        for cookie in &response.cookies {
-            builder = builder.header("set-cookie", cookie.as_str());
-        }
-        let http_response: http::Response<()> = builder
-            .body(())
-            .map_err(|e| Error::Internal(format!("Failed to build response: {}", e)))?;
+        let http_response: http::Response<()> = Response::from_parts(parts, ());
 
         // Send response
         stream
@@ -754,8 +742,6 @@ mod server {
             .await
             .map_err(|e| Error::Internal(format!("Failed to send response: {}", e)))?;
 
-        // Send body (zero-copy when the handler stored it as Bytes)
-        let body = response.into_body_bytes();
         if !body.is_empty() {
             stream
                 .send_data(body)
@@ -953,6 +939,33 @@ mod tests {
             widened_transport.contains(&widened.initial_connection_receive_window.to_string()),
             "connection receive window must appear in the applied transport config"
         );
+    }
+
+    /// H2 regression: a DATA chunk spanning several slices is copied whole.
+    /// Reading only `chunk()` (the first contiguous slice) truncated it.
+    #[cfg(feature = "http3")]
+    #[test]
+    fn test_buf_to_bytes_copies_every_slice() {
+        use bytes::{Buf, Bytes};
+        let chained = Bytes::from_static(b"ab")
+            .chain(Bytes::from_static(b"cd"))
+            .chain(Bytes::from_static(b"ef"));
+        assert_eq!(chained.chunk(), b"ab", "the premise: several slices");
+        assert_eq!(&super::server::buf_to_bytes(chained)[..], b"abcdef");
+    }
+
+    /// Repeated header fields keep every occurrence over QUIC, as over TCP.
+    #[cfg(feature = "http3")]
+    #[test]
+    fn test_build_armature_request_keeps_repeated_headers() {
+        let request = http::Request::builder()
+            .uri("https://example.com/")
+            .header("x-forwarded-for", "198.51.100.9")
+            .header("x-forwarded-for", "203.0.113.7")
+            .body(())
+            .unwrap();
+        let armature_req = super::server::build_armature_request(&request, None);
+        assert_eq!(armature_req.headers.get_all("x-forwarded-for").len(), 2);
     }
 
     /// Regression: query strings must be parsed and percent-decoded on the

@@ -48,6 +48,16 @@ impl MiddlewareChain {
         self.middlewares = Arc::new(mws);
     }
 
+    /// The number of middleware in the chain.
+    pub fn len(&self) -> usize {
+        self.middlewares.len()
+    }
+
+    /// Whether the chain has no middleware.
+    pub fn is_empty(&self) -> bool {
+        self.middlewares.is_empty()
+    }
+
     /// Execute the middleware chain with a handler
     pub async fn apply(&self, req: HttpRequest, handler: HandlerFn) -> Result<HttpResponse, Error> {
         // Fast path: with no middleware there is no chain to build, so call the
@@ -59,7 +69,7 @@ impl MiddlewareChain {
 
         debug!(
             middleware_count = self.middlewares.len(),
-            path = %req.path,
+            path = %req.path_only(),
             method = %req.method,
             "Executing middleware chain"
         );
@@ -103,6 +113,13 @@ impl Default for MiddlewareChain {
 // ========== Built-in Middleware ==========
 
 /// CORS (Cross-Origin Resource Sharing) middleware
+///
+/// A single static `allow_origin`. `Access-Control-Allow-Credentials: true` is
+/// only ever sent alongside a **specific** origin: with the default wildcard
+/// (`*`) it is withheld even if [`allow_credentials`](Self::allow_credentials)
+/// is set, because that pair is invalid and browsers reject it. For a list of
+/// origins, reflection, or regex matching use `armature-security`'s CORS, or
+/// [`crate::micro::Cors`].
 pub struct CorsMiddleware {
     pub allow_origin: String,
     pub allow_methods: String,
@@ -152,8 +169,15 @@ impl Default for CorsMiddleware {
 #[async_trait]
 impl Middleware for CorsMiddleware {
     async fn handle(&self, req: HttpRequest, next: Next) -> Result<HttpResponse, Error> {
-        // Handle preflight requests
-        if req.method == "OPTIONS" {
+        // Credentials never go out with a wildcard origin.
+        let credentials = self.allow_credentials && self.allow_origin.trim() != "*";
+        // A preflight is `OPTIONS` + `Origin` + `Access-Control-Request-Method`
+        // (Fetch standard); any other `OPTIONS` is an ordinary request and is
+        // routed.
+        let is_preflight = req.method == "OPTIONS"
+            && req.headers.contains_key("origin")
+            && req.headers.contains_key("access-control-request-method");
+        if is_preflight {
             let mut headers = HashMap::new();
             headers.insert(
                 "Access-Control-Allow-Origin".to_string(),
@@ -172,7 +196,7 @@ impl Middleware for CorsMiddleware {
                 self.max_age.to_string(),
             );
 
-            if self.allow_credentials {
+            if credentials {
                 headers.insert(
                     "Access-Control-Allow-Credentials".to_string(),
                     "true".to_string(),
@@ -189,7 +213,7 @@ impl Middleware for CorsMiddleware {
             "Access-Control-Allow-Origin".to_string(),
             self.allow_origin.clone(),
         );
-        if self.allow_credentials {
+        if credentials {
             response.headers.insert(
                 "Access-Control-Allow-Credentials".to_string(),
                 "true".to_string(),
@@ -201,14 +225,18 @@ impl Middleware for CorsMiddleware {
 }
 
 /// Logging middleware
+///
+/// Logs the request **path only**: the query string is never written, since it
+/// routinely carries password-reset codes, OAuth `code`/`state`, API keys and
+/// other bearer secrets that must not land in shipped logs.
 pub struct LoggerMiddleware {
     /// Log the request body's *size* (`body_bytes`), not its contents.
     ///
     /// Request bodies routinely carry credentials, tokens and PII, and logs are
     /// shipped to places with a wider audience than the service itself, so only
     /// the byte count is recorded here. If you need to see the payload during
-    /// development, use [`RequestLoggerMiddleware`], which logs a truncated,
-    /// deliberately opt-in body preview.
+    /// development, use [`LoggingMiddleware::with_request_body`], which logs a
+    /// truncated, deliberately opt-in body preview.
     pub log_body: bool,
 }
 
@@ -222,7 +250,8 @@ impl LoggerMiddleware {
     /// This does not log the body's contents: bodies routinely carry
     /// credentials, tokens and PII, and logs are shipped to places with a wider
     /// audience than the service itself, so the size is logged instead. For a
-    /// truncated preview of the actual payload, use [`RequestLoggerMiddleware`].
+    /// truncated preview of the actual payload, use
+    /// [`LoggingMiddleware::with_request_body`].
     pub fn with_body(mut self) -> Self {
         self.log_body = true;
         self
@@ -240,7 +269,8 @@ impl Middleware for LoggerMiddleware {
     async fn handle(&self, req: HttpRequest, next: Next) -> Result<HttpResponse, Error> {
         let start = std::time::Instant::now();
         let method = req.method.clone();
-        let path = req.path.clone();
+        // Path only: the query string can carry secrets (see the type docs).
+        let path = req.path_only().to_owned();
 
         if self.log_body && !req.body.is_empty() {
             info!(
@@ -468,6 +498,8 @@ impl Middleware for CompressionMiddleware {
 ///
 /// Automatically logs HTTP requests and responses with configurable detail level.
 /// Logs include method, path, status code, duration, and optional request/response bodies.
+/// The path is logged without its query string, which routinely carries secrets
+/// (reset codes, OAuth `code`, API keys).
 ///
 /// # Examples
 ///
@@ -528,7 +560,8 @@ impl Middleware for LoggingMiddleware {
 
         let start = Instant::now();
         let method = req.method.clone();
-        let path = req.path.clone();
+        // Path only: the query string can carry secrets (see the type docs).
+        let path = req.path_only().to_owned();
 
         // Log request
         if self.log_request_body && !req.body.is_empty() {
@@ -611,6 +644,95 @@ impl Middleware for LoggingMiddleware {
 mod tests {
     use super::*;
     use bytes::Bytes;
+
+    /// H7: the legacy CORS middleware never pairs `*` with credentials.
+    #[tokio::test]
+    async fn cors_middleware_withholds_credentials_from_a_wildcard() {
+        let cors = CorsMiddleware::new().allow_credentials(true);
+        let next: Next = Box::new(|_req| Box::pin(async { Ok(HttpResponse::ok()) }));
+        let response = cors
+            .handle(HttpRequest::new("GET", "/x".to_string()), next)
+            .await
+            .unwrap();
+        assert_eq!(
+            response
+                .headers
+                .get("Access-Control-Allow-Origin")
+                .map(String::as_str),
+            Some("*")
+        );
+        assert!(
+            !response
+                .headers
+                .contains_key("Access-Control-Allow-Credentials")
+        );
+
+        let cors = CorsMiddleware::new()
+            .allow_origin("https://app.example")
+            .allow_credentials(true);
+        let next: Next = Box::new(|_req| Box::pin(async { Ok(HttpResponse::ok()) }));
+        let response = cors
+            .handle(HttpRequest::new("GET", "/x".to_string()), next)
+            .await
+            .unwrap();
+        assert_eq!(
+            response
+                .headers
+                .get("Access-Control-Allow-Credentials")
+                .map(String::as_str),
+            Some("true")
+        );
+    }
+
+    /// A shared buffer the log subscriber writes into.
+    #[derive(Clone, Default)]
+    struct LogSink(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+
+    impl std::io::Write for LogSink {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// M8: neither logging middleware writes the query string, which carries
+    /// reset codes, OAuth `code`s and API keys.
+    #[tokio::test]
+    async fn logging_middleware_never_logs_the_query_string() {
+        let sink = LogSink::default();
+        let writer = sink.clone();
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(move || writer.clone())
+            .with_max_level(tracing::Level::TRACE)
+            .with_ansi(false)
+            .finish();
+        let _guard = tracing::subscriber::set_default(subscriber);
+
+        let target = "/reset?token=SECRET-RESET-CODE&code=SECRET-OAUTH";
+        let next: Next = Box::new(|_req| Box::pin(async { Ok(HttpResponse::ok()) }));
+        LoggerMiddleware::new()
+            .handle(HttpRequest::new("GET", target.to_string()), next)
+            .await
+            .unwrap();
+        let next: Next = Box::new(|_req| Box::pin(async { Ok(HttpResponse::ok()) }));
+        LoggingMiddleware::new()
+            .handle(HttpRequest::new("GET", target.to_string()), next)
+            .await
+            .unwrap();
+
+        let logged = String::from_utf8(sink.0.lock().unwrap().clone()).unwrap();
+        assert!(
+            logged.contains("/reset"),
+            "the path is still logged: {logged}"
+        );
+        assert!(
+            !logged.contains("SECRET"),
+            "a query secret was logged: {logged}"
+        );
+    }
 
     #[tokio::test]
     async fn test_middleware_chain() {

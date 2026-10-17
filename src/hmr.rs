@@ -23,6 +23,22 @@
 //! The accept loop is aborted when [`HmrManager::stop`] is called or the
 //! manager is dropped, and events can also be published manually with
 //! [`HmrManager::publish`].
+//!
+//! ## Security
+//!
+//! Binding to loopback does not keep other origins out: any web page the
+//! developer visits can open `ws://localhost:…` (cross-site WebSocket
+//! hijacking) and read the stream of changed file paths. So the upgrade is
+//! refused unless
+//!
+//! - it carries the manager's random per-process **token** (embedded in the
+//!   injected client script, see [`HmrManager::token`]), and
+//! - its `Origin` is a loopback origin (`http(s)://localhost`, `127.0.0.1`,
+//!   `[::1]`, any port) or one listed with [`HmrConfig::allow_origin`].
+//!
+//! HMR is a development tool: [`HmrManager::start_websocket_server`] refuses
+//! to start in a release build (`debug_assertions` off) unless
+//! [`HmrConfig::allow_in_release`] is set explicitly.
 
 use crate::Error;
 use futures_util::{SinkExt, StreamExt};
@@ -85,6 +101,15 @@ pub struct HmrConfig {
 
     /// Enable verbose logging
     pub verbose: bool,
+
+    /// Extra origins allowed to open the HMR WebSocket, besides loopback
+    /// origins (which are always allowed). Compared ASCII case-insensitively
+    /// against the full `Origin` value, e.g. `"http://dev.example.test:8080"`.
+    pub allowed_origins: Vec<String>,
+
+    /// Allow the WebSocket server to start in a release build. `false` by
+    /// default so a dev-only feature cannot ship enabled by accident.
+    pub allow_in_release: bool,
 }
 
 impl Default for HmrConfig {
@@ -114,6 +139,8 @@ impl Default for HmrConfig {
             debounce_ms: 100,
             websocket_port: 3001,
             verbose: false,
+            allowed_origins: Vec::new(),
+            allow_in_release: false,
         }
     }
 }
@@ -159,6 +186,77 @@ impl HmrConfig {
         self.verbose = enabled;
         self
     }
+
+    /// Allow `origin` (besides loopback origins) to open the HMR WebSocket.
+    pub fn allow_origin(mut self, origin: impl Into<String>) -> Self {
+        self.allowed_origins.push(origin.into());
+        self
+    }
+
+    /// Permit the HMR WebSocket server in a release build. Only for a
+    /// deliberately-built development binary; never for production.
+    pub fn allow_in_release(mut self, allow: bool) -> Self {
+        self.allow_in_release = allow;
+        self
+    }
+}
+
+/// Whether the HMR server may start, given the build profile.
+fn release_gate(allow_in_release: bool, is_release_build: bool) -> Result<(), Error> {
+    if is_release_build && !allow_in_release {
+        return Err(Error::Internal(
+            "HMR is a development feature and is disabled in release builds; \
+             set HmrConfig::allow_in_release(true) to override"
+                .to_string(),
+        ));
+    }
+    Ok(())
+}
+
+/// Whether `origin` is a loopback origin: `http`/`https` with host
+/// `localhost`, `127.0.0.1` or `[::1]`, and an optional port.
+fn is_loopback_origin(origin: &str) -> bool {
+    let Some(rest) = origin
+        .strip_prefix("http://")
+        .or_else(|| origin.strip_prefix("https://"))
+    else {
+        return false;
+    };
+    let (host, port) = if let Some(after) = rest.strip_prefix("[::1]") {
+        ("[::1]", after)
+    } else {
+        match rest.find(':') {
+            Some(i) => (&rest[..i], &rest[i..]),
+            None => (rest, ""),
+        }
+    };
+    let port_ok = port.is_empty()
+        || port
+            .strip_prefix(':')
+            .is_some_and(|p| !p.is_empty() && p.parse::<u16>().is_ok());
+    port_ok && (host.eq_ignore_ascii_case("localhost") || host == "127.0.0.1" || host == "[::1]")
+}
+
+/// Whether an HMR upgrade request may proceed: the right token, from an
+/// allowed origin.
+fn upgrade_allowed(
+    query: Option<&str>,
+    origin: Option<&str>,
+    token: &str,
+    allowed_origins: &[String],
+) -> bool {
+    let token_ok = query
+        .into_iter()
+        .flat_map(|q| q.split('&'))
+        .filter_map(|pair| pair.strip_prefix("token="))
+        .any(|candidate| crate::crypto::constant_time_eq(candidate.as_bytes(), token.as_bytes()));
+    let origin_ok = origin.is_some_and(|origin| {
+        is_loopback_origin(origin)
+            || allowed_origins
+                .iter()
+                .any(|allowed| allowed.eq_ignore_ascii_case(origin))
+    });
+    token_ok && origin_ok
 }
 
 /// HMR Manager - Coordinates file watching and client notifications
@@ -168,6 +266,8 @@ pub struct HmrManager {
     client_count: Arc<AtomicUsize>,
     last_events: Arc<RwLock<HashMap<PathBuf, std::time::SystemTime>>>,
     server_handle: std::sync::Mutex<Option<JoinHandle<()>>>,
+    /// Random per-manager secret the client must present to connect.
+    token: String,
 }
 
 impl HmrManager {
@@ -181,7 +281,17 @@ impl HmrManager {
             client_count: Arc::new(AtomicUsize::new(0)),
             last_events: Arc::new(RwLock::new(HashMap::new())),
             server_handle: std::sync::Mutex::new(None),
+            // 122 random bits from the OS CSPRNG.
+            token: uuid::Uuid::new_v4().simple().to_string(),
         }
+    }
+
+    /// The secret a client must send (`?token=…`) to open the HMR WebSocket.
+    ///
+    /// Embedded in [`get_client_script`](Self::get_client_script); a page on
+    /// another origin cannot read it, so it cannot connect.
+    pub fn token(&self) -> &str {
+        &self.token
     }
 
     /// Start watching for file changes
@@ -335,7 +445,7 @@ impl HmrManager {
   const maxReconnectAttempts = 10;
 
   function connect() {{
-    ws = new WebSocket('ws://localhost:{}');
+    ws = new WebSocket('ws://localhost:{}/?token={}');
 
     ws.onopen = function() {{
       console.log('🔥 HMR Connected');
@@ -384,7 +494,7 @@ impl HmrManager {
   connect();
 }})();
 </script>"#,
-            self.config.websocket_port
+            self.config.websocket_port, self.token
         )
     }
 
@@ -399,8 +509,17 @@ impl HmrManager {
     /// Returns the actual bound port. The accept loop runs until [`stop`] is
     /// called or the manager is dropped.
     ///
+    /// An upgrade without the manager's [`token`](Self::token) or from a
+    /// non-allowed `Origin` is refused with `403` (see the module docs).
+    ///
+    /// # Errors
+    ///
+    /// In a release build, fails unless [`HmrConfig::allow_in_release`] is set.
+    ///
     /// [`stop`]: HmrManager::stop
     pub async fn start_websocket_server(&self) -> Result<u16, Error> {
+        release_gate(self.config.allow_in_release, !cfg!(debug_assertions))?;
+
         let listener = TcpListener::bind(("127.0.0.1", self.config.websocket_port))
             .await
             .map_err(|e| Error::Internal(format!("HMR WebSocket bind failed: {}", e)))?;
@@ -416,6 +535,8 @@ impl HmrManager {
         let event_tx = self.event_tx.clone();
         let client_count = self.client_count.clone();
         let verbose = self.config.verbose;
+        let token: Arc<str> = Arc::from(self.token.as_str());
+        let allowed_origins: Arc<[String]> = self.config.allowed_origins.clone().into();
 
         let handle = tokio::spawn(async move {
             loop {
@@ -433,8 +554,26 @@ impl HmrManager {
                 // the handshake window is missed.
                 let rx = event_tx.subscribe();
                 let client_count = client_count.clone();
+                let token = Arc::clone(&token);
+                let allowed_origins = Arc::clone(&allowed_origins);
 
                 tokio::spawn(async move {
+                    use tokio_tungstenite::tungstenite::handshake::server::{
+                        ErrorResponse, Request, Response,
+                    };
+                    // The error type is tungstenite's callback contract.
+                    #[allow(clippy::result_large_err)]
+                    let check = move |req: &Request, resp: Response| {
+                        let origin = req.headers().get("origin").and_then(|v| v.to_str().ok());
+                        if upgrade_allowed(req.uri().query(), origin, &token, &allowed_origins) {
+                            Ok(resp)
+                        } else {
+                            let mut refusal = ErrorResponse::new(Some("Forbidden".to_string()));
+                            *refusal.status_mut() =
+                                tokio_tungstenite::tungstenite::http::StatusCode::FORBIDDEN;
+                            Err(refusal)
+                        }
+                    };
                     // Bound the handshake so a client that opens TCP but never
                     // completes the WebSocket upgrade (slow-loris) cannot park
                     // this task forever. On timeout or handshake error we drop
@@ -442,7 +581,7 @@ impl HmrManager {
                     // client count.
                     let handshake = tokio::time::timeout(
                         Duration::from_secs(10),
-                        tokio_tungstenite::accept_async(stream),
+                        tokio_tungstenite::accept_hdr_async(stream, check),
                     )
                     .await;
 
@@ -657,7 +796,7 @@ mod tests {
         let manager = HmrManager::new(config);
         let port = manager.start_websocket_server().await.unwrap();
 
-        let (mut ws, _) = tokio_tungstenite::connect_async(format!("ws://127.0.0.1:{port}"))
+        let (mut ws, _) = tokio_tungstenite::connect_async(authorised_request(&manager, port))
             .await
             .expect("client should connect to HMR WebSocket server");
 
@@ -703,6 +842,120 @@ mod tests {
         manager.stop();
     }
 
+    /// A client request carrying the manager's token and a loopback `Origin`.
+    fn authorised_request(
+        manager: &HmrManager,
+        port: u16,
+    ) -> tokio_tungstenite::tungstenite::handshake::client::Request {
+        use tokio_tungstenite::tungstenite::client::IntoClientRequest;
+        let mut request = format!("ws://127.0.0.1:{port}/?token={}", manager.token())
+            .into_client_request()
+            .unwrap();
+        request
+            .headers_mut()
+            .insert("Origin", "http://localhost:3000".parse().unwrap());
+        request
+    }
+
+    /// Cross-site WebSocket hijacking: a page on another origin — even one
+    /// that somehow learned the token — and a same-origin client without the
+    /// token are both refused.
+    #[tokio::test]
+    async fn test_websocket_refuses_wrong_origin_or_missing_token() {
+        use tokio_tungstenite::tungstenite::client::IntoClientRequest;
+
+        let manager = HmrManager::new(HmrConfig::new().websocket_port(0));
+        let port = manager.start_websocket_server().await.unwrap();
+
+        // Right token, hostile origin.
+        let mut hostile = format!("ws://127.0.0.1:{port}/?token={}", manager.token())
+            .into_client_request()
+            .unwrap();
+        hostile
+            .headers_mut()
+            .insert("Origin", "https://evil.example".parse().unwrap());
+        assert!(tokio_tungstenite::connect_async(hostile).await.is_err());
+
+        // Loopback origin, no token.
+        let mut tokenless = format!("ws://127.0.0.1:{port}/")
+            .into_client_request()
+            .unwrap();
+        tokenless
+            .headers_mut()
+            .insert("Origin", "http://localhost:3000".parse().unwrap());
+        assert!(tokio_tungstenite::connect_async(tokenless).await.is_err());
+
+        // Loopback origin, wrong token.
+        let mut wrong = format!("ws://127.0.0.1:{port}/?token=deadbeef")
+            .into_client_request()
+            .unwrap();
+        wrong
+            .headers_mut()
+            .insert("Origin", "http://localhost:3000".parse().unwrap());
+        assert!(tokio_tungstenite::connect_async(wrong).await.is_err());
+
+        assert_eq!(manager.client_count(), 0);
+        manager.stop();
+    }
+
+    #[test]
+    fn test_origin_and_token_rules() {
+        let allowed = vec!["http://dev.example.test:8080".to_string()];
+        for origin in [
+            "http://localhost",
+            "http://localhost:3000",
+            "https://127.0.0.1:8443",
+            "http://[::1]:5173",
+            "http://dev.example.test:8080",
+        ] {
+            assert!(
+                upgrade_allowed(Some("token=t"), Some(origin), "t", &allowed),
+                "{origin}"
+            );
+        }
+        for origin in [
+            "http://localhost.evil.example",
+            "http://evil.example",
+            "null",
+            "http://127.0.0.1.nip.io",
+            "file://",
+        ] {
+            assert!(
+                !upgrade_allowed(Some("token=t"), Some(origin), "t", &allowed),
+                "{origin}"
+            );
+        }
+        assert!(!upgrade_allowed(Some("token=t"), None, "t", &allowed));
+        assert!(!upgrade_allowed(
+            None,
+            Some("http://localhost"),
+            "t",
+            &allowed
+        ));
+        assert!(!upgrade_allowed(
+            Some("token=x"),
+            Some("http://localhost"),
+            "t",
+            &allowed
+        ));
+    }
+
+    #[test]
+    fn test_hmr_is_refused_in_release_builds_unless_opted_in() {
+        assert!(release_gate(false, true).is_err());
+        assert!(release_gate(true, true).is_ok());
+        assert!(release_gate(false, false).is_ok());
+    }
+
+    #[test]
+    fn test_tokens_are_random_per_manager() {
+        let a = HmrManager::new(HmrConfig::new());
+        let b = HmrManager::new(HmrConfig::new());
+        assert_ne!(a.token(), b.token());
+        assert!(a.token().len() >= 32);
+        assert!(a.get_client_script().contains(a.token()));
+    }
+
     #[tokio::test]
     async fn test_incomplete_handshake_never_counts_as_client() {
         // A client that opens a raw TCP connection but never sends a WebSocket
@@ -735,7 +988,7 @@ mod tests {
 
         let script = manager.get_client_script();
 
-        assert!(script.contains("ws://localhost:3333"));
+        assert!(script.contains("ws://localhost:3333/?token="));
         assert!(script.contains("HMR Client initialized"));
     }
 

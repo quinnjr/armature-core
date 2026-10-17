@@ -45,6 +45,9 @@ simd-json = { version = "0.18", optional = true }
 bumpalo = { version = "3.20", features = ["collections"] }
 serde_urlencoded = "0.7"
 urlencoding = "2.1"  # Fast URL encoding/decoding
+# Collision-resistant digest for attacker-controlled cache keys (QUERY bodies)
+# and ETags.
+sha2 = "0.10"
 httpdate = "1.0"
 async-trait = "0.1"
 flate2 = "1.1.10"
@@ -74,7 +77,8 @@ tracing-appender = "0.2"
 # TLS/HTTPS support
 rustls = { version = "0.23.45", features = ["ring"] }
 tokio-rustls = "0.26"
-rustls-pemfile = "2.2"
+# PEM parsing via `PemObject` (replaces the unmaintained `rustls-pemfile`).
+rustls-pki-types = { version = "1.12", features = ["std"] }
 rcgen = { version = "0.14", optional = true }
 
 # HTTP/3 (QUIC) support - optional

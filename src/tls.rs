@@ -3,13 +3,12 @@
 //! This module provides TLS certificate management and HTTPS server configuration.
 
 use crate::Error;
-use rustls::{
-    ServerConfig,
-    crypto::ring::default_provider,
-    pki_types::{CertificateDer, PrivateKeyDer},
+use rustls::{ServerConfig, crypto::ring::default_provider};
+use rustls_pki_types::{
+    CertificateDer, PrivateKeyDer,
+    pem::{Error as PemError, PemObject},
 };
-use rustls_pemfile::{certs, private_key};
-use std::{fs::File, io::BufReader, path::Path, sync::Arc};
+use std::{path::Path, sync::Arc};
 
 /// TLS configuration for HTTPS server
 #[derive(Clone, Debug)]
@@ -125,44 +124,33 @@ impl TlsConfig {
 
 /// Load certificates from a PEM file
 fn load_certs(path: &Path) -> Result<Vec<CertificateDer<'static>>, Error> {
-    let file = File::open(path)
-        .map_err(|e| Error::Internal(format!("Failed to open certificate file: {}", e)))?;
-
-    let mut reader = BufReader::new(file);
-
-    certs(&mut reader)
+    CertificateDer::pem_file_iter(path)
+        .map_err(|e| Error::Internal(format!("Failed to open certificate file: {}", e)))?
         .collect::<std::result::Result<Vec<_>, _>>()
         .map_err(|e| Error::Internal(format!("Failed to parse certificates: {}", e)))
 }
 
 /// Load private key from a PEM file
 fn load_private_key(path: &Path) -> Result<PrivateKeyDer<'static>, Error> {
-    let file =
-        File::open(path).map_err(|e| Error::Internal(format!("Failed to open key file: {}", e)))?;
-
-    let mut reader = BufReader::new(file);
-
-    private_key(&mut reader)
-        .map_err(|e| Error::Internal(format!("Failed to read private key: {}", e)))?
-        .ok_or_else(|| Error::Internal("No private key found in file".to_string()))
+    PrivateKeyDer::from_pem_file(path).map_err(|e| match e {
+        PemError::NoItemsFound => Error::Internal("No private key found in file".to_string()),
+        e => Error::Internal(format!("Failed to read private key: {}", e)),
+    })
 }
 
 /// Parse certificates from PEM bytes
 fn parse_certs(pem: &[u8]) -> Result<Vec<CertificateDer<'static>>, Error> {
-    let mut reader = BufReader::new(pem);
-
-    certs(&mut reader)
+    CertificateDer::pem_slice_iter(pem)
         .collect::<std::result::Result<Vec<_>, _>>()
         .map_err(|e| Error::Internal(format!("Failed to parse certificates: {}", e)))
 }
 
 /// Parse private key from PEM bytes
 fn parse_private_key(pem: &[u8]) -> Result<PrivateKeyDer<'static>, Error> {
-    let mut reader = BufReader::new(pem);
-
-    private_key(&mut reader)
-        .map_err(|e| Error::Internal(format!("Failed to read private key: {}", e)))?
-        .ok_or_else(|| Error::Internal("No private key found".to_string()))
+    PrivateKeyDer::from_pem_slice(pem).map_err(|e| match e {
+        PemError::NoItemsFound => Error::Internal("No private key found".to_string()),
+        e => Error::Internal(format!("Failed to read private key: {}", e)),
+    })
 }
 
 /// HTTPS server bind address configuration
@@ -171,7 +159,8 @@ pub struct HttpsConfig {
     /// HTTPS bind address (e.g., "0.0.0.0:443")
     pub https_addr: String,
 
-    /// Optional HTTP bind address for redirect (e.g., "0.0.0.0:80")
+    /// Optional HTTP bind address for redirect (e.g., "0.0.0.0:80"). Requires
+    /// [`Application::with_https_redirect_hosts`](crate::Application::with_https_redirect_hosts).
     pub http_redirect_addr: Option<String>,
 
     /// TLS configuration
@@ -188,7 +177,13 @@ impl HttpsConfig {
         }
     }
 
-    /// Enable HTTP to HTTPS redirect
+    /// Enable HTTP to HTTPS redirect on `http_addr`.
+    ///
+    /// The redirect server only redirects to hosts listed with
+    /// [`Application::with_https_redirect_hosts`](crate::Application::with_https_redirect_hosts);
+    /// any other `Host` is answered `400` so it cannot be used as an open
+    /// redirect. [`Application::listen_with_config`](crate::Application::listen_with_config)
+    /// refuses to start when a redirect address is set without that list.
     pub fn with_http_redirect(mut self, http_addr: impl Into<String>) -> Self {
         self.http_redirect_addr = Some(http_addr.into());
         self
@@ -282,6 +277,35 @@ mod tests {
 
         let result = TlsConfig::from_pem_bytes(cert, invalid_key);
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_from_pem_bytes_no_key_is_reported() {
+        let err = parse_private_key(b"").unwrap_err();
+        assert!(err.to_string().contains("No private key found"), "{err}");
+    }
+
+    #[test]
+    fn test_parse_certs_empty_input_is_empty_chain() {
+        assert!(parse_certs(b"").unwrap().is_empty());
+    }
+
+    #[test]
+    fn test_load_from_missing_files_errors() {
+        assert!(load_certs(Path::new("/nonexistent/armature-cert.pem")).is_err());
+        assert!(load_private_key(Path::new("/nonexistent/armature-key.pem")).is_err());
+    }
+
+    #[test]
+    #[cfg(feature = "self-signed-certs")]
+    fn test_pem_round_trip_from_rcgen() {
+        let key_pair = rcgen::KeyPair::generate().unwrap();
+        let cert = rcgen::CertificateParams::new(vec!["localhost".to_string()])
+            .unwrap()
+            .self_signed(&key_pair)
+            .unwrap();
+        assert_eq!(parse_certs(cert.pem().as_bytes()).unwrap().len(), 1);
+        assert!(parse_private_key(key_pair.serialize_pem().as_bytes()).is_ok());
     }
 
     #[test]

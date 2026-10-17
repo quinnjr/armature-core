@@ -428,11 +428,23 @@ async fn a_smuggling_shaped_request_is_rejected_rather_than_served() {
     })
     .await;
 
-    assert!(
-        response.starts_with("HTTP/1.1 400"),
-        "Content-Length together with Transfer-Encoding must be refused: \
-         {response:?}"
-    );
+    if armature_h1::HYPER_BACKEND {
+        // armature-h1's `hyper-backend` (non-additive; on when anything in the
+        // build enables it, e.g. `--all-features`) cannot refuse this: hyper
+        // drops `Content-Length`, frames the body as chunked and closes the
+        // connection afterwards (see armature-h1's BACKENDS.md). The close,
+        // asserted below, is what keeps it from being a smuggle on this hop.
+        assert!(
+            response.contains("connection: close"),
+            "the hyper backend must advertise the close: {response:?}"
+        );
+    } else {
+        assert!(
+            response.starts_with("HTTP/1.1 400"),
+            "Content-Length together with Transfer-Encoding must be refused: \
+             {response:?}"
+        );
+    }
     // Refusing and then continuing to read is the smuggle: the two framings
     // disagree about where this request ends, so whatever arrives next would be
     // interpreted as a request boundary by this server and as body bytes by
@@ -1607,8 +1619,15 @@ async fn the_two_adapters_spell_413s_reason_phrase_differently() {
         "hyper's status table is the pre-RFC-9110 spelling; a change here means \
          the divergence moved rather than closed: {via_hyper:?}"
     );
+    // Under armature-h1's non-additive `hyper-backend` (e.g. an
+    // `--all-features` build) both adapters are hyper, and share its spelling.
+    let h1_phrase = if armature_h1::HYPER_BACKEND {
+        "HTTP/1.1 413 Payload Too Large"
+    } else {
+        "HTTP/1.1 413 Content Too Large"
+    };
     assert!(
-        via_h1.starts_with("HTTP/1.1 413 Content Too Large"),
+        via_h1.starts_with(h1_phrase),
         "armature-h1's status table is the current RFC 9110 spelling; a change \
          here means the divergence moved rather than closed: {via_h1:?}"
     );

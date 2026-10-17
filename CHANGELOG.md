@@ -10,6 +10,8 @@ Changes at or before `0.6.0` are recorded in the workspace
 
 ## [Unreleased]
 
+## [0.11.0] - 2026-10-17
+
 ### Security
 
 - **Guards can no longer be bypassed by spelling a path differently (C1).** Every serve path (armature-h1, hyper HTTP/1.1 and HTTP/2, HTTP/3, `micro`) now canonicalizes the request path once, before middleware, guards and routing, and rewrites the target to it (`routing::canonicalize_path`): `//` collapses, percent-encoded unreserved characters decode, and `.`/`..` segments, `%2F`, `%5C`, `%00`, `\` and malformed escapes are refused with `400`. Module guards are now bound to the routes their module's controllers register rather than matched against a raw URL prefix, so `GET //admin/users`, `/%61dmin/users` and controller base paths containing `:params` are all guarded.

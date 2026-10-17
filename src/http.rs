@@ -1110,33 +1110,119 @@ impl HttpResponse {
         self.cache_control("no-store, no-cache, must-revalidate")
     }
 
-    /// Set a cookie on the response. Can be called multiple times to set
-    /// multiple cookies — each produces a separate `Set-Cookie` header.
+    /// Set a typed, validated cookie. Each call produces a separate
+    /// `Set-Cookie` header.
+    ///
+    /// Fails if the name, value or any attribute is invalid (see [`Cookie`]),
+    /// so request-derived data can never inject attributes.
+    ///
+    /// # Example
+    /// ```
+    /// use armature_core::{Cookie, HttpResponse, SameSite};
+    /// let response = HttpResponse::ok()
+    ///     .set_cookie(
+    ///         Cookie::new("session", "abc123")
+    ///             .http_only()
+    ///             .secure()
+    ///             .same_site(SameSite::Lax)
+    ///             .path("/"),
+    ///     )
+    ///     .unwrap();
+    /// assert_eq!(response.cookies[0], "session=abc123; Path=/; Secure; HttpOnly; SameSite=Lax");
+    /// ```
+    pub fn set_cookie(mut self, cookie: Cookie) -> Result<Self, crate::Error> {
+        let header = cookie
+            .to_header_value()
+            .map_err(|e| crate::Error::Internal(format!("invalid cookie: {e}")))?;
+        self.cookies.push(header);
+        Ok(self)
+    }
+
+    /// Set a cookie with just a name and value, and no attributes.
+    ///
+    /// Both are validated per RFC 6265: a name must be a token, and a value may
+    /// not contain `;`, `,`, whitespace, `"`, `\\` or control characters. An
+    /// invalid cookie is **not set** (and an error is logged) rather than
+    /// written with whatever attributes its value smuggles in. Attributes go
+    /// through [`set_cookie`](Self::set_cookie) and [`Cookie`]; to write a
+    /// pre-formatted `Set-Cookie` value use [`cookie_raw`](Self::cookie_raw).
     ///
     /// # Example
     /// ```
     /// use armature_core::HttpResponse;
-    /// let response = HttpResponse::ok()
-    ///     .cookie("session", "abc123; HttpOnly; Secure")
-    ///     .cookie("theme", "dark; Path=/");
+    /// let response = HttpResponse::ok().cookie("theme", "dark");
+    /// assert_eq!(response.cookies, vec!["theme=dark".to_string()]);
+    ///
+    /// // Attribute injection is refused:
+    /// let response = HttpResponse::ok().cookie("theme", "dark; Domain=evil.example");
+    /// assert!(response.cookies.is_empty());
     /// ```
-    pub fn cookie(mut self, name: impl Into<String>, value: impl Into<String>) -> Self {
-        self.cookies
-            .push(format!("{}={}", name.into(), value.into()));
+    pub fn cookie(self, name: impl Into<String>, value: impl Into<String>) -> Self {
+        let cookie = Cookie::new(name, value);
+        match cookie.to_header_value() {
+            Ok(header) => {
+                let mut this = self;
+                this.cookies.push(header);
+                this
+            }
+            Err(e) => {
+                tracing::error!(cookie = %cookie.name, error = %e, "refusing to set an invalid cookie");
+                self
+            }
+        }
+    }
+
+    /// Append a pre-formatted `Set-Cookie` value verbatim, as `name=value`.
+    ///
+    /// **Unvalidated** apart from CR, LF and NUL (which would split the
+    /// response and are refused): `value` may carry attributes
+    /// (`"abc; HttpOnly; Secure"`), which means a `;` in it starts a new
+    /// attribute. Never pass request-derived data here — use
+    /// [`set_cookie`](Self::set_cookie) with a [`Cookie`] instead.
+    ///
+    /// # Example
+    /// ```
+    /// use armature_core::HttpResponse;
+    /// let response = HttpResponse::ok().cookie_raw("session", "abc123; HttpOnly; Secure");
+    /// assert_eq!(response.cookies, vec!["session=abc123; HttpOnly; Secure".to_string()]);
+    /// ```
+    pub fn cookie_raw(mut self, name: impl Into<String>, value: impl Into<String>) -> Self {
+        let header = format!("{}={}", name.into(), value.into());
+        if header.bytes().any(|b| matches!(b, b'\r' | b'\n' | 0)) {
+            tracing::error!("refusing a raw cookie containing CR, LF or NUL");
+            return self;
+        }
+        self.cookies.push(header);
         self
     }
 
     /// Clear a cookie by setting it with an expired Max-Age.
     ///
+    /// The name and path are validated as for [`Cookie`]; an invalid one is
+    /// not written (and an error is logged).
+    ///
     /// # Example
     /// ```
     /// use armature_core::HttpResponse;
     /// let response = HttpResponse::ok().clear_cookie("session", "/");
+    /// assert_eq!(response.cookies, vec!["session=; Path=/; Max-Age=0".to_string()]);
+    /// assert!(HttpResponse::ok().clear_cookie("session", "/; Domain=x").cookies.is_empty());
     /// ```
-    pub fn clear_cookie(mut self, name: impl Into<String>, path: impl Into<String>) -> Self {
-        self.cookies
-            .push(format!("{}=; Path={}; Max-Age=0", name.into(), path.into(),));
-        self
+    pub fn clear_cookie(self, name: impl Into<String>, path: impl Into<String>) -> Self {
+        let cookie = Cookie::new(name, "")
+            .path(path)
+            .max_age(std::time::Duration::ZERO);
+        match cookie.to_header_value() {
+            Ok(header) => {
+                let mut this = self;
+                this.cookies.push(header);
+                this
+            }
+            Err(e) => {
+                tracing::error!(cookie = %cookie.name, error = %e, "refusing to clear an invalid cookie");
+                self
+            }
+        }
     }
 
     /// Get the response body as a string (lossy UTF-8 conversion).
@@ -1175,9 +1261,373 @@ impl<T: Serialize> Json<T> {
     }
 }
 
+// ============================================================================
+// Cookies (RFC 6265)
+// ============================================================================
+
+/// The `SameSite` cookie attribute.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SameSite {
+    /// Sent only on same-site requests.
+    Strict,
+    /// Sent on same-site requests and top-level cross-site navigations.
+    Lax,
+    /// Sent on all requests. Requires [`Cookie::secure`].
+    None,
+}
+
+impl SameSite {
+    fn as_str(self) -> &'static str {
+        match self {
+            SameSite::Strict => "Strict",
+            SameSite::Lax => "Lax",
+            SameSite::None => "None",
+        }
+    }
+}
+
+/// Why a [`Cookie`] could not be serialized.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum CookieError {
+    /// The name is empty or not an RFC 9110 token.
+    #[error("cookie name is empty or not a token")]
+    InvalidName,
+    /// The value contains a byte outside RFC 6265 `cookie-octet` (e.g. `;`,
+    /// `,`, whitespace, `"`, `\\`, or a control character).
+    #[error("cookie value contains a forbidden character")]
+    InvalidValue,
+    /// The `Path` contains `;` or a control character.
+    #[error("cookie Path contains a forbidden character")]
+    InvalidPath,
+    /// The `Domain` is not a plain host name.
+    #[error("cookie Domain is not a valid host name")]
+    InvalidDomain,
+    /// `SameSite=None` without `Secure` is rejected by browsers.
+    #[error("SameSite=None requires Secure")]
+    SameSiteNoneWithoutSecure,
+}
+
+/// A typed `Set-Cookie` builder that validates its input (RFC 6265 §4.1).
+///
+/// Because the value and every attribute are checked, data that came from a
+/// request can be stored in a cookie without being able to add or override
+/// attributes (`"x; Domain=evil.example"` is refused, not written).
+///
+/// ```
+/// use armature_core::{Cookie, SameSite};
+/// use std::time::Duration;
+///
+/// let c = Cookie::new("sid", "abc123")
+///     .http_only()
+///     .secure()
+///     .same_site(SameSite::Strict)
+///     .path("/")
+///     .max_age(Duration::from_secs(3600));
+/// assert_eq!(
+///     c.to_header_value().unwrap(),
+///     "sid=abc123; Path=/; Max-Age=3600; Secure; HttpOnly; SameSite=Strict"
+/// );
+/// assert!(Cookie::new("sid", "x; Domain=evil").to_header_value().is_err());
+/// ```
+#[derive(Clone, PartialEq, Eq)]
+pub struct Cookie {
+    name: String,
+    value: String,
+    path: Option<String>,
+    domain: Option<String>,
+    max_age: Option<std::time::Duration>,
+    expires: Option<std::time::SystemTime>,
+    secure: bool,
+    http_only: bool,
+    same_site: Option<SameSite>,
+    partitioned: bool,
+}
+
+/// The value is redacted: cookies are usually credentials.
+impl std::fmt::Debug for Cookie {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Cookie")
+            .field("name", &self.name)
+            .field("value", &crate::headers::REDACTED)
+            .field("path", &self.path)
+            .field("domain", &self.domain)
+            .field("max_age", &self.max_age)
+            .field("expires", &self.expires)
+            .field("secure", &self.secure)
+            .field("http_only", &self.http_only)
+            .field("same_site", &self.same_site)
+            .field("partitioned", &self.partitioned)
+            .finish()
+    }
+}
+
+impl Cookie {
+    /// A cookie with this name and value and no attributes.
+    ///
+    /// Validation happens when it is serialized
+    /// ([`to_header_value`](Self::to_header_value) or
+    /// [`HttpResponse::set_cookie`]), so the builder chain stays infallible.
+    pub fn new(name: impl Into<String>, value: impl Into<String>) -> Self {
+        Self {
+            name: name.into(),
+            value: value.into(),
+            path: None,
+            domain: None,
+            max_age: None,
+            expires: None,
+            secure: false,
+            http_only: false,
+            same_site: None,
+            partitioned: false,
+        }
+    }
+
+    /// The cookie name.
+    pub fn name(&self) -> &str {
+        &self.name
+    }
+
+    /// The cookie value.
+    pub fn value(&self) -> &str {
+        &self.value
+    }
+
+    /// Set `HttpOnly`: not readable from JavaScript.
+    pub fn http_only(mut self) -> Self {
+        self.http_only = true;
+        self
+    }
+
+    /// Set `Secure`: only sent over HTTPS.
+    pub fn secure(mut self) -> Self {
+        self.secure = true;
+        self
+    }
+
+    /// Set `SameSite`.
+    pub fn same_site(mut self, same_site: SameSite) -> Self {
+        self.same_site = Some(same_site);
+        self
+    }
+
+    /// Set `Partitioned` (CHIPS). Requires `Secure` in browsers.
+    pub fn partitioned(mut self) -> Self {
+        self.partitioned = true;
+        self
+    }
+
+    /// Set `Path`.
+    pub fn path(mut self, path: impl Into<String>) -> Self {
+        self.path = Some(path.into());
+        self
+    }
+
+    /// Set `Domain`.
+    pub fn domain(mut self, domain: impl Into<String>) -> Self {
+        self.domain = Some(domain.into());
+        self
+    }
+
+    /// Set `Max-Age` (whole seconds).
+    pub fn max_age(mut self, max_age: std::time::Duration) -> Self {
+        self.max_age = Some(max_age);
+        self
+    }
+
+    /// Set `Expires`.
+    pub fn expires(mut self, at: std::time::SystemTime) -> Self {
+        self.expires = Some(at);
+        self
+    }
+
+    /// Validate and render the `Set-Cookie` field value.
+    pub fn to_header_value(&self) -> Result<String, CookieError> {
+        use std::fmt::Write as _;
+
+        if !is_cookie_name(&self.name) {
+            return Err(CookieError::InvalidName);
+        }
+        if !is_cookie_value(&self.value) {
+            return Err(CookieError::InvalidValue);
+        }
+        let mut out = format!("{}={}", self.name, self.value);
+        if let Some(path) = &self.path {
+            // RFC 6265 path-value: any CHAR except CTLs or ";".
+            if path.is_empty()
+                || path
+                    .bytes()
+                    .any(|b| b == b';' || b.is_ascii_control() || !b.is_ascii())
+            {
+                return Err(CookieError::InvalidPath);
+            }
+            let _ = write!(out, "; Path={path}");
+        }
+        if let Some(domain) = &self.domain {
+            let d = domain.strip_prefix('.').unwrap_or(domain);
+            if d.is_empty()
+                || !d
+                    .bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'.')
+            {
+                return Err(CookieError::InvalidDomain);
+            }
+            let _ = write!(out, "; Domain={domain}");
+        }
+        if let Some(max_age) = self.max_age {
+            let _ = write!(out, "; Max-Age={}", max_age.as_secs());
+        }
+        if let Some(expires) = self.expires {
+            let _ = write!(out, "; Expires={}", httpdate::fmt_http_date(expires));
+        }
+        if self.secure {
+            out.push_str("; Secure");
+        }
+        if self.http_only {
+            out.push_str("; HttpOnly");
+        }
+        if let Some(same_site) = self.same_site {
+            if same_site == SameSite::None && !self.secure {
+                return Err(CookieError::SameSiteNoneWithoutSecure);
+            }
+            let _ = write!(out, "; SameSite={}", same_site.as_str());
+        }
+        if self.partitioned {
+            out.push_str("; Partitioned");
+        }
+        Ok(out)
+    }
+}
+
+/// RFC 6265 `cookie-name` = RFC 9110 `token`.
+fn is_cookie_name(name: &str) -> bool {
+    !name.is_empty()
+        && name.bytes().all(|b| {
+            b.is_ascii_alphanumeric()
+                || matches!(
+                    b,
+                    b'!' | b'#'
+                        | b'$'
+                        | b'%'
+                        | b'&'
+                        | b'\''
+                        | b'*'
+                        | b'+'
+                        | b'-'
+                        | b'.'
+                        | b'^'
+                        | b'_'
+                        | b'`'
+                        | b'|'
+                        | b'~'
+                )
+        })
+}
+
+/// RFC 6265 `cookie-value` = `*cookie-octet / ( DQUOTE *cookie-octet DQUOTE )`.
+fn is_cookie_value(value: &str) -> bool {
+    let inner = value
+        .strip_prefix('"')
+        .and_then(|v| v.strip_suffix('"'))
+        .unwrap_or(value);
+    // cookie-octet: %x21 / %x23-2B / %x2D-3A / %x3C-5B / %x5D-7E — no CTLs,
+    // whitespace, DQUOTE, comma, semicolon or backslash.
+    inner
+        .bytes()
+        .all(|b| matches!(b, 0x21 | 0x23..=0x2B | 0x2D..=0x3A | 0x3C..=0x5B | 0x5D..=0x7E))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// M12: attribute injection through a cookie value or path is refused.
+    #[test]
+    fn cookie_rejects_attribute_injection() {
+        for bad in [
+            "x; Domain=evil.example",
+            "a,b",
+            "a b",
+            "a\tb",
+            "a\\b",
+            "a\"b",
+            "a\r\nSet-Cookie: x=y",
+            "a\0",
+        ] {
+            assert_eq!(
+                Cookie::new("sid", bad).to_header_value(),
+                Err(CookieError::InvalidValue),
+                "{bad:?}"
+            );
+            assert!(
+                HttpResponse::ok().cookie("sid", bad).cookies.is_empty(),
+                "{bad:?}"
+            );
+            assert!(
+                HttpResponse::ok()
+                    .set_cookie(Cookie::new("sid", bad))
+                    .is_err()
+            );
+        }
+        for bad in ["", "a b", "a;b", "a=b", "a,b", "a\u{e9}"] {
+            assert_eq!(
+                Cookie::new(bad, "v").to_header_value(),
+                Err(CookieError::InvalidName),
+                "{bad:?}"
+            );
+        }
+        assert_eq!(
+            Cookie::new("sid", "v")
+                .path("/; Domain=x")
+                .to_header_value(),
+            Err(CookieError::InvalidPath)
+        );
+        assert_eq!(
+            Cookie::new("sid", "v").domain("evil;x").to_header_value(),
+            Err(CookieError::InvalidDomain)
+        );
+        assert_eq!(
+            Cookie::new("sid", "v")
+                .same_site(SameSite::None)
+                .to_header_value(),
+            Err(CookieError::SameSiteNoneWithoutSecure)
+        );
+        assert!(
+            HttpResponse::ok()
+                .clear_cookie("sid", "/\r\nX: y")
+                .cookies
+                .is_empty()
+        );
+        assert!(
+            HttpResponse::ok()
+                .cookie_raw("sid", "v\r\nX: y")
+                .cookies
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn cookie_builder_renders_all_attributes() {
+        let at = std::time::UNIX_EPOCH + std::time::Duration::from_secs(784_111_777);
+        let c = Cookie::new("__Host-sid", "\"quoted\"")
+            .path("/")
+            .domain("example.com")
+            .max_age(std::time::Duration::from_secs(60))
+            .expires(at)
+            .secure()
+            .http_only()
+            .same_site(SameSite::None)
+            .partitioned();
+        assert_eq!(
+            c.to_header_value().unwrap(),
+            "__Host-sid=\"quoted\"; Path=/; Domain=example.com; Max-Age=60; \
+             Expires=Sun, 06 Nov 1994 08:49:37 GMT; Secure; HttpOnly; SameSite=None; Partitioned"
+        );
+        assert!(!format!("{c:?}").contains("quoted"));
+        assert_eq!(
+            HttpResponse::ok().cookie_raw("s", "a; HttpOnly").cookies,
+            vec!["s=a; HttpOnly".to_string()]
+        );
+    }
 
     /// `10.0.0.1:5555` — stands in for a reverse proxy.
     fn proxy() -> SocketAddr {

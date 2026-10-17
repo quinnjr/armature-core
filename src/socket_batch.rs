@@ -20,7 +20,7 @@ use std::io::{self, IoSlice, IoSliceMut};
 use std::sync::atomic::{AtomicU64, Ordering};
 
 #[cfg(unix)]
-use std::os::unix::io::RawFd;
+use std::os::fd::{AsRawFd, BorrowedFd};
 
 // ============================================================================
 // Configuration
@@ -206,7 +206,7 @@ impl ScatterWriter {
 
     /// Flush to a writer using writev.
     #[cfg(unix)]
-    pub fn flush_to_fd(&mut self, fd: RawFd) -> io::Result<usize> {
+    pub fn flush_to_fd(&mut self, fd: BorrowedFd<'_>) -> io::Result<usize> {
         if self.buffers.is_empty() {
             return Ok(0);
         }
@@ -335,7 +335,7 @@ impl GatherReader {
 
     /// Read from fd using readv.
     #[cfg(unix)]
-    pub fn read_from_fd(&mut self, fd: RawFd) -> io::Result<Vec<Bytes>> {
+    pub fn read_from_fd(&mut self, fd: BorrowedFd<'_>) -> io::Result<Vec<Bytes>> {
         let mut slices = self.as_io_slices_mut();
         let n = readv(fd, &mut slices)?;
 
@@ -396,21 +396,26 @@ impl GatherReader {
 ///
 /// Cork delays sending until uncorked or buffer full, creating
 /// optimal-sized packets for throughput.
+///
+/// Borrows the socket for its whole life (`'fd`), so it cannot outlive the
+/// descriptor and end up corking whatever socket later reuses the number.
 #[derive(Debug)]
-pub struct CorkManager {
+pub struct CorkManager<'fd> {
     /// File descriptor
     #[cfg(unix)]
-    fd: RawFd,
+    fd: BorrowedFd<'fd>,
+    #[cfg(not(unix))]
+    _fd: std::marker::PhantomData<&'fd ()>,
     /// Currently corked
     corked: bool,
     /// Use NODELAY after uncork
     nodelay_after: bool,
 }
 
-impl CorkManager {
+impl<'fd> CorkManager<'fd> {
     /// Create new cork manager.
     #[cfg(unix)]
-    pub fn new(fd: RawFd, nodelay_after: bool) -> Self {
+    pub fn new(fd: BorrowedFd<'fd>, nodelay_after: bool) -> Self {
         Self {
             fd,
             corked: false,
@@ -421,6 +426,7 @@ impl CorkManager {
     #[cfg(not(unix))]
     pub fn new(_fd: i32, _nodelay_after: bool) -> Self {
         Self {
+            _fd: std::marker::PhantomData,
             corked: false,
             nodelay_after: false,
         }
@@ -482,7 +488,7 @@ impl CorkManager {
     }
 }
 
-impl Drop for CorkManager {
+impl Drop for CorkManager<'_> {
     fn drop(&mut self) {
         // Ensure uncorked on drop
         let _ = self.uncork();
@@ -554,7 +560,7 @@ impl SendQueue {
 
     /// Write all to fd using writev.
     #[cfg(unix)]
-    pub fn flush_to_fd(&mut self, fd: RawFd) -> io::Result<usize> {
+    pub fn flush_to_fd(&mut self, fd: BorrowedFd<'_>) -> io::Result<usize> {
         if self.queue.is_empty() {
             return Ok(0);
         }
@@ -671,10 +677,10 @@ impl ReceiveAccumulator {
 
 /// Vectored write (writev).
 #[cfg(unix)]
-pub fn writev(fd: RawFd, bufs: &[IoSlice<'_>]) -> io::Result<usize> {
+pub fn writev(fd: BorrowedFd<'_>, bufs: &[IoSlice<'_>]) -> io::Result<usize> {
     let ret = unsafe {
         libc::writev(
-            fd,
+            fd.as_raw_fd(),
             bufs.as_ptr() as *const libc::iovec,
             bufs.len() as libc::c_int,
         )
@@ -689,10 +695,10 @@ pub fn writev(fd: RawFd, bufs: &[IoSlice<'_>]) -> io::Result<usize> {
 
 /// Vectored read (readv).
 #[cfg(unix)]
-pub fn readv(fd: RawFd, bufs: &mut [IoSliceMut<'_>]) -> io::Result<usize> {
+pub fn readv(fd: BorrowedFd<'_>, bufs: &mut [IoSliceMut<'_>]) -> io::Result<usize> {
     let ret = unsafe {
         libc::readv(
-            fd,
+            fd.as_raw_fd(),
             bufs.as_mut_ptr() as *mut libc::iovec,
             bufs.len() as libc::c_int,
         )
@@ -707,11 +713,11 @@ pub fn readv(fd: RawFd, bufs: &mut [IoSliceMut<'_>]) -> io::Result<usize> {
 
 /// Set TCP_CORK option (Linux only).
 #[cfg(target_os = "linux")]
-pub fn set_tcp_cork(fd: RawFd, cork: bool) -> io::Result<()> {
+pub fn set_tcp_cork(fd: BorrowedFd<'_>, cork: bool) -> io::Result<()> {
     let val: libc::c_int = if cork { 1 } else { 0 };
     let ret = unsafe {
         libc::setsockopt(
-            fd,
+            fd.as_raw_fd(),
             libc::IPPROTO_TCP,
             libc::TCP_CORK,
             &val as *const _ as *const libc::c_void,
@@ -728,18 +734,18 @@ pub fn set_tcp_cork(fd: RawFd, cork: bool) -> io::Result<()> {
 
 /// Set TCP_CORK option (stub for non-Linux).
 #[cfg(all(unix, not(target_os = "linux")))]
-pub fn set_tcp_cork(_fd: RawFd, _cork: bool) -> io::Result<()> {
+pub fn set_tcp_cork(_fd: BorrowedFd<'_>, _cork: bool) -> io::Result<()> {
     // TCP_CORK is Linux-specific; on macOS/BSD this is a no-op
     Ok(())
 }
 
 /// Set TCP_NODELAY option.
 #[cfg(unix)]
-pub fn set_tcp_nodelay(fd: RawFd, nodelay: bool) -> io::Result<()> {
+pub fn set_tcp_nodelay(fd: BorrowedFd<'_>, nodelay: bool) -> io::Result<()> {
     let val: libc::c_int = if nodelay { 1 } else { 0 };
     let ret = unsafe {
         libc::setsockopt(
-            fd,
+            fd.as_raw_fd(),
             libc::IPPROTO_TCP,
             libc::TCP_NODELAY,
             &val as *const _ as *const libc::c_void,
@@ -756,10 +762,10 @@ pub fn set_tcp_nodelay(fd: RawFd, nodelay: bool) -> io::Result<()> {
 
 /// Send with MSG_MORE flag (like TCP_CORK per-send). Linux only.
 #[cfg(target_os = "linux")]
-pub fn send_more(fd: RawFd, data: &[u8]) -> io::Result<usize> {
+pub fn send_more(fd: BorrowedFd<'_>, data: &[u8]) -> io::Result<usize> {
     let ret = unsafe {
         libc::send(
-            fd,
+            fd.as_raw_fd(),
             data.as_ptr() as *const libc::c_void,
             data.len(),
             libc::MSG_MORE,
@@ -776,15 +782,22 @@ pub fn send_more(fd: RawFd, data: &[u8]) -> io::Result<usize> {
 
 /// Send with MSG_MORE flag (stub for non-Linux - falls back to regular send).
 #[cfg(all(unix, not(target_os = "linux")))]
-pub fn send_more(fd: RawFd, data: &[u8]) -> io::Result<usize> {
+pub fn send_more(fd: BorrowedFd<'_>, data: &[u8]) -> io::Result<usize> {
     // MSG_MORE is Linux-specific; fall back to regular send on macOS/BSD
     send_final(fd, data)
 }
 
 /// Final send (without MSG_MORE).
 #[cfg(unix)]
-pub fn send_final(fd: RawFd, data: &[u8]) -> io::Result<usize> {
-    let ret = unsafe { libc::send(fd, data.as_ptr() as *const libc::c_void, data.len(), 0) };
+pub fn send_final(fd: BorrowedFd<'_>, data: &[u8]) -> io::Result<usize> {
+    let ret = unsafe {
+        libc::send(
+            fd.as_raw_fd(),
+            data.as_ptr() as *const libc::c_void,
+            data.len(),
+            0,
+        )
+    };
 
     if ret < 0 {
         Err(io::Error::last_os_error())
@@ -1019,9 +1032,19 @@ mod tests {
 
     #[test]
     fn test_cork_manager() {
-        // Just test the state tracking (no actual socket)
-        let manager = CorkManager::new(0, true);
-        assert!(!manager.is_corked());
+        // Just test the state tracking (a live fd, but nothing is corked)
+        #[cfg(unix)]
+        {
+            use std::os::fd::AsFd;
+            let (a, _b) = std::os::unix::net::UnixStream::pair().unwrap();
+            let manager = CorkManager::new(a.as_fd(), true);
+            assert!(!manager.is_corked());
+        }
+        #[cfg(not(unix))]
+        {
+            let manager = CorkManager::new(0, true);
+            assert!(!manager.is_corked());
+        }
     }
 
     #[test]

@@ -551,6 +551,21 @@ fn numa_alloc_align() -> usize {
     64
 }
 
+/// The layout [`NumaAllocator`] allocates and frees `size` bytes with.
+///
+/// The size is rounded up to a multiple of [`numa_alloc_align`] — a whole
+/// number of pages on Linux. `mbind(2)` acts on whole pages, so binding (and
+/// `MPOL_MF_MOVE`-migrating) a region whose last page is only partly ours would
+/// rebind and move whatever the global allocator later puts in the rest of
+/// that page. Owning the whole page means the policy touches nothing else.
+fn numa_layout(size: usize) -> Option<std::alloc::Layout> {
+    Some(
+        std::alloc::Layout::from_size_align(size, numa_alloc_align())
+            .ok()?
+            .pad_to_align(),
+    )
+}
+
 // ============================================================================
 // NUMA-Aware Allocator
 // ============================================================================
@@ -614,11 +629,13 @@ impl NumaAllocator {
 
     #[cfg(target_os = "linux")]
     fn allocate_linux(&self, size: usize) -> Option<*mut u8> {
-        use std::alloc::{Layout, alloc_zeroed};
+        use std::alloc::alloc_zeroed;
 
         // Page-aligned so the region is a valid mbind(2) argument.
         // Zeroed so NumaBuffer::as_slice never exposes uninitialized memory.
-        let layout = Layout::from_size_align(size, numa_alloc_align()).ok()?;
+        let layout = numa_layout(size)?;
+        // SAFETY: `layout` has a non-zero size (`size > 0` was checked by
+        // `allocate`, and padding only grows it).
         let ptr = unsafe { alloc_zeroed(layout) };
 
         if ptr.is_null() {
@@ -631,13 +648,14 @@ impl NumaAllocator {
         // keep the allocation without NUMA placement (graceful degradation).
         if self.node.id() < mempolicy::MAX_NODES {
             let nodemask: u64 = 1u64 << self.node.id();
-            // SAFETY: ptr..ptr+size is a live allocation we own; nodemask
-            // outlives the call and maxnode matches its bit width.
+            // SAFETY: ptr..ptr+layout.size() is a live, page-aligned,
+            // whole-page allocation we own; nodemask outlives the call and
+            // maxnode matches its bit width.
             let rc = unsafe {
                 libc::syscall(
                     libc::SYS_mbind,
                     ptr as *mut libc::c_void,
-                    size as libc::c_ulong,
+                    layout.size() as libc::c_ulong,
                     mempolicy::MPOL_BIND,
                     &nodemask as *const u64,
                     mempolicy::MAX_NODES as libc::c_ulong,
@@ -668,10 +686,10 @@ impl NumaAllocator {
 
     #[cfg(not(target_os = "linux"))]
     fn allocate_fallback(&self, size: usize) -> Option<*mut u8> {
-        use std::alloc::{Layout, alloc_zeroed};
+        use std::alloc::alloc_zeroed;
 
         // Zeroed so NumaBuffer::as_slice never exposes uninitialized memory
-        let layout = Layout::from_size_align(size, numa_alloc_align()).ok()?;
+        let layout = numa_layout(size)?;
         let ptr = unsafe { alloc_zeroed(layout) };
 
         if ptr.is_null() {
@@ -692,9 +710,9 @@ impl NumaAllocator {
     /// `ptr` must have been allocated by this allocator with the given `size`.
     #[inline]
     pub unsafe fn deallocate(&self, ptr: *mut u8, size: usize) {
-        use std::alloc::{Layout, dealloc};
+        use std::alloc::dealloc;
 
-        if let Ok(layout) = Layout::from_size_align(size, numa_alloc_align()) {
+        if let Some(layout) = numa_layout(size) {
             // SAFETY: caller guarantees ptr was allocated with this size/alignment
             unsafe { dealloc(ptr, layout) };
             self.stats.record_deallocation(size);
@@ -1185,6 +1203,17 @@ pub fn cached_numa_config() -> &'static NumaConfig {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// L25: allocations are whole multiples of the alignment (whole pages on
+    /// Linux), so `mbind` never covers memory that is not ours.
+    #[test]
+    fn numa_layout_rounds_up_to_whole_pages() {
+        let align = numa_alloc_align();
+        assert_eq!(numa_layout(1).unwrap().size(), align);
+        assert_eq!(numa_layout(align).unwrap().size(), align);
+        assert_eq!(numa_layout(align + 1).unwrap().size(), 2 * align);
+        assert_eq!(numa_layout(1).unwrap().align(), align);
+    }
 
     #[test]
     fn test_numa_available() {

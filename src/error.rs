@@ -244,10 +244,41 @@ impl Error {
         self.http_status().is_server_error()
     }
 
+    /// The message that is safe to show a client for this error.
+    ///
+    /// - 5xx: always the generic `"Internal Server Error"`.
+    /// - [`Error::Deserialization`]: a generic message. The wrapped text is a
+    ///   serde error, which names Rust types, enum variants and field layout
+    ///   (`unknown variant "x", expected one of ...`) — internal structure the
+    ///   client has no use for. Log the full error instead.
+    /// - Everything else (including [`Error::Validation`], whose messages are
+    ///   written by the application *for* the client, e.g. "email is
+    ///   required"): the error's own message.
+    ///
+    /// ```
+    /// use armature_core::Error;
+    /// let e = Error::Deserialization("unknown variant `Admin`, expected `User`".into());
+    /// assert!(!e.client_message().contains("Admin"));
+    /// assert_eq!(Error::Validation("email is required".into()).client_message(),
+    ///            "Validation error: email is required");
+    /// ```
+    pub fn client_message(&self) -> String {
+        match self {
+            e if e.status_code() >= 500 => "Internal Server Error".to_string(),
+            Error::Deserialization(_) => {
+                "Request body could not be deserialized. Check that it matches the expected format."
+                    .to_string()
+            }
+            e => e.to_string(),
+        }
+    }
+
     /// Build a client-safe HTTP response for this error.
     ///
-    /// The status code comes from [`Error::status_code`]. 4xx client errors
-    /// keep their descriptive message so callers can correct their request;
+    /// The status code comes from [`Error::status_code`] and the message from
+    /// [`Error::client_message`]. 4xx client errors keep their descriptive
+    /// message so callers can correct their request (except
+    /// [`Error::Deserialization`], whose serde detail is replaced);
     /// 5xx server errors are redacted to a generic `"Internal Server Error"`
     /// message so internal detail (connection strings, upstream errors, stack
     /// context) never leaks to the client. The full error should be logged
@@ -259,11 +290,11 @@ impl Error {
     /// responses never drift apart.
     pub fn to_client_response(&self) -> HttpResponse {
         let status = self.status_code();
-        let message = if status >= 500 {
-            "Internal Server Error".to_string()
-        } else {
-            self.to_string()
-        };
+        let message = self.client_message();
+        if matches!(self, Error::Deserialization(_)) {
+            // The detail the client no longer sees still reaches the logs.
+            tracing::debug!(error = %self, "request body deserialization failed");
+        }
         let body = serde_json::json!({
             "error": message,
             "status": status,
@@ -661,6 +692,28 @@ mod tests {
     fn test_proxy_authentication_required() {
         let err = Error::ProxyAuthenticationRequired("proxy auth needed".to_string());
         assert_eq!(err.status_code(), 407);
+    }
+
+    /// L2: serde internals in a Deserialization error stay out of the body;
+    /// application-written Validation messages are kept.
+    #[test]
+    fn test_to_client_response_hides_deserialization_detail() {
+        let err = Error::Deserialization(
+            "unknown variant `SuperAdmin`, expected one of `User`, `Guest` at line 1 column 9"
+                .to_string(),
+        );
+        let response = err.to_client_response();
+        assert_eq!(response.status, 400);
+        let body = String::from_utf8(response.into_body_bytes().to_vec()).unwrap();
+        assert!(
+            !body.contains("SuperAdmin") && !body.contains("Guest"),
+            "{body}"
+        );
+
+        let body = Error::Validation("email is required".to_string())
+            .to_client_response()
+            .into_body_bytes();
+        assert!(String::from_utf8_lossy(&body).contains("email is required"));
     }
 
     #[test]

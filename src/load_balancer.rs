@@ -480,18 +480,25 @@ impl LoadBalancer {
     /// a distinct state transition.
     #[inline]
     fn next_random(&self) -> u64 {
-        let mut next = 0u64;
-        let _ = self
-            .random_state
-            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |state| {
-                let mut x = state;
-                x ^= x << 13;
-                x ^= x >> 7;
-                x ^= x << 17;
-                next = x;
-                Some(x)
-            });
-        next
+        // An explicit CAS loop rather than `fetch_update`, which newer
+        // toolchains deprecate (renamed `try_update`) while the MSRV predates
+        // the new name.
+        let mut state = self.random_state.load(Ordering::Relaxed);
+        loop {
+            let mut x = state;
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            match self.random_state.compare_exchange_weak(
+                state,
+                x,
+                Ordering::Relaxed,
+                Ordering::Relaxed,
+            ) {
+                Ok(_) => return x,
+                Err(actual) => state = actual,
+            }
+        }
     }
 
     /// Get total connections across all workers.

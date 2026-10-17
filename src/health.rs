@@ -794,38 +794,33 @@ fn get_linux_memory_info() -> (u64, u64) {
     (total, available)
 }
 
+/// Total and available bytes on the filesystem holding `path`, via
+/// `statvfs(3)`.
+///
+/// A direct syscall rather than spawning `df`: no `PATH` lookup (a planted
+/// `df` earlier in `PATH` would run with the server's privileges), no argument
+/// parsing (a `path` starting with `-` was read as an option), and no
+/// locale-dependent output to parse.
 #[cfg(unix)]
 fn get_unix_disk_info(path: &str) -> Option<(u64, u64)> {
-    use std::process::Command;
-
-    // Use df command to get disk info (more portable than libc statvfs)
-    let output = Command::new("df")
-        .args(["-B1", path]) // Use 1-byte blocks for exact values
-        .output()
-        .ok()?;
-
-    if !output.status.success() {
+    let c_path = std::ffi::CString::new(path).ok()?;
+    let mut stat = std::mem::MaybeUninit::<libc::statvfs>::uninit();
+    // SAFETY: `c_path` is a valid NUL-terminated string that outlives the
+    // call, and `stat` points to writable storage of the right type.
+    let rc = unsafe { libc::statvfs(c_path.as_ptr(), stat.as_mut_ptr()) };
+    if rc != 0 {
         return None;
     }
-
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    let lines: Vec<&str> = stdout.lines().collect();
-
-    // Skip header line, parse the data line
-    if lines.len() < 2 {
-        return None;
-    }
-
-    let parts: Vec<&str> = lines[1].split_whitespace().collect();
-    if parts.len() < 4 {
-        return None;
-    }
-
-    // df output: Filesystem 1B-blocks Used Available Use% Mounted
-    let total: u64 = parts[1].parse().ok()?;
-    let available: u64 = parts[3].parse().ok()?;
-
-    Some((total, available))
+    // SAFETY: statvfs returned 0, so it fully initialized `stat`.
+    let stat = unsafe { stat.assume_init() };
+    // The field widths differ across platforms (u32 on some, u64 on others).
+    #[allow(clippy::unnecessary_cast)]
+    let (frsize, blocks, avail) = (
+        stat.f_frsize as u64,
+        stat.f_blocks as u64,
+        stat.f_bavail as u64,
+    );
+    Some((blocks.saturating_mul(frsize), avail.saturating_mul(frsize)))
 }
 
 /// Returns the current Unix timestamp in seconds
@@ -1031,6 +1026,18 @@ mod tests {
             assert!(result.details.contains_key("total_mb"));
             assert!(result.details.contains_key("available_mb"));
         }
+    }
+
+    /// L10: disk info comes from statvfs, not a spawned `df`, so an
+    /// option-looking or NUL-containing path cannot be misinterpreted.
+    #[cfg(unix)]
+    #[test]
+    fn test_disk_info_uses_statvfs() {
+        let (total, avail) = get_unix_disk_info("/").expect("statvfs on /");
+        assert!(total > 0 && avail <= total);
+        assert!(get_unix_disk_info("--version").is_none());
+        assert!(get_unix_disk_info("/\0").is_none());
+        assert!(get_unix_disk_info("/nonexistent/armature/path").is_none());
     }
 
     #[tokio::test]

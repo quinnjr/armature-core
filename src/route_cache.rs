@@ -514,6 +514,16 @@ pub struct OptimizedRoute {
     pub constraints: Option<RouteConstraints>,
 }
 
+/// A route found by [`OptimizedRouter::resolve`], ready for
+/// [`OptimizedRouter::dispatch`].
+#[derive(Debug, Clone)]
+pub struct ResolvedRoute {
+    /// Index of the matched route, in registration order.
+    pub index: usize,
+    /// Captured path parameters; `None` for a static route, which has none.
+    pub params: Option<crate::RouteParams>,
+}
+
 /// Optimized router with caching and static fast path.
 pub struct OptimizedRouter {
     /// All routes
@@ -620,70 +630,94 @@ impl OptimizedRouter {
         opt
     }
 
-    /// Route a request with optimized matching.
-    pub async fn route(&self, mut request: HttpRequest) -> Result<HttpResponse, Error> {
+    /// Resolve `method` + `path` to a route without calling its handler.
+    ///
+    /// `path` is the path alone, query stripped. Returns `None` when no route
+    /// matches — including for a method no route can carry (`CONNECT`,
+    /// `TRACE`, an unknown token), which must never fall back to `GET`.
+    ///
+    /// Constraints are **not** validated here; [`OptimizedRouter::dispatch`]
+    /// does that, after the match, exactly as [`OptimizedRouter::route`]
+    /// always has. Splitting the two lets a serve path answer `404` before it
+    /// reads a request body, then dispatch the route it already found.
+    pub fn resolve(&self, method: &crate::Method, path: &str) -> Option<ResolvedRoute> {
         self.stats.requests.fetch_add(1, Ordering::Relaxed);
 
-        // Match on the path alone; the query is parsed on demand by
-        // `HttpRequest::query`, and only if a handler asks for it.
-        let path = request.path_only();
-
         // Unknown HTTP methods must not fall back to GET handlers.
-        let Ok(method) = HttpMethod::try_from(&request.method) else {
-            return Err(Error::RouteNotFound(format!("{} {}", request.method, path)));
-        };
-
+        let method = HttpMethod::try_from(method).ok()?;
         let key = RouteKey::new(method.clone(), path);
 
-        // 1. Try static route fast path (O(1)). Static routes carry no path
-        //    params; any constraints validate against the empty map (matching
-        //    the linear router, which only checks params that are present).
+        // 1. Static route fast path (O(1)). Static routes carry no params.
         if let Some(route_index) = self.static_routes.get(&key) {
             self.stats.static_hits.fetch_add(1, Ordering::Relaxed);
-            let route = &self.routes[route_index];
-            if let Some(constraints) = &route.constraints {
-                constraints.validate(&request.path_params)?;
-            }
-            return route.handler.call(request).await;
+            return Some(ResolvedRoute {
+                index: route_index,
+                params: None,
+            });
         }
 
-        // 2. Try cache (O(1)).
+        // 2. Cache (O(1)).
         if let Some(cached) = self.cache.get(&key) {
             self.stats.cache_hits.fetch_add(1, Ordering::Relaxed);
-            let route = &self.routes[cached.route_index];
-            let params = cached.extract_params(path);
-            if let Some(constraints) = &route.constraints {
-                constraints.validate(&params)?;
-            }
-            request.path_params = params;
-            return route.handler.call(request).await;
+            return Some(ResolvedRoute {
+                index: cached.route_index,
+                params: Some(cached.extract_params(path)),
+            });
         }
 
-        // 3. Fall back to pattern matching. Returns the first matching route in
-        //    registration order, mirroring the linear `Router::route`.
+        // 3. Pattern matching: the first matching route in registration order,
+        //    mirroring the linear `Router::route`.
         self.stats.pattern_matches.fetch_add(1, Ordering::Relaxed);
-
         for (route_index, route) in self.routes.iter().enumerate() {
-            if route.method != method {
+            if route.method != method || !route.compiled.matches(path) {
                 continue;
             }
-
-            if route.compiled.matches(path) {
-                // Cache the match for future requests
-                let cached = CachedRoute::from_compiled(route_index, &route.compiled);
-                self.cache.insert(key, cached);
-
-                // Extract params, validate constraints, then call handler.
-                let params = route.compiled.extract_params(path);
-                if let Some(constraints) = &route.constraints {
-                    constraints.validate(&params)?;
-                }
-                request.path_params = params;
-                return route.handler.call(request).await;
-            }
+            self.cache.insert(
+                key,
+                CachedRoute::from_compiled(route_index, &route.compiled),
+            );
+            return Some(ResolvedRoute {
+                index: route_index,
+                params: Some(route.compiled.extract_params(path)),
+            });
         }
+        None
+    }
 
-        Err(Error::RouteNotFound(format!("{} {}", request.method, path)))
+    /// Call the route `resolved` names, validating its constraints first.
+    ///
+    /// `resolved` must come from [`OptimizedRouter::resolve`] on this router,
+    /// for this request's method and path.
+    pub async fn dispatch(
+        &self,
+        resolved: ResolvedRoute,
+        mut request: HttpRequest,
+    ) -> Result<HttpResponse, Error> {
+        let route = &self.routes[resolved.index];
+        // A static match carries no params; constraints then validate against
+        // the request's own (empty) map, matching the linear router, which
+        // only checks params that are present.
+        if let Some(params) = resolved.params {
+            request.path_params = params;
+        }
+        if let Some(constraints) = &route.constraints {
+            constraints.validate(&request.path_params)?;
+        }
+        route.handler.call(request).await
+    }
+
+    /// Route a request with optimized matching.
+    pub async fn route(&self, request: HttpRequest) -> Result<HttpResponse, Error> {
+        // Match on the path alone; the query is parsed on demand by
+        // `HttpRequest::query`, and only if a handler asks for it.
+        match self.resolve(&request.method, request.path_only()) {
+            Some(resolved) => self.dispatch(resolved, request).await,
+            None => Err(Error::RouteNotFound(format!(
+                "{} {}",
+                request.method,
+                request.path_only()
+            ))),
+        }
     }
 
     /// Get statistics.

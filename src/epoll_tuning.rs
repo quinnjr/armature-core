@@ -318,9 +318,20 @@ impl KeepaliveConfig {
 // ============================================================================
 
 /// Apply socket options based on configuration.
+///
+/// Takes a [`BorrowedFd`](std::os::fd::BorrowedFd) rather than a raw
+/// descriptor number, so the socket is guaranteed open for the duration of
+/// the call (I/O safety): a stale number could otherwise reconfigure an
+/// unrelated socket or file that reused it. Pass `socket.as_fd()`.
 #[cfg(target_os = "linux")]
-pub fn configure_socket(fd: std::os::unix::io::RawFd, config: &EpollConfig) -> std::io::Result<()> {
+pub fn configure_socket(
+    fd: std::os::fd::BorrowedFd<'_>,
+    config: &EpollConfig,
+) -> std::io::Result<()> {
     use std::io::Error;
+    use std::os::fd::AsRawFd as _;
+
+    let fd = fd.as_raw_fd();
 
     // Helper for setsockopt
     fn setsockopt<T>(fd: i32, level: i32, name: i32, value: &T) -> std::io::Result<()> {
@@ -406,8 +417,11 @@ pub fn configure_socket(fd: std::os::unix::io::RawFd, config: &EpollConfig) -> s
     Ok(())
 }
 
-#[cfg(not(target_os = "linux"))]
-pub fn configure_socket(_fd: i32, _config: &EpollConfig) -> std::io::Result<()> {
+#[cfg(all(unix, not(target_os = "linux")))]
+pub fn configure_socket(
+    _fd: std::os::fd::BorrowedFd<'_>,
+    _config: &EpollConfig,
+) -> std::io::Result<()> {
     Ok(())
 }
 
@@ -1089,7 +1103,7 @@ mod tests {
     #[test]
     fn test_configure_socket_applies_tcp_nodelay() {
         use std::net::{TcpListener, TcpStream};
-        use std::os::unix::io::AsRawFd;
+        use std::os::fd::{AsFd, AsRawFd};
 
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let addr = listener.local_addr().unwrap();
@@ -1101,7 +1115,7 @@ mod tests {
         server.set_nodelay(false).unwrap();
 
         let config = EpollConfig::default().tcp_nodelay(true);
-        configure_socket(server.as_raw_fd(), &config).unwrap();
+        configure_socket(server.as_fd(), &config).unwrap();
 
         let mut val: libc::c_int = 0;
         let mut len = std::mem::size_of::<libc::c_int>() as libc::socklen_t;

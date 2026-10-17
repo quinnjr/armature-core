@@ -587,8 +587,19 @@ impl IoBackend {
 /// self-contained utility for fd-based I/O.
 #[cfg(all(target_os = "linux", feature = "io-uring"))]
 pub struct IoUringRuntime {
-    ring: std::sync::Mutex<::io_uring::IoUring>,
+    ring: parking_lot::Mutex<RingState>,
     stats: IoUringStats,
+}
+
+/// The ring plus the bookkeeping `submit_one` needs, behind one lock.
+#[cfg(all(target_os = "linux", feature = "io-uring"))]
+struct RingState {
+    ring: ::io_uring::IoUring,
+    /// Tag for the next operation's `user_data`.
+    next_id: u64,
+    /// Set if a wait failed with an operation in flight; every later call
+    /// fails instead of reusing a ring in an unknown state.
+    poisoned: bool,
 }
 
 #[cfg(all(target_os = "linux", feature = "io-uring"))]
@@ -639,7 +650,11 @@ impl IoUringRuntime {
         };
 
         Ok(Self {
-            ring: std::sync::Mutex::new(ring),
+            ring: parking_lot::Mutex::new(RingState {
+                ring,
+                next_id: 0,
+                poisoned: false,
+            }),
             stats: IoUringStats::new(),
         })
     }
@@ -723,62 +738,92 @@ impl IoUringRuntime {
         Ok(n)
     }
 
-    /// Submit a single SQE and block until its completion is reaped.
+    /// Submit a single SQE and block until *its* completion is reaped.
     ///
     /// Records submission/completion/error statistics.
+    ///
+    /// Each operation is tagged with a unique `user_data`, and once the SQE
+    /// has reached the kernel this function does not return — successfully or
+    /// not — until the CQE carrying that tag has been reaped. A CQE with any
+    /// other tag is discarded, never mistaken for ours. If waiting on the
+    /// ring fails in a way that cannot be retried, returning would hand the
+    /// caller's buffer back while the kernel may still read or write it, so
+    /// the ring is poisoned and the process aborts instead.
     ///
     /// # Safety
     ///
     /// Any buffers referenced by `sqe` must remain valid (and, for reads,
-    /// exclusively borrowed) until this function returns: the function only
-    /// returns after the CQE for the operation has been reaped (or before
-    /// the SQE was ever handed to the kernel).
+    /// exclusively borrowed) until this function returns.
     unsafe fn submit_one(&self, sqe: ::io_uring::squeue::Entry) -> std::io::Result<usize> {
-        let mut ring = self.ring.lock().unwrap();
+        // `parking_lot`: no lock poisoning, so a panic elsewhere cannot turn
+        // every later call into a panic of its own.
+        let mut state = self.ring.lock();
+        if state.poisoned {
+            return Err(std::io::Error::other("io_uring ring is poisoned"));
+        }
+        state.next_id = state.next_id.wrapping_add(1);
+        let id = state.next_id;
+        let sqe = sqe.user_data(id);
 
         // SAFETY (push): per this function's contract, the buffers the SQE
         // points at stay valid until the completion is reaped below.
         unsafe {
-            let mut sq = ring.submission();
+            let mut sq = state.ring.submission();
             if sq.push(&sqe).is_err() {
-                // SQ full: flush pending entries and retry once.
+                // SQ full: flush pending entries and retry once. Our SQE is
+                // not in the ring yet, so an error return here is safe.
                 self.stats.record_sq_full();
                 drop(sq);
-                ring.submit()?;
-                let mut sq = ring.submission();
+                state.ring.submit()?;
+                let mut sq = state.ring.submission();
                 sq.push(&sqe)
                     .map_err(|_| std::io::Error::other("io_uring submission queue full"))?;
             }
         }
         self.stats.record_submission();
 
-        // Wait for the completion, retrying on EINTR: we must not return
-        // while the kernel may still be using the caller's buffer. Because
-        // submissions are serialized (one in flight per lock hold) the CQ
-        // can never overflow here, so other wait errors are not expected.
+        // From here the kernel may own the buffer: loop until our CQE.
         loop {
-            match ring.submit_and_wait(1) {
-                Ok(_) => break,
-                Err(e) if e.raw_os_error() == Some(libc::EINTR) => continue,
+            match state.ring.submit_and_wait(1) {
+                Ok(_) => {}
+                Err(e)
+                    if matches!(
+                        e.raw_os_error(),
+                        Some(libc::EINTR) | Some(libc::EAGAIN) | Some(libc::EBUSY)
+                    ) => {}
                 Err(e) => {
                     self.stats.record_error();
-                    return Err(e);
+                    state.poisoned = true;
+                    tracing::error!(
+                        error = %e,
+                        "io_uring wait failed with an operation in flight; \
+                         aborting rather than releasing a buffer the kernel may still use"
+                    );
+                    std::process::abort();
                 }
             }
-        }
 
-        let cqe = ring
-            .completion()
-            .next()
-            .ok_or_else(|| std::io::Error::other("io_uring completion queue empty after wait"))?;
-        self.stats.record_completion();
+            let mut ours = None;
+            for cqe in state.ring.completion() {
+                if cqe.user_data() == id {
+                    ours = Some(cqe.result());
+                } else {
+                    // Nothing else is ever in flight while the lock is held,
+                    // so this is a stray completion; it must not be taken
+                    // for ours.
+                    self.stats.record_error();
+                }
+            }
 
-        let res = cqe.result();
-        if res < 0 {
-            self.stats.record_error();
-            Err(std::io::Error::from_raw_os_error(-res))
-        } else {
-            Ok(res as usize)
+            if let Some(res) = ours {
+                self.stats.record_completion();
+                return if res < 0 {
+                    self.stats.record_error();
+                    Err(std::io::Error::from_raw_os_error(-res))
+                } else {
+                    Ok(res as usize)
+                };
+            }
         }
     }
 }
@@ -792,9 +837,9 @@ impl IoUringRuntime {
 pub struct BufferPool {
     /// Buffer data (each slot behind its own lock so exclusive access is
     /// enforced by the type system rather than by caller discipline)
-    buffers: Vec<std::sync::Mutex<Vec<u8>>>,
+    buffers: Vec<parking_lot::Mutex<Vec<u8>>>,
     /// Free buffer indices
-    free_list: std::sync::Mutex<Vec<usize>>,
+    free_list: parking_lot::Mutex<Vec<usize>>,
     /// Buffer size
     buffer_size: usize,
     /// Statistics
@@ -815,13 +860,13 @@ impl BufferPool {
         let mut free_list = Vec::with_capacity(count);
 
         for i in 0..count {
-            buffers.push(std::sync::Mutex::new(vec![0u8; buffer_size]));
+            buffers.push(parking_lot::Mutex::new(vec![0u8; buffer_size]));
             free_list.push(i);
         }
 
         Self {
             buffers,
-            free_list: std::sync::Mutex::new(free_list),
+            free_list: parking_lot::Mutex::new(free_list),
             buffer_size,
             stats: BufferPoolStats::default(),
         }
@@ -832,12 +877,12 @@ impl BufferPool {
     /// Returns an RAII guard that dereferences to the buffer and returns
     /// it to the pool when dropped. Returns `None` if the pool is empty.
     pub fn acquire(&self) -> Option<BufferGuard<'_>> {
-        let idx = self.free_list.lock().unwrap().pop();
+        let idx = self.free_list.lock().pop();
         if let Some(idx) = idx {
             self.stats.allocations.fetch_add(1, Ordering::Relaxed);
             // The index was removed from the free list, so this slot lock is
             // uncontended; it enforces exclusive access for the guard's lifetime.
-            let buf = self.buffers[idx].lock().unwrap();
+            let buf = self.buffers[idx].lock();
             Some(BufferGuard {
                 pool: self,
                 index: idx,
@@ -861,7 +906,7 @@ impl BufferPool {
 
     /// Get available buffers count
     pub fn available(&self) -> usize {
-        self.free_list.lock().unwrap().len()
+        self.free_list.lock().len()
     }
 }
 
@@ -873,7 +918,7 @@ impl BufferPool {
 pub struct BufferGuard<'a> {
     pool: &'a BufferPool,
     index: usize,
-    buf: std::sync::MutexGuard<'a, Vec<u8>>,
+    buf: parking_lot::MutexGuard<'a, Vec<u8>>,
 }
 
 impl BufferGuard<'_> {
@@ -899,7 +944,7 @@ impl std::ops::DerefMut for BufferGuard<'_> {
 
 impl Drop for BufferGuard<'_> {
     fn drop(&mut self) {
-        self.pool.free_list.lock().unwrap().push(self.index);
+        self.pool.free_list.lock().push(self.index);
         self.pool
             .stats
             .deallocations
@@ -1176,6 +1221,40 @@ mod tests {
                     None
                 }
             }
+        }
+
+        /// M15: a completion that is not ours (here a NOP left pending in
+        /// the CQ with a foreign tag) must never be returned as our result.
+        /// Before per-op `user_data` matching, `write_at` reaped the NOP's
+        /// CQE and reported 0 bytes written.
+        #[test]
+        fn test_stray_completion_is_not_taken_for_ours() {
+            let config = IoUringConfig::builder().ring_size(64).build();
+            let Some(runtime) = runtime_or_skip(config) else {
+                return;
+            };
+            {
+                let mut state = runtime.ring.lock();
+                let nop = ::io_uring::opcode::Nop::new().build().user_data(u64::MAX);
+                // SAFETY: a NOP references no memory.
+                unsafe { state.ring.submission().push(&nop).unwrap() };
+                state.ring.submit_and_wait(1).unwrap();
+            }
+
+            let path = std::env::temp_dir()
+                .join(format!("armature-io-uring-stray-{}", std::process::id()));
+            let file = std::fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .create(true)
+                .truncate(true)
+                .open(&path)
+                .expect("create temp file");
+            let data = b"not zero bytes";
+            let written = runtime.write_at(file.as_fd(), data, 0).expect("write_at");
+            assert_eq!(written, data.len());
+            drop(file);
+            let _ = std::fs::remove_file(&path);
         }
 
         #[test]

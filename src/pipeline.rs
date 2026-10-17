@@ -264,8 +264,9 @@ pub struct PipelineConfig {
     /// kernel's listen backlog rather than spending memory on sockets it cannot
     /// serve. Defaults to [`DEFAULT_MAX_CONNECTIONS`].
     ///
-    /// Not yet enforced on the `armature-h1` path, whose accept loop lives in
-    /// `armature-h1` and exposes no connection-count limit to forward this to.
+    /// On the `armature-h1` path it is split evenly (rounding up) across the
+    /// workers as `armature_h1::Limits::max_connections`, since each worker
+    /// owns its own accept loop.
     pub max_connections: usize,
 }
 

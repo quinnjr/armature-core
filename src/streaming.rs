@@ -1434,15 +1434,20 @@ impl BackpressureController {
 
     /// Record data being acknowledged by consumer (decreases buffer level).
     pub fn record_ack(&self, bytes: usize) {
-        // Saturating subtraction via fetch_update: a plain fetch_sub of
+        // Saturating subtraction via a CAS loop: a plain fetch_sub of
         // `bytes.min(buffer_level())` races with concurrent acks and can
         // wrap the level to ~usize::MAX, pausing the controller forever.
-        let old_level = self
-            .buffer_level
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |level| {
-                Some(level.saturating_sub(bytes))
-            })
-            .expect("fetch_update closure never returns None");
+        // (An explicit CAS loop: `fetch_update` is deprecated on newer
+        // toolchains, and its replacement postdates the MSRV.)
+        let mut old_level = self.buffer_level.load(Ordering::Acquire);
+        while let Err(actual) = self.buffer_level.compare_exchange_weak(
+            old_level,
+            old_level.saturating_sub(bytes),
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        ) {
+            old_level = actual;
+        }
         let new_level = old_level.saturating_sub(bytes);
         self.stats
             .bytes_acked

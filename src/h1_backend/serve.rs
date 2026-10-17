@@ -126,7 +126,7 @@ pub(crate) fn h1_config(
         //
         // `write_timeout` defaults finite, because the failure it prevents is
         // not a slow handler but a peer that stops reading. `armature-h1` caps
-        // neither connection count nor write duration, so an unbounded write
+        // connection count but not write duration, so an unbounded write
         // deadline lets a client hold a worker's connection slot, its fd and
         // its whole response buffer indefinitely by shrinking its receive
         // window to zero — an unauthenticated hold costing one socket.
@@ -159,6 +159,11 @@ pub(crate) fn h1_config(
     if let Some(n) = workers {
         cfg = cfg.workers(n);
     }
+    // `PipelineConfig::max_connections` is a whole-listener cap, and
+    // `armature-h1` enforces its cap per worker (each owns its own accept
+    // loop), so split it across the workers, rounding up so the total is
+    // never below what was configured.
+    cfg.limits.max_connections = pipeline.max_connections.div_ceil(cfg.workers).max(1);
     cfg
 }
 
@@ -292,6 +297,31 @@ mod tests {
 
     fn addr() -> SocketAddr {
         "127.0.0.1:0".parse().expect("addr")
+    }
+
+    /// `max_connections` is split across workers, rounding up.
+    #[test]
+    fn max_connections_is_split_per_worker() {
+        let pipeline = PipelineConfig {
+            max_connections: 10,
+            ..PipelineConfig::default()
+        };
+        assert_eq!(
+            h1_config(addr(), &pipeline, 1024, Some(3))
+                .limits
+                .max_connections,
+            4
+        );
+        let pipeline = PipelineConfig {
+            max_connections: 1,
+            ..PipelineConfig::default()
+        };
+        assert_eq!(
+            h1_config(addr(), &pipeline, 1024, Some(8))
+                .limits
+                .max_connections,
+            1
+        );
     }
 
     #[test]

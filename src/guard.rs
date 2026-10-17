@@ -269,6 +269,7 @@ mod tests {
 
     /// `#[guard(AuthenticationGuard)]` constructs the guard with `Default`.
     #[tokio::test]
+    #[allow(clippy::default_constructed_unit_structs)] // `Default` is what's under test
     async fn test_authentication_guard_default_is_fail_closed() {
         let guard = AuthenticationGuard::default();
 

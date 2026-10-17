@@ -3755,7 +3755,7 @@ mod tests {
     fn test_to_hyper_response_sets_headers_cookies_and_cors() {
         let response = HttpResponse::ok()
             .content_type("application/json")
-            .cookie("session", "abc; HttpOnly")
+            .cookie_raw("session", "abc; HttpOnly")
             .with_body(b"{}".to_vec());
         let cors = CorsConfig::new("https://example.com").with_credentials();
 

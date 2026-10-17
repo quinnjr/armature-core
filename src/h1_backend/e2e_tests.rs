@@ -63,6 +63,7 @@ where
     let cfg = h1_config(
         "127.0.0.1:0".parse().expect("addr"),
         &PipelineConfig::default(),
+        state.max_body_size(),
         // One worker: the test asserts on responses, not on load balancing, and
         // a worker per core would open N listeners for no added coverage.
         Some(1),
@@ -316,16 +317,14 @@ async fn a_declared_content_length_over_the_limit_is_refused_before_the_body() {
         response.starts_with("HTTP/1.1 413"),
         "an over-limit declaration must be refused with 413: {response:?}"
     );
-    // The status line alone does not distinguish the producers: `armature-h1`
-    // answers a bare 413 from `framing::decide` before the service runs, and
-    // armature-core answers one with this envelope. `h1_config` gives its cap a
-    // byte of headroom precisely so the framework's answer wins, and asserting
-    // the body is what pins that — otherwise the two are indistinguishable and
-    // a regression is invisible.
+    // `h1_config` hands armature-h1 the application's own (finite) cap, so a
+    // declaration over it is refused by `framing::decide` before the service
+    // runs, with armature-h1's bare 413 rather than the framework's envelope.
+    // That is the price of the transport never being unbounded; a *streamed*
+    // overrun still gets the envelope (see the next test).
     assert!(
-        response.contains("\"status\":413"),
-        "the framework's own 413 envelope must reach the client, not \
-         armature-h1's bare status line: {response:?}"
+        !response.contains("method="),
+        "the handler must not have run: {response:?}"
     );
     // 100 bytes were declared and none sent. Anything that kept this
     // connection would be waiting for a body it just refused, holding a socket
@@ -429,11 +428,23 @@ async fn a_smuggling_shaped_request_is_rejected_rather_than_served() {
     })
     .await;
 
-    assert!(
-        response.starts_with("HTTP/1.1 400"),
-        "Content-Length together with Transfer-Encoding must be refused: \
-         {response:?}"
-    );
+    if armature_h1::HYPER_BACKEND {
+        // armature-h1's `hyper-backend` (non-additive; on when anything in the
+        // build enables it, e.g. `--all-features`) cannot refuse this: hyper
+        // drops `Content-Length`, frames the body as chunked and closes the
+        // connection afterwards (see armature-h1's BACKENDS.md). The close,
+        // asserted below, is what keeps it from being a smuggle on this hop.
+        assert!(
+            response.contains("connection: close"),
+            "the hyper backend must advertise the close: {response:?}"
+        );
+    } else {
+        assert!(
+            response.starts_with("HTTP/1.1 400"),
+            "Content-Length together with Transfer-Encoding must be refused: \
+             {response:?}"
+        );
+    }
     // Refusing and then continuing to read is the smuggle: the two framings
     // disagree about where this request ends, so whatever arrives next would be
     // interpreted as a request boundary by this server and as body bytes by
@@ -1072,6 +1083,7 @@ async fn dropping_the_serve_future_stops_the_listener() {
     let cfg = h1_config(
         "127.0.0.1:0".parse().expect("addr"),
         &PipelineConfig::default(),
+        DEFAULT_MAX_BODY_SIZE,
         Some(1),
     );
     let (tx, rx) = tokio::sync::oneshot::channel();
@@ -1475,9 +1487,12 @@ async fn the_two_adapters_answer_the_same_request_the_same_way() {
             b"GET /nope HTTP/1.1\r\nHost: a\r\nConnection: close\r\n\r\n",
         ),
         (
-            "a declared-length 413",
+            // Streamed rather than declared: a declared length over the cap is
+            // refused by armature-h1's own framing (bounded by the same cap)
+            // before the service runs, which hyper has no counterpart for.
+            "a streamed over-limit 413",
             parity_state(16),
-            b"POST /echo HTTP/1.1\r\nHost: a\r\nContent-Length: 100\r\nConnection: close\r\n\r\n",
+            b"POST /echo HTTP/1.1\r\nHost: a\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n20\r\n0123456789abcdef0123456789abcdef\r\n0\r\n\r\n",
         ),
         (
             // A real preflight, which needs `Access-Control-Request-Method` to
@@ -1591,8 +1606,7 @@ async fn the_two_adapters_answer_the_same_request_the_same_way() {
 /// along with the carve-out in [`normalised`].
 #[tokio::test]
 async fn the_two_adapters_spell_413s_reason_phrase_differently() {
-    let request: &[u8] =
-        b"POST /echo HTTP/1.1\r\nHost: a\r\nContent-Length: 100\r\nConnection: close\r\n\r\n";
+    let request: &[u8] = b"POST /echo HTTP/1.1\r\nHost: a\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n20\r\n0123456789abcdef0123456789abcdef\r\n0\r\n\r\n";
 
     let via_hyper = hyper_roundtrip(parity_state(16), request).await;
     let via_h1 = with_server(parity_state(16), move |addr| async move {
@@ -1605,8 +1619,15 @@ async fn the_two_adapters_spell_413s_reason_phrase_differently() {
         "hyper's status table is the pre-RFC-9110 spelling; a change here means \
          the divergence moved rather than closed: {via_hyper:?}"
     );
+    // Under armature-h1's non-additive `hyper-backend` (e.g. an
+    // `--all-features` build) both adapters are hyper, and share its spelling.
+    let h1_phrase = if armature_h1::HYPER_BACKEND {
+        "HTTP/1.1 413 Payload Too Large"
+    } else {
+        "HTTP/1.1 413 Content Too Large"
+    };
     assert!(
-        via_h1.starts_with("HTTP/1.1 413 Content Too Large"),
+        via_h1.starts_with(h1_phrase),
         "armature-h1's status table is the current RFC 9110 spelling; a change \
          here means the divergence moved rather than closed: {via_h1:?}"
     );
@@ -1618,5 +1639,246 @@ async fn the_two_adapters_spell_413s_reason_phrase_differently() {
             "the envelope callers parse must be byte-identical on both \
              adapters even though the advisory phrase is not: {response:?}"
         );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Security hardening: path canonicalization (C1), slow bodies (H6), and
+// answering before the body (H6), on both adapters.
+// ---------------------------------------------------------------------------
+
+/// `GET /admin/users` behind a route-bound guard that refuses everything.
+fn guarded_admin_state() -> ServeState {
+    let mut router = Router::new();
+    router.add_route(Route::new(HttpMethod::GET, "/admin/users", echo));
+    router.add_route(Route::new(HttpMethod::POST, "/echo", echo));
+    router.layer_routes(0..1, &[], &[Arc::new(DenyAll) as Arc<dyn Guard>]);
+    ServeState::for_test(
+        Arc::new(OptimizedRouter::from_router(&router)),
+        DEFAULT_MAX_BODY_SIZE,
+    )
+}
+
+/// Serve connections through the hyper adapter until the test ends, and
+/// return the address.
+async fn hyper_server(state: ServeState) -> std::net::SocketAddr {
+    use hyper::service::service_fn;
+    use hyper::{Request, body::Incoming};
+    use hyper_util::rt::TokioIo;
+
+    let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+        .await
+        .expect("bind the hyper listener");
+    let addr = listener.local_addr().expect("hyper listener address");
+    tokio::spawn(async move {
+        loop {
+            let Ok((stream, peer)) = listener.accept().await else {
+                return;
+            };
+            let state = state.for_peer(peer);
+            tokio::spawn(async move {
+                let service = service_fn(move |req: Request<Incoming>| {
+                    let state = state.clone();
+                    async move { crate::application::handle_request(req, state).await }
+                });
+                let _ = crate::pipeline::hardened_http1_builder()
+                    .serve_connection(TokioIo::new(stream), service)
+                    .await;
+            });
+        }
+    });
+    addr
+}
+
+/// The C1 regression on the wire: no spelling of a guarded path reaches the
+/// handler on either adapter.
+#[tokio::test]
+async fn a_route_guard_is_not_bypassed_by_any_spelling_of_the_path() {
+    let targets = [
+        "/admin/users",
+        "//admin/users",
+        "/admin//users",
+        "/./admin/users",
+        "/admin/../admin/users",
+        "/%2Fadmin/users",
+        "/%2fadmin/users",
+        "/%61dmin/users",
+        "/admin/users/",
+    ];
+    for target in targets {
+        let request = format!("GET {target} HTTP/1.1\r\nHost: a\r\nConnection: close\r\n\r\n");
+        let via_hyper = hyper_roundtrip(guarded_admin_state(), request.as_bytes()).await;
+        let request_h1 = request.clone().into_bytes();
+        let via_h1 = with_server(guarded_admin_state(), move |addr| async move {
+            roundtrip(addr, &request_h1).await
+        })
+        .await;
+        for (adapter, response) in [("hyper", &via_hyper), ("armature-h1", &via_h1)] {
+            let status = response.get(9..12).unwrap_or("");
+            assert!(
+                status == "403" || status == "400",
+                "{adapter} answered {target} with {status}, not a refusal: {response:?}"
+            );
+            assert!(
+                !response.contains("method="),
+                "{adapter} let {target} reach the handler: {response:?}"
+            );
+        }
+    }
+}
+
+/// Write `head`, then `body_start`, then stall; return what the server sent.
+async fn stall_after(addr: std::net::SocketAddr, head: &[u8], body_start: &[u8]) -> String {
+    let mut stream = tokio::net::TcpStream::connect(addr)
+        .await
+        .expect("connect to test server");
+    stream.write_all(head).await.expect("write head");
+    stream
+        .write_all(body_start)
+        .await
+        .expect("write body start");
+    let mut out = Vec::new();
+    let _ = tokio::time::timeout(Duration::from_secs(5), stream.read_to_end(&mut out)).await;
+    String::from_utf8_lossy(&out).into_owned()
+}
+
+/// H6: a client that declares a body and then stops sending it is answered
+/// `408` once the inactivity deadline passes, on both adapters — not held
+/// open for the life of the connection.
+#[tokio::test]
+async fn a_stalled_body_is_answered_408_on_both_adapters() {
+    let policy = crate::BodyReadPolicy {
+        idle_timeout: Duration::from_millis(200),
+        min_bytes_per_sec: 0,
+    };
+    let head: &[u8] =
+        b"POST /echo HTTP/1.1\r\nHost: a\r\nContent-Length: 10\r\nConnection: close\r\n\r\n";
+
+    let state = test_state(DEFAULT_MAX_BODY_SIZE).with_body_read_for_test(policy);
+    let started = std::time::Instant::now();
+    let via_hyper = stall_after(hyper_server(state.clone()).await, head, b"ab").await;
+    assert!(
+        via_hyper.starts_with("HTTP/1.1 408"),
+        "hyper adapter: {via_hyper:?}"
+    );
+    let via_h1 = with_server(state, move |addr| async move {
+        stall_after(addr, head, b"ab").await
+    })
+    .await;
+    assert!(
+        via_h1.starts_with("HTTP/1.1 408"),
+        "armature-h1: {via_h1:?}"
+    );
+    assert!(
+        started.elapsed() < Duration::from_secs(4),
+        "the deadline, not the client's read timeout, must end the request"
+    );
+}
+
+/// H6: trickling one byte just inside every idle window does not keep a body
+/// read alive past the minimum-rate budget.
+#[tokio::test]
+async fn a_trickled_body_runs_out_of_rate_budget() {
+    let policy = crate::BodyReadPolicy {
+        idle_timeout: Duration::from_millis(300),
+        // 300 ms + 1 s per 1000 bytes: two bytes buy 2 ms.
+        min_bytes_per_sec: 1000,
+    };
+    let state = test_state(DEFAULT_MAX_BODY_SIZE).with_body_read_for_test(policy);
+    let addr = hyper_server(state).await;
+
+    let mut stream = tokio::net::TcpStream::connect(addr).await.unwrap();
+    stream
+        .write_all(
+            b"POST /echo HTTP/1.1\r\nHost: a\r\nContent-Length: 100\r\nConnection: close\r\n\r\n",
+        )
+        .await
+        .unwrap();
+    // One byte every 200 ms: always inside the 300 ms idle window. Stop as
+    // soon as the server has answered (or hung up), then collect the answer.
+    let trickle = tokio::spawn(async move {
+        for _ in 0..20 {
+            if stream.write_all(b"x").await.is_err() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(200)).await;
+            let mut probe = [0u8; 1];
+            match tokio::time::timeout(Duration::from_millis(1), stream.peek(&mut probe)).await {
+                Ok(Ok(_)) => break,
+                Ok(Err(_)) => break,
+                Err(_) => {}
+            }
+        }
+        let mut out = Vec::new();
+        let _ = tokio::time::timeout(Duration::from_secs(2), stream.read_to_end(&mut out)).await;
+        String::from_utf8_lossy(&out).into_owned()
+    });
+    let answer = tokio::time::timeout(Duration::from_secs(8), trickle)
+        .await
+        .expect("trickle task finished")
+        .expect("trickle task panicked");
+    assert!(answer.starts_with("HTTP/1.1 408"), "{answer:?}");
+}
+
+/// H6: an unmatched route is answered before its body is read — a large
+/// declared upload to a path that does not exist costs the server nothing.
+#[tokio::test]
+async fn an_unrouted_request_is_answered_without_reading_its_body() {
+    let head: &[u8] =
+        b"POST /nope HTTP/1.1\r\nHost: a\r\nContent-Length: 1000\r\nConnection: close\r\n\r\n";
+    // No body bytes are ever sent; the answer must not wait for them.
+    let via_hyper = stall_after(
+        hyper_server(test_state(DEFAULT_MAX_BODY_SIZE)).await,
+        head,
+        b"",
+    )
+    .await;
+    assert!(
+        via_hyper.starts_with("HTTP/1.1 404"),
+        "hyper adapter: {via_hyper:?}"
+    );
+    let via_h1 = with_server(test_state(DEFAULT_MAX_BODY_SIZE), move |addr| async move {
+        stall_after(addr, head, b"").await
+    })
+    .await;
+    assert!(
+        via_h1.starts_with("HTTP/1.1 404"),
+        "armature-h1: {via_h1:?}"
+    );
+}
+
+/// Global middleware runs on the wire too, before global guards.
+#[tokio::test]
+async fn global_middleware_reaches_the_wire_on_both_adapters() {
+    struct Tag;
+
+    #[async_trait::async_trait]
+    impl crate::middleware::Middleware for Tag {
+        async fn handle(
+            &self,
+            req: HttpRequest,
+            next: crate::middleware::Next,
+        ) -> Result<HttpResponse, Error> {
+            let mut response = next(req).await?;
+            response
+                .headers
+                .insert("X-Tagged".to_string(), "yes".to_string());
+            Ok(response)
+        }
+    }
+
+    let mut chain = crate::middleware::MiddlewareChain::new();
+    chain.use_middleware(Tag);
+    let state = test_state(DEFAULT_MAX_BODY_SIZE).with_middleware_for_test(chain);
+    let request: &[u8] = b"GET /echo HTTP/1.1\r\nHost: a\r\nConnection: close\r\n\r\n";
+    let via_hyper = hyper_roundtrip(state.clone(), request).await;
+    let via_h1 = with_server(
+        state,
+        move |addr| async move { roundtrip(addr, request).await },
+    )
+    .await;
+    for response in [via_hyper, via_h1] {
+        assert!(response.starts_with("HTTP/1.1 200"), "{response:?}");
+        assert_eq!(header_count(&response, "x-tagged"), 1, "{response:?}");
     }
 }

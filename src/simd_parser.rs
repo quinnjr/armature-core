@@ -397,6 +397,16 @@ pub fn is_valid_header_name(name: &[u8]) -> bool {
     !name.is_empty() && name.iter().all(|&c| is_tchar(c))
 }
 
+/// Whether a header field value may be written to the wire as-is.
+///
+/// Rejects CR, LF and NUL — the same rule `armature-h1` applies before writing
+/// a response. Any of them ends the field early and lets the rest be read as
+/// further header fields or a body (response splitting).
+#[inline]
+pub fn is_valid_header_value(value: &[u8]) -> bool {
+    !value.iter().any(|b| matches!(b, b'\r' | b'\n' | 0))
+}
+
 /// Whether `c` is an RFC 9110 `tchar`.
 #[inline]
 const fn is_tchar(c: u8) -> bool {
@@ -523,6 +533,17 @@ mod tests {
             params.get("email").map(String::as_str),
             Some("test@example.com")
         );
+    }
+
+    #[test]
+    fn test_url_decode_trailing_escape() {
+        // L26 (audit): a `%XX` that ends the input is decoded, and a truncated
+        // escape is left literal rather than read past the end.
+        assert_eq!(url_decode("a%2F"), "a/");
+        assert_eq!(url_decode("a%2f%3D"), "a/=");
+        assert_eq!(url_decode("a%2"), "a%2");
+        assert_eq!(url_decode("a%"), "a%");
+        assert_eq!(url_decode("%zz"), "%zz");
     }
 
     #[test]

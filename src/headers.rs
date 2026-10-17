@@ -112,8 +112,39 @@ impl Header {
     }
 }
 
+/// Header names whose values are credentials and must never reach a log
+/// through `Debug`: `authorization`, `proxy-authorization`, `cookie`,
+/// `set-cookie` and `x-api-key`. Compared case-insensitively.
+pub const SENSITIVE_HEADERS: &[&str] = &[
+    "authorization",
+    "proxy-authorization",
+    "cookie",
+    "set-cookie",
+    "x-api-key",
+];
+
+/// What `Debug` prints in place of a sensitive header's value.
+pub const REDACTED: &str = "<redacted>";
+
+/// Whether `name` is one of [`SENSITIVE_HEADERS`] (case-insensitively).
+///
+/// ```
+/// use armature_core::headers::is_sensitive_header;
+/// assert!(is_sensitive_header("Authorization"));
+/// assert!(!is_sensitive_header("content-type"));
+/// ```
+#[inline]
+pub fn is_sensitive_header(name: &str) -> bool {
+    SENSITIVE_HEADERS
+        .iter()
+        .any(|s| s.eq_ignore_ascii_case(name))
+}
+
 impl fmt::Debug for Header {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        if is_sensitive_header(self.name()) {
+            return write!(f, "{}: {}", self.name(), REDACTED);
+        }
         match self.value_str() {
             Some(v) => write!(f, "{}: {}", self.name(), v),
             None => write!(f, "{}: <{} non-utf8 bytes>", self.name(), self.value.len()),
@@ -778,12 +809,17 @@ impl std::error::Error for DuplicateField {}
 
 impl fmt::Debug for HeaderMap {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        // Credentials are redacted: a `{:?}` of a request (or its headers) is
+        // the kind of thing that ends up in an error log.
         f.debug_map()
-            .entries(
-                self.inner
-                    .iter()
-                    .map(|h| (h.name(), h.value_str().unwrap_or("<non-utf8>"))),
-            )
+            .entries(self.inner.iter().map(|h| {
+                let value = if is_sensitive_header(h.name()) {
+                    REDACTED
+                } else {
+                    h.value_str().unwrap_or("<non-utf8>")
+                };
+                (h.name(), value)
+            }))
             .finish()
     }
 }
@@ -884,6 +920,36 @@ impl From<HeaderMap> for HashMap<String, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// H27: credentials never reach a log through `{:?}`.
+    #[test]
+    fn debug_redacts_credential_headers() {
+        let mut h = HeaderMap::new();
+        h.insert("Authorization", "Bearer secret-1");
+        h.insert("Proxy-Authorization", "Basic secret-2");
+        h.insert("Cookie", "session=secret-3");
+        h.insert("Set-Cookie", "session=secret-4");
+        h.insert("X-API-Key", "secret-5");
+        h.insert("Content-Type", "application/json");
+        let out = format!("{h:?}");
+        for n in 1..=5 {
+            assert!(!out.contains(&format!("secret-{n}")), "{out}");
+        }
+        assert!(out.contains("application/json"), "{out}");
+        assert!(out.contains(REDACTED), "{out}");
+
+        let one = Header::new("authorization", "Bearer secret-6");
+        assert!(!format!("{one:?}").contains("secret-6"));
+
+        let mut req = crate::HttpRequest::new("GET", "/".to_string());
+        req.headers.insert("Authorization", "Bearer secret-7");
+        req.headers.insert("Cookie", "sid=secret-8");
+        let out = format!("{req:?}");
+        assert!(
+            !out.contains("secret-7") && !out.contains("secret-8"),
+            "{out}"
+        );
+    }
 
     #[test]
     fn test_new_is_inline() {

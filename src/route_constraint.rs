@@ -177,6 +177,10 @@ impl RouteConstraint for EmailConstraint {
 }
 
 /// Regex constraint - validates that a parameter matches a regex pattern
+///
+/// The pattern must match the **whole** parameter: it is anchored at both ends
+/// automatically, so `\d+` accepts `123` and rejects `123abc`. Explicit `^` and
+/// `$` anchors are harmless.
 pub struct RegexConstraint {
     regex: Regex,
     description: String,
@@ -191,11 +195,24 @@ impl RegexConstraint {
     /// use armature_core::RegexConstraint;
     ///
     /// // Only allow lowercase letters
-    /// let constraint = RegexConstraint::new(r"^[a-z]+$", "lowercase letters");
+    /// let constraint = RegexConstraint::new(r"[a-z]+", "lowercase letters").unwrap();
+    /// ```
+    ///
+    /// The pattern is matched against the entire value:
+    ///
+    /// ```
+    /// use armature_core::{RegexConstraint, RouteConstraint};
+    ///
+    /// let digits = RegexConstraint::new(r"\d+", "digits").unwrap();
+    /// assert!(digits.validate("123").is_ok());
+    /// assert!(digits.validate("123abc").is_err());
+    /// assert!(digits.validate("abc123").is_err());
     /// ```
     pub fn new(pattern: &str, description: &str) -> Result<Self, regex::Error> {
+        // Wrapped in a non-capturing group so an alternation (`a|b`) is
+        // anchored as a whole, not just its first and last branch.
         Ok(Self {
-            regex: Regex::new(pattern)?,
+            regex: Regex::new(&format!(r"\A(?:{pattern})\z"))?,
             description: description.to_string(),
         })
     }
@@ -502,6 +519,28 @@ impl Clone for RouteConstraints {
 
 #[cfg(test)]
 mod tests {
+
+    /// L8: a regex constraint matches the whole parameter, not a substring.
+    #[test]
+    fn regex_constraint_is_anchored() {
+        let digits = RegexConstraint::new(r"\d+", "digits").unwrap();
+        assert!(digits.validate("123").is_ok());
+        assert!(digits.validate("1abc").is_err());
+        assert!(digits.validate("abc1").is_err());
+
+        // An alternation is anchored as a whole.
+        let either = RegexConstraint::new("cat|dog", "pet").unwrap();
+        assert!(either.validate("cat").is_ok());
+        assert!(either.validate("dog").is_ok());
+        assert!(either.validate("catalog").is_err());
+        assert!(either.validate("hotdog").is_err());
+
+        // Explicit anchors still work.
+        let lower = RegexConstraint::new(r"^[a-z]+$", "lower").unwrap();
+        assert!(lower.validate("abc").is_ok());
+        assert!(lower.validate("abC").is_err());
+    }
+
     use super::*;
     use bytes::Bytes;
 

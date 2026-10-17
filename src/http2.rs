@@ -399,6 +399,13 @@ impl Http2Builder {
         let mut builder =
             hyper::server::conn::http2::Builder::new(hyper_util::rt::TokioExecutor::new());
 
+        // A timer is not optional: every `Http2Config` preset sets
+        // `keep_alive_interval`, and hyper panics ("You must supply a timer.")
+        // on the first connection that arms a keep-alive ping without one.
+        // It is set unconditionally so a config without keep-alive cannot
+        // reintroduce that by later gaining one.
+        builder.timer(hyper_util::rt::TokioTimer::new());
+
         builder
             .initial_connection_window_size(self.config.initial_connection_window_size)
             .initial_stream_window_size(self.config.initial_stream_window_size)

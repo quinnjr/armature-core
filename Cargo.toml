@@ -1,6 +1,6 @@
 [package]
 name = "armature-core"
-version = "0.10.0"
+version = "0.11.0"
 edition = "2024"
 rust-version = "1.94.1"
 autobenches = false  # Disable auto-discovery, use explicit [[bench]] only
@@ -13,7 +13,7 @@ keywords = ["http", "async", "web", "framework"]
 categories = ["web-programming::http-server", "asynchronous"]
 
 [dependencies]
-armature-log = { version = "0.2" }
+armature-log = { version = "0.3" }
 inventory = "0.3"
 dependency-injector = "2.1.0"
 matchit = "0.9"  # High-performance router (same as Axum)
@@ -22,7 +22,7 @@ matchit = "0.9"  # High-performance router (same as Axum)
 # parallel set, and — under the default `h1-backend` feature — serves HTTP/1.1
 # through it rather than through hyper. The `tls` feature is what lets the
 # HTTPS listeners hand it a rustls config; hyper still serves HTTP/2.
-armature-h1 = { version = "0.3", features = ["tls"] }
+armature-h1 = { version = "0.4", features = ["tls"] }
 tokio = { version = "1.53", features = ["rt", "rt-multi-thread", "macros", "sync", "time", "net", "io-util", "fs", "signal"] }
 hyper = { version = "1.11", features = ["full"] }
 hyper-util = { version = "0.1", features = ["server", "http1", "http2", "tokio"] }
@@ -45,6 +45,9 @@ simd-json = { version = "0.18", optional = true }
 bumpalo = { version = "3.20", features = ["collections"] }
 serde_urlencoded = "0.7"
 urlencoding = "2.1"  # Fast URL encoding/decoding
+# Collision-resistant digest for attacker-controlled cache keys (QUERY bodies)
+# and ETags.
+sha2 = "0.10"
 httpdate = "1.0"
 async-trait = "0.1"
 flate2 = "1.1.10"
@@ -74,7 +77,8 @@ tracing-appender = "0.2"
 # TLS/HTTPS support
 rustls = { version = "0.23.45", features = ["ring"] }
 tokio-rustls = "0.26"
-rustls-pemfile = "2.2"
+# PEM parsing via `PemObject` (replaces the unmaintained `rustls-pemfile`).
+rustls-pki-types = { version = "1.12", features = ["std"] }
 rcgen = { version = "0.14", optional = true }
 
 # HTTP/3 (QUIC) support - optional

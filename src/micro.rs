@@ -764,84 +764,107 @@ impl Cors {
     }
 }
 
+impl Cors {
+    /// The `Access-Control-Allow-Origin` value for a request `Origin`, and
+    /// whether credentials may accompany it; `None` if the origin is not
+    /// allowed.
+    ///
+    /// Mirrors `armature-security`'s rules:
+    /// - the opaque origin `null` (sandboxed iframes, `file:` pages, some
+    ///   redirects) is never allowed or reflected;
+    /// - a `*` entry allows any origin **without credentials**: the wildcard
+    ///   revokes `allow_credentials` rather than turning into reflection of
+    ///   whatever origin asks, which would let every site on the web make
+    ///   credentialed reads;
+    /// - a listed origin (ASCII case-insensitive) is reflected, with
+    ///   credentials if configured.
+    fn decide(&self, origin: &str) -> Option<(String, bool)> {
+        if origin.eq_ignore_ascii_case("null") {
+            return None;
+        }
+        if self
+            .allowed_origins
+            .iter()
+            .any(|o| o.eq_ignore_ascii_case(origin))
+        {
+            return Some((origin.to_string(), self.allow_credentials));
+        }
+        if self.allowed_origins.iter().any(|o| o == "*") {
+            return Some(("*".to_string(), false));
+        }
+        None
+    }
+}
+
+/// Add `token` to the response's `Vary`, merging with any existing value.
+pub(crate) fn add_vary(response: &mut HttpResponse, token: &str) {
+    let merged = match response.headers.get("Vary") {
+        None => token.to_string(),
+        Some(existing) => {
+            let already_present = existing.trim() == "*"
+                || existing
+                    .split(',')
+                    .any(|part| part.trim().eq_ignore_ascii_case(token));
+            if already_present {
+                return;
+            }
+            format!("{}, {}", existing, token)
+        }
+    };
+    response.headers.insert("Vary".to_string(), merged);
+}
+
 impl Middleware for Cors {
     fn call(
         &self,
         req: HttpRequest,
         next: Next,
     ) -> Pin<Box<dyn Future<Output = Result<HttpResponse, Error>> + Send>> {
-        let is_preflight = req.method == "OPTIONS";
-        let allowed_origins = self.allowed_origins.clone();
+        let request_origin = req.headers.get("origin").map(str::to_owned);
+        // A preflight is `OPTIONS` carrying `Origin` and
+        // `Access-Control-Request-Method` (Fetch standard). Any other `OPTIONS`
+        // is an ordinary request and is routed like one.
+        let is_preflight = req.method == "OPTIONS"
+            && request_origin.is_some()
+            && req.headers.contains_key("access-control-request-method");
+        let decision = request_origin.as_deref().and_then(|o| self.decide(o));
         let allowed_methods = self.allowed_methods.join(", ");
         let allowed_headers = self.allowed_headers.join(", ");
-        let allow_credentials = self.allow_credentials;
         let max_age = self.max_age;
 
-        // Resolve the `Access-Control-Allow-Origin` value (if any) for the
-        // request's actual `Origin` header, per the configured
-        // `allowed_origins` list. A literal `"*"` entry allows any origin; if
-        // `allow_credentials` is set, the actual origin is reflected instead
-        // of `*`, since the CORS spec forbids combining a wildcard origin
-        // with credentialed requests. Origins not in the list yield `None`,
-        // so no `Access-Control-Allow-Origin` header is emitted.
-        let allowed_origin_for = move |origin: &str| -> Option<String> {
-            if allowed_origins.iter().any(|o| o == "*") {
-                if allow_credentials {
-                    Some(origin.to_string())
-                } else {
-                    Some("*".to_string())
-                }
-            } else if allowed_origins.iter().any(|o| o == origin) {
-                Some(origin.to_string())
-            } else {
-                None
-            }
-        };
-
         Box::pin(async move {
-            let request_origin = req.headers.get("origin").map(str::to_owned);
-
-            if is_preflight {
+            let mut response = if is_preflight {
                 let mut response = HttpResponse::no_content();
-                if let Some(origin) = request_origin.as_deref()
-                    && let Some(allow_origin) = allowed_origin_for(origin)
-                {
+                if decision.is_some() {
                     response
                         .headers
-                        .insert("Access-Control-Allow-Origin".to_string(), allow_origin);
+                        .insert("Access-Control-Allow-Methods".to_string(), allowed_methods);
+                    response
+                        .headers
+                        .insert("Access-Control-Allow-Headers".to_string(), allowed_headers);
+                    response
+                        .headers
+                        .insert("Access-Control-Max-Age".to_string(), max_age.to_string());
                 }
                 response
-                    .headers
-                    .insert("Access-Control-Allow-Methods".to_string(), allowed_methods);
+            } else {
+                next(req).await?
+            };
+
+            if let Some((allow_origin, credentials)) = decision {
                 response
                     .headers
-                    .insert("Access-Control-Allow-Headers".to_string(), allowed_headers);
-                response
-                    .headers
-                    .insert("Access-Control-Max-Age".to_string(), max_age.to_string());
-                if allow_credentials {
+                    .insert("Access-Control-Allow-Origin".to_string(), allow_origin);
+                if credentials {
                     response.headers.insert(
                         "Access-Control-Allow-Credentials".to_string(),
                         "true".to_string(),
                     );
                 }
-                return Ok(response);
             }
-
-            let mut response = next(req).await?;
-            if let Some(origin) = request_origin.as_deref()
-                && let Some(allow_origin) = allowed_origin_for(origin)
-            {
-                response
-                    .headers
-                    .insert("Access-Control-Allow-Origin".to_string(), allow_origin);
-            }
-            if allow_credentials {
-                response.headers.insert(
-                    "Access-Control-Allow-Credentials".to_string(),
-                    "true".to_string(),
-                );
-            }
+            // The answer depends on the request's `Origin`, so a shared cache
+            // must key on it.
+            add_vary(&mut response, "Origin");
 
             Ok(response)
         })
@@ -1063,23 +1086,7 @@ pub(crate) async fn apply_gzip_offload(
 /// is a no-op if `Accept-Encoding` is already present as a token
 /// (case-insensitive), so repeated calls don't pile up duplicates.
 pub(crate) fn add_vary_accept_encoding(response: &mut HttpResponse) {
-    const TOKEN: &str = "Accept-Encoding";
-
-    let merged = match response.headers.get("Vary") {
-        None => TOKEN.to_string(),
-        Some(existing) => {
-            let already_present = existing.trim() == "*"
-                || existing
-                    .split(',')
-                    .any(|part| part.trim().eq_ignore_ascii_case(TOKEN));
-            if already_present {
-                return;
-            }
-            format!("{}, {}", existing, TOKEN)
-        }
-    };
-
-    response.headers.insert("Vary".to_string(), merged);
+    add_vary(response, "Accept-Encoding");
 }
 
 impl Default for Compress {
@@ -1151,7 +1158,7 @@ fn error_response_parts(e: &Error) -> (u16, String) {
 ///
 /// Note: the body-size-limit pattern used here and in
 /// [`handle_micro_request`] (the `Content-Length` fast-path, the
-/// `Limited`-stream cap, and this `413` response shape) mirrors the
+/// streaming cap (`application::read_body`), and this `413` response shape) mirrors the
 /// equivalent logic in `Application::handle_request`
 /// (`armature-core/src/application.rs`) — a separate implementation, not a
 /// shared helper. If this logic changes, check whether that implementation
@@ -1168,75 +1175,120 @@ fn payload_too_large_response() -> HttpResponse {
 
 /// Convert an [`HttpResponse`] into a hyper response with a fully-buffered
 /// `Full` body.
+///
+/// Applies the same wire rules as `Application`'s adapters: a header a handler
+/// made unwritable (CR/LF/NUL, a non-token name) fails the response closed
+/// with a 500 rather than panicking the connection task, and framing fields
+/// (`Content-Length`, `Transfer-Encoding`, `Connection`, ...) are left to the
+/// transport.
 fn to_hyper_response(resp: HttpResponse) -> hyper::Response<http_body_util::Full<bytes::Bytes>> {
+    use crate::application::response_wire::{
+        internal_error_envelope, name_is_token, transport_field, value_is_emittable,
+    };
+
+    fn fail_closed() -> hyper::Response<http_body_util::Full<bytes::Bytes>> {
+        let envelope = internal_error_envelope();
+        let content_type = envelope.headers.get("Content-Type").cloned();
+        let mut response =
+            hyper::Response::new(http_body_util::Full::new(envelope.into_body_bytes()));
+        *response.status_mut() = hyper::StatusCode::INTERNAL_SERVER_ERROR;
+        if let Some(ct) = content_type
+            && let Ok(value) = hyper::header::HeaderValue::from_str(&ct)
+        {
+            response
+                .headers_mut()
+                .insert(hyper::header::CONTENT_TYPE, value);
+        }
+        response
+    }
+
     let mut builder = hyper::Response::builder().status(resp.status);
 
     for (name, value) in &resp.headers {
+        if !name_is_token(name) || !value_is_emittable(value.as_bytes()) {
+            tracing::warn!("Handler produced an unwritable header; failing the response closed");
+            return fail_closed();
+        }
+        if transport_field(name).is_some() {
+            continue;
+        }
         builder = builder.header(name.as_str(), value.as_str());
     }
     for cookie in &resp.cookies {
+        if !value_is_emittable(cookie.as_bytes()) {
+            tracing::warn!("Handler produced an unwritable cookie; failing the response closed");
+            return fail_closed();
+        }
         builder = builder.header("Set-Cookie", cookie.as_str());
     }
 
     builder
         .body(http_body_util::Full::new(resp.into_body_bytes()))
-        .unwrap()
+        .unwrap_or_else(|_| fail_closed())
 }
 
 /// Convert a single hyper request into our [`HttpRequest`], dispatch it
 /// through `app`, and convert the result back into a hyper response.
 ///
-/// Enforces `app.max_body_size` *before* the body is buffered in memory,
-/// mirroring `application.rs`'s `handle_request`: a `Content-Length`
-/// fast-path rejects declared-oversized requests with `413` before any body
-/// bytes are read, and a streaming [`http_body_util::Limited`] wrapper
-/// enforces the same cap while collecting chunked or undeclared bodies.
-/// Body-read errors that are *not* a size-limit violation (malformed chunked
-/// framing, a connection reset mid-body, ...) are rejected with `400 Bad
-/// Request` rather than silently substituted with an empty body — this now
-/// genuinely matches `handle_request`'s handling of the same class of error,
-/// rather than merely claiming to. One difference remains: this function's
-/// error type is `Infallible` (required by the hyper `Service` it backs), so
-/// a genuine `hyper::Error` is folded into the same `400` response here
-/// instead of being propagated to fail the connection the way
-/// `handle_request` does. Split out from [`run_server`]/[`serve`] so the
-/// body-limit behavior is directly unit-testable without a real socket.
+/// The same admission rules as `Application`'s serve paths: the path is
+/// canonicalized (or refused with `400`) before middleware or routing see it,
+/// a declared `Content-Length` over `app.max_body_size` is refused with `413`
+/// before any body byte is read, and the body is read under the same cap and
+/// the default [`BodyReadPolicy`](crate::BodyReadPolicy) (inactivity and
+/// minimum-rate deadlines, `408` when broken). Body-read errors that are *not*
+/// a size or time violation (malformed chunked framing, a reset mid-body) are
+/// answered `400` rather than substituted with an empty body. This function's
+/// error type is `Infallible` (required by the hyper `Service` it backs), so a
+/// genuine `hyper::Error` is folded into that `400`. Split out from
+/// [`run_server`]/[`serve`] so the body-limit behavior is directly
+/// unit-testable without a real socket.
 async fn handle_micro_request(
     req: hyper::Request<hyper::body::Incoming>,
     app: Arc<BuiltApp>,
     peer: Option<std::net::SocketAddr>,
 ) -> Result<hyper::Response<http_body_util::Full<bytes::Bytes>>, std::convert::Infallible> {
-    use http_body_util::{BodyExt, Limited};
+    use crate::application::{BodyReadError, read_body};
+    use hyper::body::Body as _;
+    use std::task::Poll;
 
     // Convert hyper request to our HttpRequest. `Method::from` matches the
     // token against the well-known set, so the common case is a unit variant
     // rather than a per-request `String`.
     let method = crate::Method::from(req.method().as_str());
-    let path = req
-        .uri()
-        .path_and_query()
-        .map(|pq| pq.to_string())
-        .unwrap_or_else(|| "/".to_string());
+    let query = req.uri().query().map(str::to_owned);
 
-    let mut http_req = HttpRequest::new(method.clone(), path.clone()).with_peer(peer);
+    // One spelling of the path for middleware, routing and handlers.
+    let path = match crate::routing::canonicalize_path(req.uri().path()) {
+        Ok(path) => path.into_owned(),
+        Err(rejection) => {
+            tracing::warn!(method = %method, reason = %rejection, "Rejected a non-canonical request path");
+            return Ok(to_hyper_response(
+                Error::BadRequest(rejection.to_string()).to_client_response(),
+            ));
+        }
+    };
+    let target = match &query {
+        Some(q) => format!("{path}?{q}"),
+        None => path.clone(),
+    };
 
-    // Copy headers. One copy per value, because hyper's `HeaderValue` owns its
-    // own buffer and cannot be projected into our `Bytes`; the name goes in as
-    // a `&str`, so it costs nothing for a well-known header.
+    let mut http_req = HttpRequest::new(method.clone(), target).with_peer(peer);
+
+    // Copy headers, keeping every occurrence of a repeated field.
     for (name, value) in req.headers() {
         http_req
             .headers
-            .insert(name.as_str(), Bytes::copy_from_slice(value.as_bytes()));
+            .append(name.as_str(), Bytes::copy_from_slice(value.as_bytes()));
     }
 
-    // Fast-path rejection: if the client declares a Content-Length larger
-    // than the configured limit, reject with 413 before buffering any body
-    // bytes. The streaming `Limited` wrapper below still enforces the limit
-    // for chunked or undeclared bodies.
+    // Fast-path rejection: a declared Content-Length over the limit is
+    // refused before any body byte is buffered. Only the first element of a
+    // comma list is parsed, as on `Application`'s serve paths.
     if let Some(declared_len) = http_req
         .headers
         .get("content-length")
-        .and_then(|v| v.parse::<usize>().ok())
+        .and_then(|v| v.split(',').next())
+        .and_then(|v| v.trim().parse::<usize>().ok())
         && declared_len > app.max_body_size
     {
         tracing::warn!(
@@ -1249,13 +1301,26 @@ async fn handle_micro_request(
         return Ok(to_hyper_response(payload_too_large_response()));
     }
 
-    // Read body, enforcing the configured size limit *before* it is fully
-    // buffered in memory — a client sending an arbitrarily large body would
-    // otherwise be buffered into a `Vec<u8>` with no cap at all.
-    let limited = Limited::new(req.into_body(), app.max_body_size);
-    let body_bytes = match limited.collect().await {
-        Ok(collected) => collected.to_bytes(),
-        Err(err) if err.is::<http_body_util::LengthLimitError>() => {
+    let mut body = req.into_body();
+    let read = read_body(
+        |cx| loop {
+            return match std::pin::Pin::new(&mut body).poll_frame(cx) {
+                Poll::Pending => Poll::Pending,
+                Poll::Ready(None) => Poll::Ready(None),
+                Poll::Ready(Some(Err(e))) => Poll::Ready(Some(Err(e))),
+                Poll::Ready(Some(Ok(frame))) => match frame.into_data() {
+                    Ok(data) => Poll::Ready(Some(Ok(data))),
+                    Err(_) => continue,
+                },
+            };
+        },
+        app.max_body_size,
+        crate::BodyReadPolicy::default(),
+    )
+    .await;
+    match read {
+        Ok(body_bytes) => http_req.body = body_bytes,
+        Err(BodyReadError::TooLarge) => {
             tracing::warn!(
                 method = %method,
                 path = %path,
@@ -1264,21 +1329,22 @@ async fn handle_micro_request(
             );
             return Ok(to_hyper_response(payload_too_large_response()));
         }
-        // Any other body-read error (e.g. malformed chunked framing or a
-        // dropped connection mid-body) is a genuine failure to receive the
-        // request as sent. Substituting an empty body here would let the
-        // request proceed to the handler as if the client had sent nothing,
-        // potentially producing a success response for a body that never
-        // actually arrived intact. Reject with 400 instead, matching
-        // `application.rs::handle_request`'s handling of non-length-limit
-        // body-read errors.
-        Err(err) => {
+        Err(BodyReadError::TimedOut) => {
+            tracing::warn!(method = %method, path = %path, "Request body not received in time");
+            return Ok(to_hyper_response(
+                Error::RequestTimeout("request body was not received in time".to_string())
+                    .to_client_response(),
+            ));
+        }
+        // Any other body-read error (malformed chunked framing, a dropped
+        // connection mid-body) is a genuine failure to receive the request as
+        // sent; substituting an empty body would let the handler act on a body
+        // that never arrived intact.
+        Err(BodyReadError::Source(err)) => {
             tracing::warn!(method = %method, path = %path, error = %err, "Failed to read request body");
             return Ok(to_hyper_response(HttpResponse::new(400)));
         }
-    };
-    // Hyper already handed back `Bytes`, so this is a refcount move, not a copy.
-    http_req.body = body_bytes;
+    }
 
     // Handle request
     let response = app.handle(http_req).await;
@@ -1288,12 +1354,11 @@ async fn handle_micro_request(
         Ok(resp) => Ok(to_hyper_response(resp)),
         Err(e) => {
             let (status, body) = error_response_parts(&e);
-
-            Ok(hyper::Response::builder()
-                .status(status)
-                .header("Content-Type", "application/json")
-                .body(http_body_util::Full::new(bytes::Bytes::from(body)))
-                .unwrap())
+            let mut response = HttpResponse::new(status);
+            response
+                .headers
+                .insert("Content-Type".to_string(), "application/json".to_string());
+            Ok(to_hyper_response(response.with_body(body.into_bytes())))
         }
     }
 }
@@ -1304,22 +1369,36 @@ async fn handle_micro_request(
 /// (`127.0.0.1:0`), read back the OS-assigned address via
 /// `TcpListener::local_addr`, and drive the server directly — without the
 /// bind/drop/rebind race a port-0-then-reconnect test would otherwise have.
+///
+/// Every connection is served with a header-read deadline (see
+/// [`crate::pipeline::HEADER_READ_TIMEOUT`]) and the loop serves at most
+/// [`crate::pipeline::DEFAULT_MAX_CONNECTIONS`] connections at once.
 async fn serve(listener: tokio::net::TcpListener, app: Arc<BuiltApp>) -> std::io::Result<()> {
-    use hyper::server::conn::http1;
     use hyper::service::service_fn;
     use hyper_util::rt::TokioIo;
 
+    let limit = Arc::new(tokio::sync::Semaphore::new(
+        crate::pipeline::DEFAULT_MAX_CONNECTIONS,
+    ));
     loop {
+        let permit = Arc::clone(&limit)
+            .acquire_owned()
+            .await
+            .expect("connection-limit semaphore is never closed");
         let (stream, client_addr) = listener.accept().await?;
         let io = TokioIo::new(stream);
         let app = app.clone();
 
         tokio::spawn(async move {
+            let _permit = permit;
             let service = service_fn(move |req: hyper::Request<hyper::body::Incoming>| {
                 handle_micro_request(req, app.clone(), Some(client_addr))
             });
 
-            if let Err(err) = http1::Builder::new().serve_connection(io, service).await {
+            if let Err(err) = crate::pipeline::hardened_http1_builder()
+                .serve_connection(io, service)
+                .await
+            {
                 tracing::error!("Connection error: {}", err);
             }
         });
@@ -1342,6 +1421,127 @@ mod tests {
 
     async fn test_handler(_req: HttpRequest) -> Result<HttpResponse, Error> {
         Ok(HttpResponse::ok())
+    }
+
+    fn cors_request(method: &str, origin: Option<&str>, acrm: bool) -> HttpRequest {
+        let mut req = HttpRequest::new(method, "/x".to_string());
+        if let Some(origin) = origin {
+            req.headers.insert("origin", origin);
+        }
+        if acrm {
+            req.headers.insert("access-control-request-method", "POST");
+        }
+        req
+    }
+
+    fn ok_next() -> Next {
+        Box::new(|_req| Box::pin(async { Ok(HttpResponse::ok()) }))
+    }
+
+    /// H7: a wildcard never becomes credentialed reflection of any origin.
+    #[tokio::test]
+    async fn cors_wildcard_revokes_credentials() {
+        let cors = Cors::permissive().allow_credentials(true);
+        let response = cors
+            .call(
+                cors_request("GET", Some("https://evil.example"), false),
+                ok_next(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            response
+                .headers
+                .get("Access-Control-Allow-Origin")
+                .map(String::as_str),
+            Some("*")
+        );
+        assert!(
+            !response
+                .headers
+                .contains_key("Access-Control-Allow-Credentials")
+        );
+    }
+
+    #[tokio::test]
+    async fn cors_never_reflects_null_and_varies_on_origin() {
+        let cors = Cors::default()
+            .allowed_origins(["https://app.example", "null"])
+            .allow_credentials(true);
+        let response = cors
+            .call(cors_request("GET", Some("null"), false), ok_next())
+            .await
+            .unwrap();
+        assert!(!response.headers.contains_key("Access-Control-Allow-Origin"));
+        assert!(
+            !response
+                .headers
+                .contains_key("Access-Control-Allow-Credentials")
+        );
+        assert_eq!(
+            response.headers.get("Vary").map(String::as_str),
+            Some("Origin")
+        );
+
+        let response = cors
+            .call(
+                cors_request("GET", Some("https://app.example"), false),
+                ok_next(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            response
+                .headers
+                .get("Access-Control-Allow-Origin")
+                .map(String::as_str),
+            Some("https://app.example")
+        );
+        assert_eq!(
+            response
+                .headers
+                .get("Access-Control-Allow-Credentials")
+                .map(String::as_str),
+            Some("true")
+        );
+        assert_eq!(
+            response.headers.get("Vary").map(String::as_str),
+            Some("Origin")
+        );
+    }
+
+    /// Only `OPTIONS` + `Origin` + `Access-Control-Request-Method` is a
+    /// preflight; any other `OPTIONS` reaches the handler.
+    #[tokio::test]
+    async fn cors_only_intercepts_real_preflights() {
+        let cors = Cors::default();
+        let next: Next = Box::new(|_req| Box::pin(async { Ok(HttpResponse::new(299)) }));
+        let response = cors
+            .call(cors_request("OPTIONS", None, false), next)
+            .await
+            .unwrap();
+        assert_eq!(response.status, 299);
+
+        let next: Next = Box::new(|_req| Box::pin(async { Ok(HttpResponse::new(299)) }));
+        let response = cors
+            .call(
+                cors_request("OPTIONS", Some("https://a.example"), true),
+                next,
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status, 204);
+    }
+
+    /// A handler header with CR/LF fails the response closed instead of
+    /// panicking the connection task.
+    #[test]
+    fn an_unwritable_header_fails_closed_instead_of_panicking() {
+        let mut response = HttpResponse::ok();
+        response
+            .headers
+            .insert("X-Bad".to_string(), "a\r\nSet-Cookie: x=1".to_string());
+        assert_eq!(to_hyper_response(response).status(), 500);
     }
 
     #[test]

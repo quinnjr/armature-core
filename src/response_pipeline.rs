@@ -747,7 +747,7 @@ impl ConnectionPipeline {
     /// `cork = false` right after the write completes to flush any
     /// coalesced segments.
     #[cfg(unix)]
-    pub fn apply_cork(&self, fd: std::os::unix::io::RawFd, cork: bool) -> std::io::Result<()> {
+    pub fn apply_cork(&self, fd: std::os::fd::BorrowedFd<'_>, cork: bool) -> std::io::Result<()> {
         if self.config.use_tcp_cork {
             crate::socket_batch::set_tcp_cork(fd, cork)
         } else {
@@ -1109,16 +1109,18 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn test_apply_cork_honors_config() {
-        use std::os::unix::io::AsRawFd;
+        use std::os::fd::AsFd;
 
-        // Corking disabled: apply_cork must not touch the socket at all. An
-        // invalid fd proves it — a real setsockopt on -1 would fail EBADF.
-        // (On non-Linux unix `set_tcp_cork` is an Ok(()) stub, so this only
-        // demonstrates the short-circuit on Linux; it stays green elsewhere.)
+        // Corking disabled: apply_cork must not touch the socket at all. A
+        // non-socket fd proves it — a real setsockopt(TCP_CORK) on a file
+        // fails ENOTSOCK. (On non-Linux unix `set_tcp_cork` is an Ok(()) stub,
+        // so this only demonstrates the short-circuit on Linux; it stays green
+        // elsewhere.)
+        let not_a_socket = std::fs::File::open("/dev/null").expect("open /dev/null");
         let quiet = ConnectionPipeline::with_config(1, 8, ResponseWriterConfig::low_latency());
         assert!(!quiet.config().use_tcp_cork);
-        assert!(quiet.apply_cork(-1, true).is_ok());
-        assert!(quiet.apply_cork(-1, false).is_ok());
+        assert!(quiet.apply_cork(not_a_socket.as_fd(), true).is_ok());
+        assert!(quiet.apply_cork(not_a_socket.as_fd(), false).is_ok());
 
         // Corking enabled: the option is really set on a connected socket,
         // both on the way in and on the way out.
@@ -1129,8 +1131,8 @@ mod tests {
 
         let corked = ConnectionPipeline::with_config(2, 8, ResponseWriterConfig::high_throughput());
         assert!(corked.config().use_tcp_cork);
-        assert!(corked.apply_cork(stream.as_raw_fd(), true).is_ok());
-        assert!(corked.apply_cork(stream.as_raw_fd(), false).is_ok());
+        assert!(corked.apply_cork(stream.as_fd(), true).is_ok());
+        assert!(corked.apply_cork(stream.as_fd(), false).is_ok());
     }
 
     #[test]

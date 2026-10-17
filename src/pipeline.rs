@@ -165,8 +165,9 @@ pub struct PipelineConfig {
     ///
     /// Not wired on the hyper path: hyper's H1 builder only exposes
     /// `keep_alive(bool)` (used, hardcoded `true`) and a header-read timeout
-    /// with different semantics that requires a [`hyper::rt::Timer`] this
-    /// crate does not currently supply.
+    /// with different semantics — which is applied, at
+    /// [`HEADER_READ_TIMEOUT`], by every hyper HTTP/1.1 builder this crate
+    /// creates.
     pub keep_alive_timeout: Duration,
 
     /// How long a handler may run before the connection answers `408` and
@@ -177,17 +178,14 @@ pub struct PipelineConfig {
     /// handler future, and so covers the handler's reads of the request body
     /// as well as its own work.
     ///
-    /// `None` by default, and deliberately: the hyper path supplies no
-    /// [`hyper::rt::Timer`] and therefore imposes no request deadline at all,
-    /// so defaulting this to a finite value would make a backend swap silently
-    /// cancel every long-poll, SSE stream and slow upload the previous
-    /// behaviour allowed. Set it when you know your handlers' upper bound —
-    /// a request deadline is worth having, but it has to be one you asked for.
+    /// `None` by default, and deliberately: a finite default would cancel
+    /// every long-poll, SSE stream and slow handler. Set it when you know your
+    /// handlers' upper bound.
     ///
-    /// Note what this does *not* bound: a peer that has sent a complete head
-    /// and then trickles its body. That is the same deadline, so a deployment
-    /// exposed directly to the internet rather than behind a proxy that
-    /// enforces its own request timeout should set this.
+    /// A peer that sends a complete head and then trickles its body is **not**
+    /// this deadline's job: every serve path reads the body under the
+    /// application's [`BodyReadPolicy`](crate::BodyReadPolicy) (30 s of
+    /// inactivity, a minimum transfer rate), independent of this setting.
     pub request_timeout: Option<Duration>,
 
     /// How long a single response write may take before the connection is torn
@@ -257,6 +255,42 @@ pub struct PipelineConfig {
     /// method limits a *count* of headers (default 100), not a byte size,
     /// so this field cannot be applied to it without changing its meaning.
     pub max_header_size: usize,
+
+    /// Maximum connections one accept loop serves concurrently.
+    ///
+    /// **Wired on every hyper listener** (HTTP/1.1, HTTPS, h2c, HTTPS+h2, and
+    /// the HTTP→HTTPS redirect server): once this many connections are open the
+    /// loop stops accepting until one closes, leaving new connections in the
+    /// kernel's listen backlog rather than spending memory on sockets it cannot
+    /// serve. Defaults to [`DEFAULT_MAX_CONNECTIONS`].
+    ///
+    /// On the `armature-h1` path it is split evenly (rounding up) across the
+    /// workers as `armature_h1::Limits::max_connections`, since each worker
+    /// owns its own accept loop.
+    pub max_connections: usize,
+}
+
+/// Default for [`PipelineConfig::max_connections`].
+pub const DEFAULT_MAX_CONNECTIONS: usize = 10_000;
+
+/// How long a hyper HTTP/1.1 connection may take to deliver a complete request
+/// head, applied by every hyper HTTP/1.1 builder this crate creates.
+///
+/// The slowloris defence for the hyper path: without it (and without a
+/// [`hyper::rt::Timer`], which hyper needs to enforce any deadline), a peer
+/// that sends one header byte at a time holds a connection forever.
+pub const HEADER_READ_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// A hyper HTTP/1.1 server builder with a timer and a header-read deadline.
+///
+/// The base every HTTP/1.1 builder in this crate starts from, so no listener
+/// can end up serving without a deadline.
+pub(crate) fn hardened_http1_builder() -> hyper::server::conn::http1::Builder {
+    let mut builder = hyper::server::conn::http1::Builder::new();
+    builder
+        .timer(hyper_util::rt::TokioTimer::new())
+        .header_read_timeout(HEADER_READ_TIMEOUT);
+    builder
 }
 
 impl Default for PipelineConfig {
@@ -277,6 +311,7 @@ impl Default for PipelineConfig {
             read_buffer_size: 8192,
             write_buffer_size: 8192,
             max_header_size: 16384,
+            max_connections: DEFAULT_MAX_CONNECTIONS,
         }
     }
 }
@@ -302,6 +337,7 @@ impl PipelineConfig {
             read_buffer_size: 16384,
             write_buffer_size: 16384,
             max_header_size: 32768,
+            max_connections: DEFAULT_MAX_CONNECTIONS,
         }
     }
 
@@ -322,6 +358,7 @@ impl PipelineConfig {
             read_buffer_size: 4096,
             write_buffer_size: 4096,
             max_header_size: 8192,
+            max_connections: DEFAULT_MAX_CONNECTIONS,
         }
     }
 
@@ -340,6 +377,7 @@ impl PipelineConfig {
             read_buffer_size: 4096,
             write_buffer_size: 4096,
             max_header_size: 8192,
+            max_connections: DEFAULT_MAX_CONNECTIONS,
         }
     }
 }
@@ -408,6 +446,13 @@ impl PipelineConfigBuilder {
     /// Set maximum header size
     pub fn max_header_size(mut self, size: usize) -> Self {
         self.config.max_header_size = size;
+        self
+    }
+
+    /// Set the per-accept-loop connection cap (see
+    /// [`PipelineConfig::max_connections`]).
+    pub fn max_connections(mut self, max: usize) -> Self {
+        self.config.max_connections = max;
         self
     }
 
@@ -631,9 +676,12 @@ impl PipelinedHttp1Builder {
     /// `keep_alive_timeout`, `max_requests_per_connection`,
     /// `write_buffer_size`, `max_header_size`) are not wired through hyper's
     /// H1 builder.
+    ///
+    /// Every builder also carries a [`hyper::rt::Timer`] and the
+    /// [`HEADER_READ_TIMEOUT`] head deadline (see [`hardened_http1_builder`]).
     #[inline]
     pub fn configure_hyper_builder(&self) -> hyper::server::conn::http1::Builder {
-        let mut builder = hyper::server::conn::http1::Builder::new();
+        let mut builder = hardened_http1_builder();
 
         // Enable pipeline flush for batched response sending
         builder.pipeline_flush(self.config.pipeline_flush);

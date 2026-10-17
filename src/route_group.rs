@@ -6,19 +6,29 @@
 //! - Guards
 //! - Configuration
 //!
+//! A group's guards and middleware are **enforced** on every route registered
+//! through it ([`RouteGroup::add_route`] / [`RouteGroup::route`]): each such
+//! route runs the group's middleware (outermost first), then its guards, then
+//! the handler. They are bound to the route itself, not to a URL prefix, so no
+//! spelling of the path reaches the handler around them.
+//!
 //! # Examples
 //!
 //! ```
-//! use armature_core::RouteGroup;
+//! use armature_core::{Error, HttpMethod, HttpRequest, HttpResponse, RouteGroup, Router};
 //!
-//! let api_group = RouteGroup::new()
-//!     .prefix("/api/v1");
+//! async fn list_users(_req: HttpRequest) -> Result<HttpResponse, Error> {
+//!     Ok(HttpResponse::ok())
+//! }
 //!
-//! // Add routes to the group
-//! // These routes will inherit the prefix and middleware
+//! let mut router = Router::new();
+//! let api_group = RouteGroup::new().prefix("/api/v1");
+//! api_group.route(&mut router, HttpMethod::GET, "/users", list_users);
+//! assert_eq!(router.routes[0].path, "/api/v1/users");
 //! ```
 
-use crate::{Error, Guard, GuardContext, Middleware};
+use crate::handler::IntoHandler;
+use crate::{Error, Guard, GuardContext, HttpMethod, Middleware, Route, Router};
 use std::sync::Arc;
 
 /// A guard that checks all guards in a list
@@ -132,7 +142,8 @@ impl RouteGroup {
 
     /// Add middleware to this group
     ///
-    /// Middleware will be applied to all routes in this group.
+    /// Runs, outermost first, for every route registered through this group,
+    /// before the group's guards.
     pub fn middleware(mut self, middleware: Arc<dyn Middleware>) -> Self {
         self.middleware.push(middleware);
         self
@@ -146,7 +157,8 @@ impl RouteGroup {
 
     /// Add a guard to this group
     ///
-    /// Guards will be checked for all routes in this group.
+    /// Checked for every route registered through this group, after the
+    /// group's middleware; a guard returning `Ok(false)` answers `403`.
     ///
     /// # Examples
     ///
@@ -179,6 +191,35 @@ impl RouteGroup {
     pub fn with_guards(mut self, guards: Vec<Box<dyn Guard>>) -> Self {
         self.guards.extend(guards.into_iter().map(Arc::from));
         self
+    }
+
+    /// Register `route` through this group.
+    ///
+    /// The group's prefix is applied to the route's path, and the group's
+    /// middleware and guards are bound to the route so they run on every
+    /// request it serves, however that request spelled the path.
+    pub fn add_route(&self, router: &mut Router, mut route: Route) -> &Self {
+        route.path = self.apply_prefix(&route.path);
+        let index = router.routes.len();
+        router.add_route(route);
+        router.layer_routes(index..index + 1, &self.middleware, &self.guards);
+        self
+    }
+
+    /// Register `handler` for `method` at `path` (prefixed) through this group.
+    ///
+    /// See [`RouteGroup::add_route`].
+    pub fn route<H, Args>(
+        &self,
+        router: &mut Router,
+        method: HttpMethod,
+        path: &str,
+        handler: H,
+    ) -> &Self
+    where
+        H: IntoHandler<Args>,
+    {
+        self.add_route(router, Route::new(method, path, handler))
     }
 
     /// Get the prefix for this group
@@ -308,6 +349,83 @@ mod tests {
         let group = RouteGroup::new();
         assert_eq!(group.get_prefix(), "");
         assert_eq!(group.apply_prefix("/users"), "/users");
+    }
+
+    async fn ok_handler(_req: crate::HttpRequest) -> Result<crate::HttpResponse, Error> {
+        Ok(crate::HttpResponse::ok())
+    }
+
+    struct DenyGuard;
+
+    #[async_trait::async_trait]
+    impl Guard for DenyGuard {
+        async fn can_activate(&self, _context: &GuardContext) -> Result<bool, Error> {
+            Ok(false)
+        }
+    }
+
+    /// Records the order middleware and guards run in.
+    struct Recorder(Arc<std::sync::Mutex<Vec<&'static str>>>, &'static str);
+
+    #[async_trait::async_trait]
+    impl Middleware for Recorder {
+        async fn handle(
+            &self,
+            req: crate::HttpRequest,
+            next: crate::Next,
+        ) -> Result<crate::HttpResponse, Error> {
+            self.0.lock().unwrap().push(self.1);
+            next(req).await
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl Guard for Recorder {
+        async fn can_activate(&self, _context: &GuardContext) -> Result<bool, Error> {
+            self.0.lock().unwrap().push(self.1);
+            Ok(true)
+        }
+    }
+
+    /// The regression: a group guard used to be recorded and never run.
+    #[tokio::test]
+    async fn a_group_guard_is_enforced_on_every_spelling_of_the_path() {
+        let mut router = Router::new();
+        RouteGroup::new()
+            .prefix("/admin")
+            .guard(Box::new(DenyGuard))
+            .route(&mut router, HttpMethod::GET, "/users", ok_handler);
+        let optimized = crate::route_cache::OptimizedRouter::from_router(&router);
+
+        for path in ["/admin/users", "//admin/users", "/admin//users/"] {
+            let linear = router
+                .route(crate::HttpRequest::new("GET", path))
+                .await
+                .unwrap();
+            assert_eq!(linear.status, 403, "{path} via Router");
+            let fast = optimized
+                .route(crate::HttpRequest::new("GET", path))
+                .await
+                .unwrap();
+            assert_eq!(fast.status, 403, "{path} via OptimizedRouter");
+        }
+    }
+
+    #[tokio::test]
+    async fn group_middleware_runs_before_group_guards() {
+        let log = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let mut router = Router::new();
+        RouteGroup::new()
+            .middleware(Arc::new(Recorder(log.clone(), "middleware")))
+            .guard(Box::new(Recorder(log.clone(), "guard")))
+            .route(&mut router, HttpMethod::GET, "/x", ok_handler);
+
+        let response = router
+            .route(crate::HttpRequest::new("GET", "/x"))
+            .await
+            .unwrap();
+        assert_eq!(response.status, 200);
+        assert_eq!(*log.lock().unwrap(), vec!["middleware", "guard"]);
     }
 
     #[test]

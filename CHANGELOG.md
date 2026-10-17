@@ -10,6 +10,74 @@ Changes at or before `0.6.0` are recorded in the workspace
 
 ## [Unreleased]
 
+### Security
+
+- **Guards can no longer be bypassed by spelling a path differently (C1).** Every serve path (armature-h1, hyper HTTP/1.1 and HTTP/2, HTTP/3, `micro`) now canonicalizes the request path once, before middleware, guards and routing, and rewrites the target to it (`routing::canonicalize_path`): `//` collapses, percent-encoded unreserved characters decode, and `.`/`..` segments, `%2F`, `%5C`, `%00`, `\` and malformed escapes are refused with `400`. Module guards are now bound to the routes their module's controllers register rather than matched against a raw URL prefix, so `GET //admin/users`, `/%61dmin/users` and controller base paths containing `:params` are all guarded.
+- **HTTP/2 no longer panics on every connection (H1).** `Http2Builder::configure_hyper_builder` supplies a `TokioTimer`; previously the keep-alive ping every preset enables made hyper panic ("You must supply a timer"), which under `panic = "abort"` killed the process.
+- **HTTP/3 goes through the full pipeline (H2).** QUIC requests now get path canonicalization, global middleware and guards, route-scoped guards, CORS, declared-length checks, the slow-body policy and exception filters, exactly like TCP. Multi-slice DATA chunks are no longer truncated to their first slice, and repeated header fields keep every occurrence.
+- **Guards fail closed (H5).** `AuthenticationGuard` requires a verified identity extension (`VerifiedIdentity` or `RequestRoles`) instead of any `Authorization: Bearer …` header; `RolesGuard::new(vec![])` means "any authenticated caller", not "everyone"; a module guard whose factory fails aborts registration; `RouteGroup::guard`/`with_guards`/`middleware` are now enforced on routes registered through the group. `ApiKeyGuard` compares keys in constant time.
+- **Slow-client defences on by default (H6, M39).** Request bodies are read under a `BodyReadPolicy` (30 s inactivity, 1 KiB/s minimum rate → `408`) on every transport, independent of handler timeouts; hyper HTTP/1.1 builders (including the HTTP→HTTPS redirect server) get a timer and a 10 s header-read timeout; every hyper TLS accept has a 10 s handshake timeout; hyper accept loops cap concurrent connections (`PipelineConfig::max_connections`, default 10 000); armature-h1 is handed the application's finite body cap instead of `u64::MAX`; a request for an unknown route is answered `404` before its body is read when no global guard or middleware is configured.
+- **CORS (H7).** `micro::Cors` never reflects the `null` origin, a `*` entry revokes credentials instead of reflecting any origin with `Allow-Credentials: true`, responses carry `Vary: Origin`, and only `OPTIONS` + `Origin` + `Access-Control-Request-Method` is treated as a preflight. `CorsMiddleware` never sends `Allow-Credentials` with `*` and routes non-preflight `OPTIONS`.
+- **Logging (M8).** `LoggerMiddleware`, `LoggingMiddleware` and the middleware chain log the path without its query string, which carries reset codes, OAuth `code`s and API keys.
+- **HTTP→HTTPS redirect (L1).** The `Location` host comes from an allowlist (`Application::with_https_redirect_hosts`), never verbatim from `Host`; unknown hosts get `400`; the query string is preserved; IPv6 authorities parse correctly.
+- **HMR WebSocket (L3).** Upgrades require the manager's random per-process token and a loopback (or explicitly allowed) `Origin`; the server refuses to start in release builds unless `HmrConfig::allow_in_release(true)`.
+- **`RegexConstraint` is anchored (L8):** the pattern must match the whole parameter (`\d+` no longer accepts `1abc`).
+- `micro`'s response conversion fails closed with a 500 on an unwritable handler header instead of panicking, and drops framing headers like `Application`'s adapters.
+- **Shared response cache no longer leaks per-user responses (H8).** `ResponseCache` only stores responses that state their own freshness (`s-maxage`, `max-age`, `Expires`, or `public`); it refuses requests carrying `Cookie` and responses setting a cookie unless the response is `public`, and never stores `Set-Cookie`. Header checks are case-insensitive. QUERY body cache keys use SHA-256 instead of an unkeyed 64-bit `DefaultHasher`, and the path and Vary values in the rendered key are length-prefixed so a crafted header cannot forge another variant's key. `invalidate_prefix` matches the stored path, not a substring of the key.
+- **`ETag::from_bytes` uses SHA-256** (was a 64-bit `DefaultHasher`, whose collisions could let a stale `If-Match` pass).
+- **Credentials redacted from `Debug` (H27).** `HeaderMap` and `Header` print `<redacted>` for `authorization`, `proxy-authorization`, `cookie`, `set-cookie` and `x-api-key`; `Cookies` prints names only. `HttpRequest`'s `Debug` inherits this.
+- **Error bodies don't echo the request target (M9).** `ErrorTransformer` no longer includes the path by default; when enabled it uses the path without the query. Its production logger logs the path only. The static-file 404 names neither path nor query.
+- **Cookie attribute injection (M12).** New typed `Cookie` builder validates names (RFC 9110 token), values (RFC 6265 `cookie-octet`), `Path` and `Domain`, and rejects `SameSite=None` without `Secure`. `HttpResponse::cookie` and `clear_cookie` validate and refuse (log, don't set) invalid input.
+- **`io_uring` soundness (M15).** Each `IoUringRuntime` operation carries its own `user_data` and `submit_one` loops until *its* CQE; it never returns while the kernel may still own the caller's buffer (a non-retryable wait failure poisons the ring and aborts). Locks are `parking_lot` (no poisoning panics).
+- **Deserialization errors are generic to clients (L2).** `Error::to_client_response` (and `ErrorTransformer` in production mode) replace the serde detail with a fixed message; the detail is logged at `debug`. `Validation` messages are application-authored and still returned.
+- **Static assets fail closed (L4).** A request path that cannot be canonicalized is a 404 rather than served from the unchecked joined path; index files, `.gz`/`.br` siblings and the SPA fallback are each canonicalized and must stay inside the root (symlinks out are ignored).
+- **Raw response writers validate fields (L6).** `ResponseChunks` drops header names that are not tokens and values (and `Set-Cookie`s) containing CR, LF or NUL; `MultiBufferCoalescer::write_header_line` returns an error for them.
+- **Disk health check uses `statvfs` (L10)** instead of spawning `df` through `PATH`.
+- **I/O safety (L24).** `socket_batch` and `epoll_tuning::configure_socket` take `BorrowedFd<'_>` instead of `RawFd`.
+- **NUMA allocations are whole pages (L25)**, so `mbind`/`MPOL_MF_MOVE` never touches memory outside the allocation.
+- `armature-h1` now caps connections per worker; `PipelineConfig::max_connections` is split across its workers.
+
+### Added
+
+- `AuthenticationGuard` implements `Default` (and `Clone`, `Copy`, `Debug`), so the type form `#[guard(AuthenticationGuard)]` / `#[use_guard(AuthenticationGuard)]` compiles.
+- `Application::use_middleware` — global middleware, run (NestJS order) before global guards, then route-scoped middleware and guards, then the handler.
+- `Application::try_create`, `Application::with_body_read_policy`, `Application::with_https_redirect_hosts`, `BodyReadPolicy`.
+- `VerifiedIdentity` — the extension an authentication layer inserts after verifying a credential.
+- `Router::layer_routes`, `routing::layer_handler`, `routing::canonicalize_path`, `routing::PathRejection`.
+- `RouteGroup::add_route` / `RouteGroup::route` — register routes through a group so its prefix, middleware and guards apply.
+- `OptimizedRouter::resolve` / `OptimizedRouter::dispatch` and `ResolvedRoute`.
+- `PipelineConfig::max_connections` (+ builder method), `pipeline::DEFAULT_MAX_CONNECTIONS`, `pipeline::HEADER_READ_TIMEOUT`.
+- `MiddlewareChain::len` / `is_empty`; `HmrConfig::allowed_origins` / `allow_origin` / `allow_in_release`; `HmrManager::token`.
+- `Cookie`, `SameSite`, `CookieError`; `HttpResponse::set_cookie` and `HttpResponse::cookie_raw`.
+- `Error::client_message`; `headers::is_sensitive_header`, `headers::SENSITIVE_HEADERS`, `headers::REDACTED`; `simd_parser::is_valid_header_value`.
+
+### Changed
+
+- **Breaking:** `AuthenticationGuard` no longer accepts a bare `Bearer` header and answers `401` without a verified identity. Migration: run an authentication middleware (e.g. `armature_auth::JwtAuthMiddleware`) via `Application::use_middleware` so it inserts `VerifiedIdentity`/`RequestRoles` before guards run.
+- **Breaking:** `RolesGuard` no longer checks the `Authorization` header; with an empty role list it requires a verified identity. Migration: as above.
+- **Breaking:** `Application::create` panics if a module guard cannot be instantiated (previously the module's routes were served unguarded). Migration: use `Application::try_create` to handle the error.
+- **Breaking:** module guards bind to their module's routes instead of URL prefixes; a guard no longer runs for an unrelated route that happens to share a prefix.
+- **Breaking:** non-canonical paths (`.`/`..` segments, `%2F`, `%5C`, `%00`, `\`, malformed `%`) are refused with `400`; handlers see the canonical target. Migration: clients must not send dot segments or encoded slashes.
+- **Breaking:** `Application::listen_with_config` with an HTTP redirect address fails unless `with_https_redirect_hosts` is set.
+- **Breaking:** `HmrManager::start_websocket_server` fails in release builds unless `HmrConfig::allow_in_release(true)`; clients must use the injected script (which carries the token).
+- **Breaking:** `RegexConstraint::new` anchors the pattern at both ends.
+- **Breaking:** `PipelineConfig` has a new public field, `max_connections`; struct literals need `..PipelineConfig::default()`.
+- With the default `h1-backend`, a declared `Content-Length` over the body cap is refused by armature-h1 with its own bare `413` (no JSON envelope/CORS) before the handler runs; streamed overruns still get the envelope.
+- `Http3Server::new` builds a standalone serve state (route-scoped guards enforced); `listen_h3`/`listen_dual_stack` share the application's.
+- **Breaking:** `ResponseCache::store` no longer stores responses without explicit freshness (the default TTL now applies only to `public` responses). Migration: send `Cache-Control: max-age=…`/`s-maxage=…`/`public`, or call `store_with_ttl`.
+- **Breaking:** `CacheKey::body_hash` is `Option<[u8; 32]>` (SHA-256), and rendered cache keys have a new format.
+- **Breaking:** `ETag::from_bytes` values change (64 hex chars of SHA-256).
+- **Breaking:** `HttpResponse::cookie(name, value)` no longer accepts attributes inside `value`. Migration: use `set_cookie(Cookie::new(..).http_only()...)`, or `cookie_raw` for a trusted pre-formatted value.
+- **Breaking:** `ErrorTransformer` path inclusion defaults to off. Migration: `.include_path(true)`.
+- **Breaking:** `MultiBufferCoalescer::write_header_line` returns `Result<(), Error>`.
+- **Breaking:** `socket_batch::{writev, readv, set_tcp_cork, set_tcp_nodelay, send_more, send_final}`, `BatchWriter`/`SendQueue::flush_to_fd`, `ScatterReader::read_from_fd`, `CorkManager::new` (now `CorkManager<'fd>`), `epoll_tuning::configure_socket` and `ConnectionPipeline::apply_cork` take `BorrowedFd<'_>`. Migration: pass `socket.as_fd()`. The non-unix `configure_socket` stub is removed.
+- TLS PEM parsing uses `rustls-pki-types`' `PemObject`; the unmaintained `rustls-pemfile` dependency is dropped (M32). Adds `sha2`.
+- `HttpsConfig::with_http_redirect` documents the required `Application::with_https_redirect_hosts`.
+
+### Fixed
+
+- Replaced two `fetch_update` calls (deprecated on current toolchains) with CAS loops in `load_balancer` and `streaming`.
+
 ## [0.10.0] - 2026-09-15
 
 ### Changed

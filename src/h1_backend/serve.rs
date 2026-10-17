@@ -82,8 +82,8 @@ impl Drop for ShutdownOnDrop {
 /// more than one request in flight per connection to limit. `mode` and
 /// `write_buffer_size` likewise have nothing to attach to.
 ///
-/// It takes no body-size argument, deliberately: armature-core enforces that
-/// cap itself, for the reason spelled out on `max_body_bytes` below.
+/// `max_body_size` is the application's body cap; see `max_body_bytes` below
+/// for why `armature-h1` is handed the same finite value.
 ///
 /// Two fields go the other way, and `PipelineConfig` does not warn about them
 /// because under hyper there was nothing to warn about: `pipeline_flush` and
@@ -95,47 +95,38 @@ impl Drop for ShutdownOnDrop {
 pub(crate) fn h1_config(
     addr: SocketAddr,
     pipeline: &PipelineConfig,
+    max_body_size: usize,
     workers: Option<usize>,
 ) -> Config {
     let limits = Limits {
         max_head_bytes: pipeline.max_header_size,
-        // Unbounded here on purpose: armature-core is the sole enforcer of the
-        // body cap on this path, and it has to be.
-        //
-        // `armature-h1` evaluates `max_body_bytes` in `framing::decide`, before
-        // the service is ever called, and answers a bare status-line 413 — no
-        // body, no CORS headers, connection closed. Configuring it with the
-        // framework's own cap therefore made `dispatch_via_h1`'s check
-        // unreachable for any declared `Content-Length`, and with it this
-        // framework's `{"error":"Payload Too Large","status":413}` envelope,
-        // which every other transport returns. A browser doing a CORS upload
-        // over the limit saw an opaque CORS failure rather than a 413. Nor does
-        // a headroom constant fix it: whatever the margin, a declaration past it
-        // trips armature-h1 first.
-        //
-        // Nothing is unprotected as a result. `dispatch_via_h1` rejects an
-        // over-limit declared length before a body byte is buffered, and reads
-        // the body through `Body::collect(max_body_size)`, which fails mid-read
-        // on an undeclared or chunked body that runs past the cap. Both answer
-        // with the envelope.
-        max_body_bytes: u64::MAX,
+        // The application's own cap, so the transport never accepts a body
+        // the framework would refuse. armature-core still enforces it too —
+        // `dispatch_via_h1` reads through `read_body(max_body_size)` and
+        // answers a streamed overrun with the framework's 413 envelope — but a
+        // bound that only holds while every future code path remembers to
+        // apply it is not a bound. The cost: a *declared* `Content-Length`
+        // over the cap is now refused by `armature-h1`'s `framing::decide`
+        // with its own bare 413 and a close, before the service runs, rather
+        // than with the JSON envelope (and CORS headers) the other transports
+        // send. Refusing early and cheaply wins over the nicer body.
+        max_body_bytes: max_body_size as u64,
         idle_timeout: pipeline.keep_alive_timeout,
         // Both come from `PipelineConfig` rather than from `Limits::default()`,
         // and they default differently on purpose.
         //
         // `body_timeout` in `armature-h1` does not bound body *reads* alone —
         // it races the entire handler future, answering a bare `408` and
-        // closing when it expires. The hyper path supplies no `hyper::rt::Timer`
-        // and so imposes no request deadline at all, so inheriting a 30-second
-        // default here would have made a backend swap silently cancel every
-        // long-poll, SSE stream and slow upload, with no envelope and nothing
-        // logged (the handler is cancelled before `dispatch_request` returns).
-        // It therefore defaults to `None`, and a deployment that knows its
-        // handlers' upper bound sets it.
+        // closing when it expires, so a finite default would cancel every
+        // long-poll and SSE stream. It therefore follows `request_timeout`,
+        // `None` by default. The slow-body defence does not depend on it:
+        // `dispatch_via_h1` reads the body under the application's
+        // `BodyReadPolicy` (inactivity + minimum rate), which is finite by
+        // default and touches nothing after the body is in.
         //
         // `write_timeout` defaults finite, because the failure it prevents is
         // not a slow handler but a peer that stops reading. `armature-h1` caps
-        // neither connection count nor write duration, so an unbounded write
+        // connection count but not write duration, so an unbounded write
         // deadline lets a client hold a worker's connection slot, its fd and
         // its whole response buffer indefinitely by shrinking its receive
         // window to zero — an unauthenticated hold costing one socket.
@@ -168,6 +159,11 @@ pub(crate) fn h1_config(
     if let Some(n) = workers {
         cfg = cfg.workers(n);
     }
+    // `PipelineConfig::max_connections` is a whole-listener cap, and
+    // `armature-h1` enforces its cap per worker (each owns its own accept
+    // loop), so split it across the workers, rounding up so the total is
+    // never below what was configured.
+    cfg.limits.max_connections = pipeline.max_connections.div_ceil(cfg.workers).max(1);
     cfg
 }
 
@@ -303,6 +299,31 @@ mod tests {
         "127.0.0.1:0".parse().expect("addr")
     }
 
+    /// `max_connections` is split across workers, rounding up.
+    #[test]
+    fn max_connections_is_split_per_worker() {
+        let pipeline = PipelineConfig {
+            max_connections: 10,
+            ..PipelineConfig::default()
+        };
+        assert_eq!(
+            h1_config(addr(), &pipeline, 1024, Some(3))
+                .limits
+                .max_connections,
+            4
+        );
+        let pipeline = PipelineConfig {
+            max_connections: 1,
+            ..PipelineConfig::default()
+        };
+        assert_eq!(
+            h1_config(addr(), &pipeline, 1024, Some(8))
+                .limits
+                .max_connections,
+            1
+        );
+    }
+
     #[test]
     fn the_two_previously_unwired_pipeline_fields_reach_the_limits() {
         let pipeline = PipelineConfig {
@@ -311,7 +332,7 @@ mod tests {
             tcp_nodelay: false,
             ..PipelineConfig::default()
         };
-        let cfg = h1_config(addr(), &pipeline, Some(2));
+        let cfg = h1_config(addr(), &pipeline, 1024, Some(2));
 
         assert_eq!(
             cfg.limits.idle_timeout,
@@ -323,11 +344,9 @@ mod tests {
             "max_header_size is a byte cap and armature-h1 takes one"
         );
         assert_eq!(
-            cfg.limits.max_body_bytes,
-            u64::MAX,
-            "armature-core enforces the body cap on this path, so armature-h1 \
-             must not reject first with its bare status line and cost the \
-             client the framework's JSON envelope"
+            cfg.limits.max_body_bytes, 1024,
+            "the transport must be bounded by the application's own body cap, \
+             never left unbounded"
         );
         assert!(!cfg.tcp.nodelay);
         assert_eq!(cfg.workers, 2);
@@ -340,7 +359,12 @@ mod tests {
     /// a one-line edit, so both are pinned.
     #[test]
     fn the_request_and_write_deadlines_default_asymmetrically() {
-        let cfg = h1_config(addr(), &PipelineConfig::default(), None);
+        let cfg = h1_config(
+            addr(),
+            &PipelineConfig::default(),
+            crate::DEFAULT_MAX_BODY_SIZE,
+            None,
+        );
 
         assert!(
             cfg.limits.body_timeout >= Duration::from_secs(300 * 24 * 60 * 60),
@@ -364,7 +388,7 @@ mod tests {
             write_timeout: None,
             ..PipelineConfig::default()
         };
-        let cfg = h1_config(addr(), &pipeline, None);
+        let cfg = h1_config(addr(), &pipeline, crate::DEFAULT_MAX_BODY_SIZE, None);
 
         assert_eq!(
             cfg.limits.body_timeout,
@@ -384,7 +408,15 @@ mod tests {
     /// tasks on those same cores.
     #[test]
     fn core_pinning_is_left_to_the_caller() {
-        assert!(!h1_config(addr(), &PipelineConfig::default(), None).pin_cores);
+        assert!(
+            !h1_config(
+                addr(),
+                &PipelineConfig::default(),
+                crate::DEFAULT_MAX_BODY_SIZE,
+                None
+            )
+            .pin_cores
+        );
     }
 
     #[test]
@@ -393,7 +425,12 @@ mod tests {
         // ceiling. Going through it (rather than setting `cfg.limits`
         // directly) is what makes that clamp apply, so this pins that
         // `h1_config` uses the builder.
-        let cfg = h1_config(addr(), &PipelineConfig::default(), None);
+        let cfg = h1_config(
+            addr(),
+            &PipelineConfig::default(),
+            crate::DEFAULT_MAX_BODY_SIZE,
+            None,
+        );
         assert!(cfg.limits.max_headers <= armature_h1::limits::MAX_HEADERS_CEILING);
     }
 }

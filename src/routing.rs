@@ -5,8 +5,10 @@
 // - Inline dispatch: Hot paths use #[inline(always)]
 // - Zero-cost abstractions: Minimal runtime overhead
 
+use crate::guard::{Guard, GuardContext};
 use crate::handler::{BoxedHandler, IntoHandler};
 use crate::logging::{debug, trace};
+use crate::middleware::{Middleware, Next};
 use crate::param_intern;
 use crate::route_constraint::RouteConstraints;
 use crate::{Error, HttpMethod, HttpRequest, HttpResponse, Method, RouteParams};
@@ -296,6 +298,285 @@ impl Default for Router {
     fn default() -> Self {
         Self::new()
     }
+}
+
+impl Router {
+    /// Bind route-scoped middleware and guards to the routes at `range`.
+    ///
+    /// Each route's handler is replaced by one that runs `middleware` (first
+    /// = outermost), then every guard in `guards`, then the original handler —
+    /// the NestJS order within one scope. Because the layers live on the
+    /// *matched route* rather than on a URL prefix, they are enforced however
+    /// the request spelled its path: `//admin/x`, `/admin/./x` and a controller
+    /// base path with a `:param` in it all reach the same guarded handler.
+    ///
+    /// Used by `Application` to scope a module's guards to the routes its own
+    /// controllers registered, and by [`RouteGroup`](crate::RouteGroup) to
+    /// enforce a group's guards and middleware.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `range` is out of bounds for [`Router::routes`], like slice
+    /// indexing does.
+    pub fn layer_routes(
+        &mut self,
+        range: std::ops::Range<usize>,
+        middleware: &[Arc<dyn Middleware>],
+        guards: &[Arc<dyn Guard>],
+    ) {
+        if middleware.is_empty() && guards.is_empty() {
+            return;
+        }
+        for route in &mut self.routes[range] {
+            route.handler = layer_handler(route.handler.clone(), middleware, guards);
+        }
+        // The index holds positions and parameter names, not handlers, so it
+        // stays valid; no rebuild is needed.
+    }
+}
+
+/// The `403` a guard that returns `Ok(false)` produces, on every transport and
+/// at every scope.
+pub(crate) fn guard_forbidden_response() -> HttpResponse {
+    let body = serde_json::json!({
+        "error": "Forbidden",
+        "status": 403,
+    });
+    HttpResponse::new(403)
+        .with_json(&body)
+        .unwrap_or_else(|_| HttpResponse::new(403))
+}
+
+/// Evaluate `guards` in order against `request`.
+///
+/// `Ok(Ok(request))` lets the request through (with whatever extensions a
+/// guard left on it); `Ok(Err(response))` is the 403 for a guard that returned
+/// `Ok(false)`; `Err(err)` is the first error a guard returned.
+pub(crate) async fn run_guards(
+    guards: &[Arc<dyn Guard>],
+    request: HttpRequest,
+) -> Result<Result<HttpRequest, HttpResponse>, Error> {
+    if guards.is_empty() {
+        return Ok(Ok(request));
+    }
+    let context = GuardContext::new(request);
+    for guard in guards {
+        if !guard.can_activate(&context).await? {
+            return Ok(Err(guard_forbidden_response()));
+        }
+    }
+    Ok(Ok(context.request))
+}
+
+/// Wrap `handler` so `middleware` (first = outermost) and then `guards` run
+/// before it. See [`Router::layer_routes`].
+///
+/// Layering an already-layered handler nests the new layers *outside* the old
+/// ones, so a module's guards wrap a [`RouteGroup`](crate::RouteGroup)'s.
+pub fn layer_handler(
+    handler: BoxedHandler,
+    middleware: &[Arc<dyn Middleware>],
+    guards: &[Arc<dyn Guard>],
+) -> BoxedHandler {
+    let mut layered = handler;
+    if !guards.is_empty() {
+        let guards: Arc<[Arc<dyn Guard>]> = guards.to_vec().into();
+        let inner = layered;
+        layered = crate::handler::from_legacy_handler(Arc::new(move |req: HttpRequest| {
+            let guards = Arc::clone(&guards);
+            let inner = inner.clone();
+            Box::pin(async move {
+                match run_guards(&guards, req).await? {
+                    Ok(req) => inner.call(req).await,
+                    Err(forbidden) => {
+                        debug!("Request rejected by a route-scoped guard");
+                        Ok(forbidden)
+                    }
+                }
+            })
+        }));
+    }
+    for mw in middleware.iter().rev() {
+        let mw = Arc::clone(mw);
+        let inner = layered;
+        layered = crate::handler::from_legacy_handler(Arc::new(move |req: HttpRequest| {
+            let mw = Arc::clone(&mw);
+            let inner = inner.clone();
+            Box::pin(async move {
+                let next: Next = Box::new(move |req| inner.call(req));
+                mw.handle(req, next).await
+            })
+        }));
+    }
+    layered
+}
+
+/// Why [`canonicalize_path`] refused a request path.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum PathRejection {
+    /// The path does not begin with `/` (and is not the asterisk form `*`).
+    NotOriginForm,
+    /// A `.` or `..` segment, spelled literally or percent-encoded.
+    DotSegment,
+    /// An encoded `/` (`%2F`), an encoded or literal `\`, or an encoded NUL.
+    EncodedSeparator,
+    /// A `%` not followed by two hexadecimal digits.
+    MalformedEscape,
+}
+
+impl std::fmt::Display for PathRejection {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::NotOriginForm => "request path must begin with '/'",
+            Self::DotSegment => "request path contains a '.' or '..' segment",
+            Self::EncodedSeparator => "request path contains an encoded separator",
+            Self::MalformedEscape => "request path contains a malformed percent-escape",
+        })
+    }
+}
+
+/// Whether `b` is an RFC 3986 `unreserved` byte.
+#[inline]
+fn is_unreserved(b: u8) -> bool {
+    b.is_ascii_alphanumeric() || matches!(b, b'-' | b'.' | b'_' | b'~')
+}
+
+#[inline]
+fn hex_val(b: u8) -> Option<u8> {
+    match b {
+        b'0'..=b'9' => Some(b - b'0'),
+        b'a'..=b'f' => Some(b - b'a' + 10),
+        b'A'..=b'F' => Some(b - b'A' + 10),
+        _ => None,
+    }
+}
+
+/// Canonicalize a request path (no query string) once, before anything
+/// security-relevant looks at it.
+///
+/// Every serve path runs this before middleware, guards and routing, and
+/// rewrites the request's target to the result, so all of them — and the
+/// handler — see one spelling of the path. The policy:
+///
+/// * runs of `/` collapse to one (`//admin//x` → `/admin/x`);
+/// * percent-encoded **unreserved** characters (RFC 3986 §2.3: letters,
+///   digits, `-`, `.`, `_`, `~`) are decoded (RFC 3986 §6.2.2.2), so
+///   `/%61dmin` and `/admin` are the same path;
+/// * every other escape is kept verbatim — handlers still receive `%20`,
+///   `%3A`, … undecoded in path parameters, exactly as before;
+/// * a `.` or `..` segment (including `%2E%2E`) is **rejected**, not
+///   resolved: browsers remove dot segments before sending, so only a crafted
+///   request carries one;
+/// * `%2F`, `%5C`, `%00` and a literal `\` are **rejected**: a decoder further
+///   down (a proxy, a file-serving handler) could turn them into separators
+///   the router never saw;
+/// * a `%` not followed by two hex digits is **rejected**.
+///
+/// A trailing `/` is preserved; the router already treats `/users/` and
+/// `/users` alike. The common case — a path with none of the above — is
+/// returned borrowed, without allocating.
+///
+/// ```
+/// use armature_core::routing::{canonicalize_path, PathRejection};
+///
+/// assert_eq!(canonicalize_path("/users/42").unwrap(), "/users/42");
+/// assert_eq!(canonicalize_path("//admin//users").unwrap(), "/admin/users");
+/// assert_eq!(canonicalize_path("/%61dmin").unwrap(), "/admin");
+/// assert_eq!(canonicalize_path("/a%20b").unwrap(), "/a%20b");
+/// assert_eq!(canonicalize_path("/admin/../x"), Err(PathRejection::DotSegment));
+/// assert_eq!(canonicalize_path("/%2Fadmin"), Err(PathRejection::EncodedSeparator));
+/// ```
+pub fn canonicalize_path(path: &str) -> Result<std::borrow::Cow<'_, str>, PathRejection> {
+    use std::borrow::Cow;
+
+    let bytes = path.as_bytes();
+    if path == "*" {
+        return Ok(Cow::Borrowed(path));
+    }
+    if bytes.first() != Some(&b'/') {
+        return Err(PathRejection::NotOriginForm);
+    }
+
+    // Fast path: one scan deciding whether anything needs doing at all.
+    let mut needs_work = false;
+    for (i, &b) in bytes.iter().enumerate() {
+        match b {
+            b'%' => needs_work = true,
+            b'\\' => return Err(PathRejection::EncodedSeparator),
+            b'/' => {
+                let rest = &bytes[i + 1..];
+                if rest.first() == Some(&b'/')
+                    || rest == b"."
+                    || rest == b".."
+                    || rest.starts_with(b"./")
+                    || rest.starts_with(b"../")
+                {
+                    needs_work = true;
+                }
+            }
+            _ => {}
+        }
+        if needs_work {
+            break;
+        }
+    }
+    if !needs_work {
+        return Ok(Cow::Borrowed(path));
+    }
+
+    let mut out = String::with_capacity(path.len());
+    let mut segment = String::new();
+    for raw in path[1..].split('/') {
+        segment.clear();
+        let seg = raw.as_bytes();
+        let mut i = 0;
+        while i < seg.len() {
+            let b = seg[i];
+            if b == b'\\' {
+                return Err(PathRejection::EncodedSeparator);
+            }
+            if b != b'%' {
+                // `raw` is a `str` and the run ends on an ASCII byte, so the
+                // slice boundary is always a character boundary.
+                let end = seg[i..]
+                    .iter()
+                    .position(|&c| c == b'%' || c == b'\\')
+                    .map_or(seg.len(), |p| i + p);
+                segment.push_str(&raw[i..end]);
+                i = end;
+                continue;
+            }
+            let (Some(hi), Some(lo)) = (
+                seg.get(i + 1).copied().and_then(hex_val),
+                seg.get(i + 2).copied().and_then(hex_val),
+            ) else {
+                return Err(PathRejection::MalformedEscape);
+            };
+            let decoded = (hi << 4) | lo;
+            if matches!(decoded, b'/' | b'\\' | 0) {
+                return Err(PathRejection::EncodedSeparator);
+            }
+            if is_unreserved(decoded) {
+                segment.push(decoded as char);
+            } else {
+                segment.push_str(&raw[i..i + 3]);
+            }
+            i += 3;
+        }
+        if segment.is_empty() {
+            continue;
+        }
+        if segment == "." || segment == ".." {
+            return Err(PathRejection::DotSegment);
+        }
+        out.push('/');
+        out.push_str(&segment);
+    }
+    if out.is_empty() || path.ends_with('/') {
+        out.push('/');
+    }
+    Ok(Cow::Owned(out))
 }
 
 /// Split a path into non-empty segments without allocating a `Vec`.
@@ -715,6 +996,59 @@ mod tests {
     use super::*;
     use crate::RouteParamsExt;
     use bytes::Bytes;
+
+    #[test]
+    fn canonicalize_path_policy() {
+        use std::borrow::Cow;
+        // Untouched paths are borrowed, not copied.
+        for path in [
+            "/",
+            "/users/42",
+            "/a-b_c.d~e/x",
+            "/.well-known/x",
+            "/a/.../b",
+            "*",
+        ] {
+            assert!(
+                matches!(canonicalize_path(path), Ok(Cow::Borrowed(p)) if p == path),
+                "{path}"
+            );
+        }
+        for (raw, canonical) in [
+            ("//", "/"),
+            ("//admin", "/admin"),
+            ("/admin//users", "/admin/users"),
+            ("/admin/users//", "/admin/users/"),
+            ("/%61dmin", "/admin"),
+            ("/%7euser", "/~user"),
+            ("/a%2db", "/a-b"),
+            ("/caf%C3%A9", "/caf%C3%A9"),
+            ("/q%3Fx", "/q%3Fx"),
+            ("/a/%20x", "/a/%20x"),
+        ] {
+            assert_eq!(canonicalize_path(raw).unwrap(), canonical, "{raw}");
+        }
+        for (raw, rejection) in [
+            ("/.", PathRejection::DotSegment),
+            ("/./a", PathRejection::DotSegment),
+            ("/a/..", PathRejection::DotSegment),
+            ("/a/../b", PathRejection::DotSegment),
+            ("/%2e/a", PathRejection::DotSegment),
+            ("/%2E%2E/a", PathRejection::DotSegment),
+            ("/.%2e/a", PathRejection::DotSegment),
+            ("/%2Fadmin", PathRejection::EncodedSeparator),
+            ("/a%2fb", PathRejection::EncodedSeparator),
+            ("/a%5Cb", PathRejection::EncodedSeparator),
+            ("/a\\b", PathRejection::EncodedSeparator),
+            ("/a%00b", PathRejection::EncodedSeparator),
+            ("/a%2", PathRejection::MalformedEscape),
+            ("/a%zz", PathRejection::MalformedEscape),
+            ("admin", PathRejection::NotOriginForm),
+            ("", PathRejection::NotOriginForm),
+        ] {
+            assert_eq!(canonicalize_path(raw), Err(rejection), "{raw}");
+        }
+    }
 
     // Test helper handler
     async fn test_handler(_req: HttpRequest) -> Result<HttpResponse, Error> {

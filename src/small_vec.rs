@@ -479,10 +479,16 @@ impl Cookies {
     }
 }
 
+/// Cookie values are session tokens and other credentials, so `Debug` lists
+/// only the names.
 impl fmt::Debug for Cookies {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_map()
-            .entries(self.inner.iter().map(|(k, v)| (k, v)))
+            .entries(
+                self.inner
+                    .iter()
+                    .map(|(k, _)| (k, crate::headers::REDACTED)),
+            )
             .finish()
     }
 }
@@ -538,6 +544,15 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// H27: cookie values are credentials; `Debug` shows names only.
+    #[test]
+    fn cookies_debug_redacts_values() {
+        let cookies = Cookies::parse("session=secret-1; theme=dark");
+        let out = format!("{cookies:?}");
+        assert!(!out.contains("secret-1") && !out.contains("dark"), "{out}");
+        assert!(out.contains("session") && out.contains("theme"), "{out}");
+    }
 
     #[test]
     fn test_query_params_inline() {

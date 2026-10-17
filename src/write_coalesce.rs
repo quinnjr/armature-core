@@ -487,13 +487,25 @@ impl MultiBufferCoalescer {
     }
 
     /// Write a header line (name: value\r\n).
+    ///
+    /// The name must be an RFC 9110 token and the value must not contain CR,
+    /// LF or NUL; otherwise nothing is written and an error is returned, since
+    /// either would split the response.
     #[inline]
-    pub fn write_header_line(&mut self, name: &str, value: &str) {
+    pub fn write_header_line(&mut self, name: &str, value: &str) -> Result<(), crate::Error> {
+        if !crate::simd_parser::is_valid_header_name(name.as_bytes())
+            || !crate::simd_parser::is_valid_header_value(value.as_bytes())
+        {
+            return Err(crate::Error::Internal(
+                "invalid response header name or value".to_string(),
+            ));
+        }
         self.headers.buffer.extend_from_slice(name.as_bytes());
         self.headers.buffer.extend_from_slice(b": ");
         self.headers.buffer.extend_from_slice(value.as_bytes());
         self.headers.buffer.extend_from_slice(b"\r\n");
         self.headers.writes_coalesced += 1;
+        Ok(())
     }
 
     /// Write to body buffer.
@@ -917,7 +929,15 @@ mod tests {
         let mut coalescer = MultiBufferCoalescer::new(CoalesceConfig::default());
 
         coalescer.write_header(b"HTTP/1.1 200 OK\r\n");
-        coalescer.write_header_line("Content-Type", "text/plain");
+        coalescer
+            .write_header_line("Content-Type", "text/plain")
+            .unwrap();
+        assert!(
+            coalescer
+                .write_header_line("X-Bad", "a\r\nInjected: yes")
+                .is_err()
+        );
+        assert!(coalescer.write_header_line("Bad Name", "v").is_err());
         coalescer.write_header(b"\r\n");
         coalescer.write_body(b"Hello, World!");
 

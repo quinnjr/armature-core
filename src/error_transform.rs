@@ -895,7 +895,8 @@ pub struct ErrorTransformer {
     filters: Vec<FilterFn>,
     /// Loggers
     loggers: Vec<LoggerFn>,
-    /// Whether to include request path
+    /// Whether to include the request path (never the query) in error bodies.
+    /// Off by default.
     include_path: bool,
     /// Whether to include timestamp
     include_timestamp: bool,
@@ -915,7 +916,7 @@ impl ErrorTransformer {
             transformers: Vec::new(),
             filters: Vec::new(),
             loggers: Vec::new(),
-            include_path: true,
+            include_path: false,
             include_timestamp: true,
             error_codes: HashMap::new(),
             production_mode: true,
@@ -940,7 +941,11 @@ impl ErrorTransformer {
         self
     }
 
-    /// Enable or disable path inclusion.
+    /// Enable or disable path inclusion (off by default).
+    ///
+    /// When enabled, only the path is echoed — the query string is always
+    /// dropped, since it routinely carries tokens, e-mail addresses and other
+    /// values that must not be reflected into a response body.
     pub fn include_path(mut self, include: bool) -> Self {
         self.include_path = include;
         self
@@ -1068,6 +1073,10 @@ impl ErrorTransformer {
         // Set message
         if self.production_mode && error.is_server_error() {
             response = response.message("An internal server error occurred");
+        } else if self.production_mode {
+            // Same client-safe text `Error::to_client_response` uses, so a
+            // serde error's internals never reach a production client.
+            response = response.message(error.client_message());
         } else {
             response = response.message(error.to_string());
         }
@@ -1079,7 +1088,7 @@ impl ErrorTransformer {
 
         // Add path
         if self.include_path {
-            response = response.path(context.request.path_str());
+            response = response.path(context.request.path_only());
         }
 
         // Add request ID
@@ -1172,7 +1181,9 @@ impl ErrorTransformer {
             .with_logger(|error, ctx, _response| {
                 eprintln!(
                     "[DEV ERROR] {} {} - {:?}",
-                    ctx.request.method, ctx.request.path, error
+                    ctx.request.method,
+                    ctx.request.path_only(),
+                    error
                 );
             })
     }
@@ -1188,7 +1199,7 @@ impl ErrorTransformer {
                 if error.is_server_error() {
                     crate::logging::error!(
                         status = response.status,
-                        path = %ctx.request.path,
+                        path = %ctx.request.path_only(),
                         request_id = ctx.request_id,
                         error = %error,
                         "Server error occurred"
@@ -1196,7 +1207,7 @@ impl ErrorTransformer {
                 } else {
                     crate::logging::warn!(
                         status = response.status,
-                        path = %ctx.request.path,
+                        path = %ctx.request.path_only(),
                         request_id = ctx.request_id,
                         "Client error occurred"
                     );
@@ -1728,5 +1739,26 @@ mod tests {
         assert_eq!(first, second);
         assert!(!first.contains("secret123"));
         assert!(!first.contains("deadbeef"));
+    }
+
+    /// M9: the request target is not echoed by default, and when it is, the
+    /// query (which may hold tokens) never is.
+    #[test]
+    fn test_error_body_never_echoes_query() {
+        let req = HttpRequest::new("GET", "/reset?token=secret-token".to_string());
+        let err = Error::NotFound("missing".to_string());
+
+        let body = ErrorTransformer::new().transform(&err, &req).body;
+        let body = String::from_utf8_lossy(&body);
+        assert!(!body.contains("secret-token"), "{body}");
+        assert!(!body.contains("/reset"), "path is off by default: {body}");
+
+        let body = ErrorTransformer::new()
+            .include_path(true)
+            .transform(&err, &req)
+            .body;
+        let body = String::from_utf8_lossy(&body);
+        assert!(body.contains("/reset"), "{body}");
+        assert!(!body.contains("secret-token"), "{body}");
     }
 }

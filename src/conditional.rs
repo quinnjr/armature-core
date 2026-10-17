@@ -54,7 +54,6 @@
 use crate::{Error, HttpRequest, HttpResponse};
 use bytes::Bytes;
 use std::fmt;
-use std::hash::{Hash, Hasher};
 use std::time::SystemTime;
 
 // ============================================================================
@@ -153,13 +152,19 @@ impl ETag {
     /// assert!(!etag.weak);
     /// ```
     pub fn from_bytes(data: &[u8]) -> Self {
-        use std::collections::hash_map::DefaultHasher;
+        use sha2::Digest as _;
+        use std::fmt::Write as _;
 
-        let mut hasher = DefaultHasher::new();
-        data.hash(&mut hasher);
-        let hash = hasher.finish();
-
-        Self::strong(format!("{:x}", hash))
+        // SHA-256, not the unkeyed 64-bit `DefaultHasher`: a strong ETag is
+        // what `If-Match` compares for lost-update protection, and with a
+        // 64-bit non-cryptographic hash two different bodies can be made to
+        // share one, so a stale `If-Match` would pass against changed content.
+        let digest = sha2::Sha256::digest(data);
+        let mut hex = String::with_capacity(64);
+        for b in digest {
+            let _ = write!(hex, "{b:02x}");
+        }
+        Self::strong(hex)
     }
 
     /// Generate a weak ETag from bytes.
@@ -745,6 +750,15 @@ mod tests {
         let etag = ETag::parse("w/\"abc123\"").unwrap();
         assert!(etag.weak);
         assert_eq!(etag.value, "abc123");
+    }
+
+    #[test]
+    fn test_etag_from_bytes_is_sha256() {
+        // SHA-256("abc"), FIPS 180-2 test vector.
+        assert_eq!(
+            ETag::from_bytes(b"abc").value,
+            "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
+        );
     }
 
     #[test]

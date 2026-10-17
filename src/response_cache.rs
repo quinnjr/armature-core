@@ -417,10 +417,14 @@ pub struct CacheKey {
     pub query: String,
     /// Vary header values that affect caching
     pub vary_values: Vec<(String, String)>,
-    /// Hash of the request body, for methods where the body identifies the
+    /// SHA-256 of the request body, for methods where the body identifies the
     /// resource being queried (QUERY, draft-ietf-httpbis-safe-method-w-body).
     /// `None` for methods whose body does not participate in the cache key.
-    pub body_hash: Option<u64>,
+    ///
+    /// A collision-resistant digest, not a 64-bit `DefaultHasher` value: the
+    /// body is attacker-chosen, and two bodies that collide would share one
+    /// cache entry, letting one request poison what another is served.
+    pub body_hash: Option<[u8; 32]>,
 }
 
 impl CacheKey {
@@ -461,10 +465,8 @@ impl CacheKey {
         // For QUERY the request body *is* the query, so two requests with
         // different bodies are different cache entries.
         let body_hash = if method == "QUERY" {
-            use std::hash::{Hash, Hasher};
-            let mut hasher = std::hash::DefaultHasher::new();
-            request.body_bytes().hash(&mut hasher);
-            Some(hasher.finish())
+            use sha2::Digest as _;
+            Some(sha2::Sha256::digest(request.body_bytes()).into())
         } else {
             None
         };
@@ -481,33 +483,34 @@ impl CacheKey {
     }
 
     /// Convert to a string representation suitable for use as a cache key.
+    ///
+    /// The path and every Vary name/value are length-prefixed (`{len}:{bytes}`)
+    /// for the same reason the query is (see the `query` field docs): a
+    /// request-controlled header value such as `Accept: x,x-b:y` must not be
+    /// able to render the same key as a *different* set of Vary values, nor a
+    /// path containing `|` the same key as a shorter path plus a Vary suffix.
+    /// Variant keys are always `{base key}|...`, which [`ResponseCache::invalidate`]
+    /// relies on.
     pub fn to_string_key(&self) -> String {
-        let vary_str = if self.vary_values.is_empty() {
-            String::new()
-        } else {
-            format!(
-                "|{}",
-                self.vary_values
-                    .iter()
-                    .map(|(k, v)| format!("{}:{}", k, v))
-                    .collect::<Vec<_>>()
-                    .join(",")
-            )
-        };
-
-        let body_str = self
-            .body_hash
-            .map(|h| format!("|body:{:016x}", h))
-            .unwrap_or_default();
-
-        if self.query.is_empty() {
-            format!("{}:{}{}{}", self.method, self.path, body_str, vary_str)
-        } else {
-            format!(
-                "{}:{}?{}{}{}",
-                self.method, self.path, self.query, body_str, vary_str
-            )
+        use fmt::Write as _;
+        let mut out = String::with_capacity(16 + self.path.len() + self.query.len());
+        let _ = write!(out, "{}:{}:{}", self.method, self.path.len(), self.path);
+        if !self.query.is_empty() {
+            let _ = write!(out, "?{}", self.query);
         }
+        if let Some(h) = &self.body_hash {
+            out.push_str("|body:");
+            for b in h {
+                let _ = write!(out, "{b:02x}");
+            }
+        }
+        if !self.vary_values.is_empty() {
+            out.push('|');
+            for (k, v) in &self.vary_values {
+                let _ = write!(out, "{}:{}={}:{},", k.len(), k, v.len(), v);
+            }
+        }
+        out
     }
 }
 
@@ -544,6 +547,11 @@ pub struct CachedResponse {
     /// be removed too. `None` for entries created outside the cache (e.g. via
     /// [`CachedResponse::new`] directly), which are never tracked there.
     pub(crate) base_key: Option<String>,
+    /// The request path this entry was stored for, so
+    /// [`ResponseCache::invalidate_prefix`] matches on the path itself rather
+    /// than on a substring of the rendered key (which also contains the query
+    /// and Vary values). `None` for entries created outside the cache.
+    pub(crate) path: Option<String>,
     /// Monotonic insertion sequence used by the [`EvictionIndex`] to identify
     /// this entry's *current* position in `order`. Each store assigns a fresh
     /// value (see [`ResponseCache::store_with_ttl`]); a re-store (refresh)
@@ -567,6 +575,11 @@ pub struct CachedResponseData {
 
 impl CachedResponse {
     /// Create a new cached response.
+    ///
+    /// `Set-Cookie` is never stored, whatever its case: a cookie minted for
+    /// the user whose request populated the cache must not be replayed to
+    /// every later client served from it (RFC 9111 section 3.1 lets a shared
+    /// cache drop it; this one always does).
     pub fn new(response: &HttpResponse, ttl: Duration) -> Self {
         let now = Instant::now();
 
@@ -584,7 +597,12 @@ impl CachedResponse {
         Self {
             response: CachedResponseData {
                 status: response.status,
-                headers: response.headers.clone().into(),
+                headers: response
+                    .headers
+                    .iter()
+                    .filter(|(k, _)| !k.eq_ignore_ascii_case("set-cookie"))
+                    .map(|(k, v)| (k.clone(), v.clone()))
+                    .collect(),
                 body: response.body.clone(),
             },
             cached_at: now,
@@ -593,6 +611,7 @@ impl CachedResponse {
             last_modified,
             vary,
             base_key: None,
+            path: None,
             eviction_seq: 0,
         }
     }
@@ -645,6 +664,17 @@ impl CachedResponse {
 
         response
     }
+}
+
+/// Case-insensitive response header lookup. Response headers are a plain
+/// map keyed as the handler spelled them, so `Set-Cookie`, `set-cookie` and
+/// `SET-COOKIE` are all distinct keys there; every storage rule must see them.
+fn response_header<'a>(response: &'a HttpResponse, name: &str) -> Option<&'a String> {
+    response
+        .headers
+        .iter()
+        .find(|(k, _)| k.eq_ignore_ascii_case(name))
+        .map(|(_, v)| v)
 }
 
 // ============================================================================
@@ -937,22 +967,45 @@ impl ResponseCache {
 
     /// Store a response in the cache.
     ///
-    /// The TTL is derived from the response's `Cache-Control` header
-    /// (`s-maxage` takes precedence over `max-age`) when present, falling
-    /// back to the configured default TTL.
+    /// Only responses that state their own freshness are stored. The TTL is
+    /// taken, in order, from `Cache-Control: s-maxage`, `max-age`, then
+    /// `Expires` (relative to the response's `Date`, or now); a response that
+    /// is merely `public` with none of those gets the configured default TTL.
+    /// A response with no freshness information at all is **not** stored —
+    /// guessing a lifetime for it (heuristic freshness) is how per-user pages
+    /// end up served to other users.
     pub async fn store(&self, request: &HttpRequest, response: &HttpResponse) {
-        let ttl = response
-            .headers
-            .get("Cache-Control")
-            .map(|h| CacheControl::parse(h))
-            .and_then(|cc| cc.freshness_lifetime())
-            .map(Duration::from_secs)
-            .unwrap_or(self.config.default_ttl);
-
+        let Some(ttl) = self.explicit_freshness(response) else {
+            return;
+        };
         self.store_with_ttl(request, response, ttl).await
     }
 
+    /// The freshness lifetime a response explicitly grants, if any.
+    fn explicit_freshness(&self, response: &HttpResponse) -> Option<Duration> {
+        let cc = response_header(response, "cache-control").map(|h| CacheControl::parse(h));
+        if let Some(secs) = cc.as_ref().and_then(CacheControl::freshness_lifetime) {
+            return Some(Duration::from_secs(secs));
+        }
+        if let Some(expires) = response_header(response, "expires") {
+            // RFC 9111 section 5.3: an invalid Expires (e.g. `0`) means
+            // "already expired".
+            let expires = httpdate::parse_http_date(expires).ok()?;
+            let date = response_header(response, "date")
+                .and_then(|d| httpdate::parse_http_date(d).ok())
+                .unwrap_or_else(SystemTime::now);
+            return expires.duration_since(date).ok();
+        }
+        cc.filter(CacheControl::is_public)
+            .map(|_| self.config.default_ttl)
+    }
+
     /// Store a response with a specific TTL.
+    ///
+    /// The caller chooses the lifetime, but every other storage rule still
+    /// applies: `no-store`/`private`/`no-cache`, `Authorization`, `Cookie` and
+    /// `Set-Cookie` all prevent storage exactly as for [`store`](Self::store),
+    /// and `Set-Cookie` is never kept in the stored headers.
     pub async fn store_with_ttl(
         &self,
         request: &HttpRequest,
@@ -976,6 +1029,7 @@ impl ResponseCache {
         let base_key = CacheKey::from_request(request).to_string_key();
         let mut cached = CachedResponse::new(response, ttl);
         cached.base_key = Some(base_key.clone());
+        cached.path = Some(request.path_only().to_string());
 
         // Base key of any entry evicted to make room, but only when that was
         // the last variant sharing it (so its `vary_index` entry is now dead).
@@ -1053,10 +1107,8 @@ impl ResponseCache {
 
         // Check response Cache-Control (RFC 9111): this is a shared cache,
         // so no-store, private, and no-cache responses must not be stored.
-        let cache_control = response
-            .headers
-            .get("Cache-Control")
-            .map(|h| CacheControl::parse(h));
+        let cache_control =
+            response_header(response, "cache-control").map(|h| CacheControl::parse(h));
         if let Some(ref cc) = cache_control
             && (cc.is_no_store() || cc.is_private() || cc.is_no_cache())
         {
@@ -1078,6 +1130,19 @@ impl ResponseCache {
             if !explicitly_allowed {
                 return false;
             }
+        }
+
+        // Cookie-authenticated requests, and responses that set a cookie, are
+        // per-user by default. Store them only when the response explicitly
+        // says it is the same for everyone (`public`); even then the
+        // `Set-Cookie` itself is stripped (see `CachedResponse::new`).
+        let has_cookie = request.headers.get("cookie").is_some();
+        let sets_cookie =
+            !response.cookies.is_empty() || response_header(response, "set-cookie").is_some();
+        if (has_cookie || sets_cookie)
+            && !cache_control.as_ref().is_some_and(CacheControl::is_public)
+        {
+            return false;
         }
 
         true
@@ -1157,11 +1222,13 @@ impl ResponseCache {
 
     /// Remove all entries matching a path prefix.
     pub async fn invalidate_prefix(&self, path_prefix: &str) {
-        let needle = format!(":{}", path_prefix);
         let mut entries = self.entries.write().await;
         let mut index = self.eviction.lock().unwrap();
-        entries.retain(|key, v| {
-            if key.contains(&needle) {
+        entries.retain(|_, v| {
+            if v.path
+                .as_deref()
+                .is_some_and(|p| p.starts_with(path_prefix))
+            {
                 if let Some(bk) = &v.base_key {
                     index.record_remove(bk);
                 }
@@ -1370,6 +1437,11 @@ mod tests {
     use super::*;
     use bytes::Bytes;
 
+    /// A response that explicitly grants freshness, so `store` keeps it.
+    fn fresh() -> HttpResponse {
+        HttpResponse::ok().cache_public(Duration::from_secs(300))
+    }
+
     #[test]
     fn test_cache_directive_parse() {
         assert_eq!(
@@ -1489,7 +1561,7 @@ mod tests {
     async fn test_response_cache_store_and_get() {
         let cache = ResponseCache::new();
         let request = HttpRequest::new("GET", "/api/users".to_string());
-        let mut response = HttpResponse::ok();
+        let mut response = fresh();
         response.body = Bytes::from_static(b"cached content");
 
         cache.store(&request, &response).await;
@@ -1505,7 +1577,7 @@ mod tests {
 
         let mut search_a = HttpRequest::new("QUERY", "/search".to_string());
         search_a.body = Bytes::from_static(b"name=alice");
-        let mut response_a = HttpResponse::ok();
+        let mut response_a = fresh();
         response_a.body = Bytes::from_static(b"results for alice");
 
         cache.store(&search_a, &response_a).await;
@@ -1524,7 +1596,7 @@ mod tests {
         assert!(cache.get(&search_b).await.is_none());
 
         // The two bodies produce different keys, so both can coexist
-        let mut response_b = HttpResponse::ok();
+        let mut response_b = fresh();
         response_b.body = Bytes::from_static(b"results for bob");
         cache.store(&search_b, &response_b).await;
         assert_eq!(
@@ -1560,7 +1632,7 @@ mod tests {
     async fn test_response_cache_invalidate() {
         let cache = ResponseCache::new();
         let request = HttpRequest::new("GET", "/api/users".to_string());
-        let response = HttpResponse::ok();
+        let response = fresh();
 
         cache.store(&request, &response).await;
         assert!(cache.get(&request).await.is_some());
@@ -1604,6 +1676,156 @@ mod tests {
         assert!(cache.get(&request).await.is_none());
     }
 
+    /// H8: a response with no freshness information is not stored at all —
+    /// no heuristic default TTL.
+    #[tokio::test]
+    async fn test_response_without_explicit_freshness_not_stored() {
+        let cache = ResponseCache::new();
+        let request = HttpRequest::new("GET", "/api/me".to_string());
+        cache.store(&request, &HttpResponse::ok()).await;
+        assert!(cache.get(&request).await.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_explicit_freshness_sources_are_honoured() {
+        let cache = ResponseCache::new();
+
+        let req = HttpRequest::new("GET", "/max-age".to_string());
+        let mut resp = HttpResponse::ok();
+        resp.headers
+            .insert("cache-control".to_string(), "max-age=60".to_string());
+        cache.store(&req, &resp).await;
+        assert!(cache.get(&req).await.is_some(), "lowercase max-age");
+
+        let req = HttpRequest::new("GET", "/public".to_string());
+        let mut resp = HttpResponse::ok();
+        resp.headers
+            .insert("Cache-Control".to_string(), "public".to_string());
+        cache.store(&req, &resp).await;
+        assert!(cache.get(&req).await.is_some(), "public alone");
+
+        let req = HttpRequest::new("GET", "/expires".to_string());
+        let mut resp = HttpResponse::ok();
+        resp.headers.insert(
+            "Expires".to_string(),
+            httpdate::fmt_http_date(SystemTime::now() + Duration::from_secs(120)),
+        );
+        cache.store(&req, &resp).await;
+        assert!(cache.get(&req).await.is_some(), "future Expires");
+
+        let req = HttpRequest::new("GET", "/expired".to_string());
+        let mut resp = HttpResponse::ok();
+        resp.headers.insert("Expires".to_string(), "0".to_string());
+        cache.store(&req, &resp).await;
+        assert!(cache.get(&req).await.is_none(), "invalid Expires = expired");
+    }
+
+    /// H8: a cookie-authenticated request's response is per-user unless the
+    /// response explicitly says `public`.
+    #[tokio::test]
+    async fn test_cookie_request_not_stored_unless_public() {
+        let cache = ResponseCache::new();
+        let mut request = HttpRequest::new("GET", "/api/me".to_string());
+        request
+            .headers
+            .insert("Cookie", "session=user-a".to_string());
+
+        let response = HttpResponse::ok()
+            .with_cache_control(CacheControl::new().max_age(Duration::from_secs(60)));
+        cache.store(&request, &response).await;
+        assert!(cache.get(&request).await.is_none());
+
+        let response = HttpResponse::ok().cache_public(Duration::from_secs(60));
+        cache.store(&request, &response).await;
+        assert!(cache.get(&request).await.is_some());
+    }
+
+    /// H8: a response that sets a cookie is not stored unless `public`, and
+    /// even then the stored copy never replays the `Set-Cookie`.
+    #[tokio::test]
+    async fn test_set_cookie_response_not_stored_and_always_stripped() {
+        let cache = ResponseCache::new();
+        let request = HttpRequest::new("GET", "/login".to_string());
+
+        for name in ["Set-Cookie", "set-cookie", "SET-COOKIE"] {
+            let mut response = HttpResponse::ok()
+                .with_cache_control(CacheControl::new().max_age(Duration::from_secs(60)));
+            response
+                .headers
+                .insert(name.to_string(), "session=user-a".to_string());
+            cache.store(&request, &response).await;
+            assert!(cache.get(&request).await.is_none(), "{name}");
+        }
+
+        let mut response = HttpResponse::ok()
+            .with_cache_control(CacheControl::new().max_age(Duration::from_secs(60)));
+        response.cookies.push("session=user-a".to_string());
+        cache.store(&request, &response).await;
+        assert!(cache.get(&request).await.is_none(), "cookies vec");
+
+        let mut response = HttpResponse::ok().cache_public(Duration::from_secs(60));
+        response
+            .headers
+            .insert("set-cookie".to_string(), "session=user-a".to_string());
+        response.cookies.push("other=user-a".to_string());
+        cache.store(&request, &response).await;
+        let hit = cache.get(&request).await.expect("public is stored");
+        assert!(
+            hit.headers
+                .iter()
+                .all(|(k, _)| !k.eq_ignore_ascii_case("set-cookie")),
+            "{:?}",
+            hit.headers
+        );
+        assert!(hit.cookies.is_empty());
+    }
+
+    /// H8: the QUERY body participates in the key as a SHA-256 digest.
+    #[test]
+    fn test_query_body_hash_is_sha256() {
+        let mut req = HttpRequest::new("QUERY", "/search".to_string());
+        req.body = Bytes::from_static(b"abc");
+        let key = CacheKey::from_request(&req);
+        assert_eq!(
+            key.body_hash.unwrap()[..4],
+            [0xba, 0x78, 0x16, 0xbf],
+            "SHA-256(\"abc\")"
+        );
+        assert!(
+            key.to_string_key()
+                .contains("|body:ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad")
+        );
+    }
+
+    /// A Vary value that embeds the key's own separators must not render the
+    /// same key as a different set of Vary values.
+    #[test]
+    fn test_vary_values_cannot_forge_another_variant_key() {
+        let mut a = HttpRequest::new("GET", "/x".to_string());
+        a.headers.insert("Accept", "x".to_string());
+        a.headers.insert("X-B", "y".to_string());
+        let mut b = HttpRequest::new("GET", "/x".to_string());
+        b.headers.insert("Accept", "x,x-b:y".to_string());
+        let vary = ["Accept", "X-B"];
+        assert_ne!(
+            CacheKey::from_request_with_vary(&a, &vary).to_string_key(),
+            CacheKey::from_request_with_vary(&b, &vary).to_string_key()
+        );
+    }
+
+    #[tokio::test]
+    async fn test_invalidate_prefix_matches_path_not_query() {
+        let cache = ResponseCache::new();
+        let resp = HttpResponse::ok().cache_public(Duration::from_secs(60));
+        let users = HttpRequest::new("GET", "/api/users".to_string());
+        let other = HttpRequest::new("GET", "/other?next=/api/users".to_string());
+        cache.store(&users, &resp).await;
+        cache.store(&other, &resp).await;
+        cache.invalidate_prefix("/api").await;
+        assert!(cache.get(&users).await.is_none());
+        assert!(cache.get(&other).await.is_some());
+    }
+
     #[tokio::test]
     async fn test_response_cache_authorization_not_stored() {
         let cache = ResponseCache::new();
@@ -1611,7 +1833,8 @@ mod tests {
         request
             .headers
             .insert("Authorization", "Bearer user-a".to_string());
-        let response = HttpResponse::ok();
+        let response = HttpResponse::ok()
+            .with_cache_control(CacheControl::new().max_age(Duration::from_secs(60)));
 
         cache.store(&request, &response).await;
 
@@ -1654,7 +1877,7 @@ mod tests {
             .headers
             .insert("Accept", "application/json".to_string());
 
-        let mut response = HttpResponse::ok().with_vary(&["Accept"]);
+        let mut response = fresh().with_vary(&["Accept"]);
         response.body = Bytes::from_static(b"json");
 
         cache.store(&request, &response).await;
@@ -1678,7 +1901,7 @@ mod tests {
             .headers
             .insert("Accept", "application/json".to_string());
 
-        let response = HttpResponse::ok().with_vary(&["Accept"]);
+        let response = fresh().with_vary(&["Accept"]);
         cache.store(&request, &response).await;
         assert!(cache.get(&request).await.is_some());
 
@@ -1699,7 +1922,7 @@ mod tests {
 
     #[test]
     fn test_response_with_vary() {
-        let response = HttpResponse::ok().with_vary(&["Accept", "Accept-Encoding"]);
+        let response = fresh().with_vary(&["Accept", "Accept-Encoding"]);
 
         assert_eq!(
             response.headers.get("Vary"),
@@ -1731,7 +1954,7 @@ mod tests {
         for i in 0..100 {
             let mut req = HttpRequest::new("QUERY", "/search".to_string());
             req.body = Bytes::from(format!("q={}", i).into_bytes());
-            let mut resp = HttpResponse::ok();
+            let mut resp = fresh();
             resp.body = Bytes::from(format!("result {}", i).into_bytes());
             cache.store(&req, &resp).await;
         }
@@ -1761,7 +1984,7 @@ mod tests {
 
         for i in 0..3 {
             let req = HttpRequest::new("GET", format!("/p{}", i));
-            cache.store(&req, &HttpResponse::ok()).await;
+            cache.store(&req, &fresh()).await;
         }
         for i in 0..3 {
             let req = HttpRequest::new("GET", format!("/p{}", i));
@@ -1770,7 +1993,7 @@ mod tests {
 
         // A fourth insert must evict the oldest (/p0), not any newer entry.
         let req = HttpRequest::new("GET", "/p3".to_string());
-        cache.store(&req, &HttpResponse::ok()).await;
+        cache.store(&req, &fresh()).await;
 
         let p0 = HttpRequest::new("GET", "/p0".to_string());
         assert!(
@@ -1800,7 +2023,7 @@ mod tests {
     async fn test_eviction_refresh_resets_recency() {
         async fn store(cache: &ResponseCache, path: &str, body: &[u8]) {
             let req = HttpRequest::new("GET", path.to_string());
-            let mut resp = HttpResponse::ok();
+            let mut resp = fresh();
             resp.body = Bytes::copy_from_slice(body);
             cache.store(&req, &resp).await;
         }
@@ -1841,7 +2064,7 @@ mod tests {
         stale_req.body = Bytes::from_static(b"q=stale");
         let mut fresh_req = HttpRequest::new("QUERY", "/search".to_string());
         fresh_req.body = Bytes::from_static(b"q=fresh");
-        let resp = HttpResponse::ok();
+        let resp = fresh();
 
         cache
             .store_with_ttl(&stale_req, &resp, Duration::from_secs(0))
@@ -1878,7 +2101,7 @@ mod tests {
 
         for i in 0..2000 {
             let req = HttpRequest::new("GET", format!("/churn/{}", i % 5));
-            cache.store(&req, &HttpResponse::ok()).await;
+            cache.store(&req, &fresh()).await;
             cache.invalidate(&req).await;
         }
 
@@ -1903,7 +2126,7 @@ mod tests {
         let req = HttpRequest::new("GET", "/hot".to_string());
 
         for i in 0..2000 {
-            let mut resp = HttpResponse::ok();
+            let mut resp = fresh();
             resp.body = Bytes::from(format!("v{}", i).into_bytes());
             cache.store(&req, &resp).await;
         }
@@ -1938,7 +2161,7 @@ mod tests {
         req_accept
             .headers
             .insert("Accept", "application/json".to_string());
-        let mut resp_accept = HttpResponse::ok().with_vary(&["Accept"]);
+        let mut resp_accept = fresh().with_vary(&["Accept"]);
         resp_accept.body = Bytes::from_static(b"json-body");
         cache.store(&req_accept, &resp_accept).await;
 
@@ -1947,7 +2170,7 @@ mod tests {
         req_enc
             .headers
             .insert("Accept-Encoding", "gzip".to_string());
-        let mut resp_enc = HttpResponse::ok().with_vary(&["Accept-Encoding"]);
+        let mut resp_enc = fresh().with_vary(&["Accept-Encoding"]);
         resp_enc.body = Bytes::from_static(b"gzip-body");
         cache.store(&req_enc, &resp_enc).await;
 

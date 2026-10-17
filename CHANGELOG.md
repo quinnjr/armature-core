@@ -39,6 +39,7 @@ Changes at or before `0.6.0` are recorded in the workspace
 
 ### Added
 
+- `AuthenticationGuard` implements `Default` (and `Clone`, `Copy`, `Debug`), so the type form `#[guard(AuthenticationGuard)]` / `#[use_guard(AuthenticationGuard)]` compiles.
 - `Application::use_middleware` — global middleware, run (NestJS order) before global guards, then route-scoped middleware and guards, then the handler.
 - `Application::try_create`, `Application::with_body_read_policy`, `Application::with_https_redirect_hosts`, `BodyReadPolicy`.
 - `VerifiedIdentity` — the extension an authentication layer inserts after verifying a credential.

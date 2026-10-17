@@ -91,6 +91,10 @@ fn is_verified(request: &HttpRequest) -> bool {
 /// assert!(AuthenticationGuard.can_activate(&GuardContext::new(verified)).await.unwrap());
 /// # });
 /// ```
+///
+/// It implements [`Default`], so the type form of the guard attribute works:
+/// `#[guard(AuthenticationGuard)]` / `#[use_guard(AuthenticationGuard)]`.
+#[derive(Clone, Copy, Debug, Default)]
 pub struct AuthenticationGuard;
 
 #[async_trait]
@@ -261,6 +265,25 @@ mod tests {
         let context = GuardContext::new(request);
 
         assert!(matches!(guard.can_activate(&context).await, Ok(true)));
+    }
+
+    /// `#[guard(AuthenticationGuard)]` constructs the guard with `Default`.
+    #[tokio::test]
+    async fn test_authentication_guard_default_is_fail_closed() {
+        let guard = AuthenticationGuard::default();
+
+        let anonymous = GuardContext::new(HttpRequest::new("GET", "/test".to_string()));
+        assert!(matches!(
+            guard.can_activate(&anonymous).await,
+            Err(Error::Unauthorized(_))
+        ));
+
+        let mut request = HttpRequest::new("GET", "/test".to_string());
+        request.extensions.insert(VerifiedIdentity::new("user-1"));
+        assert!(matches!(
+            guard.can_activate(&GuardContext::new(request)).await,
+            Ok(true)
+        ));
     }
 
     /// The regression this guard was rewritten for: any `Bearer x` used to pass.

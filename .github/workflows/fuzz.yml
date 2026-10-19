@@ -20,7 +20,7 @@ jobs:
       matrix:
         target: [http_request, http_response, routing, json, url_parsing, headers, query_params, path_params]
     steps:
-      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       # cargo-fuzz needs nightly: the sanitizer and coverage instrumentation
       # libFuzzer relies on are nightly-only. `clippy` is requested explicitly
       # because this action installs the minimal profile, which omits it.

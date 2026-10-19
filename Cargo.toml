@@ -47,7 +47,7 @@ serde_urlencoded = "0.7"
 urlencoding = "2.1"  # Fast URL encoding/decoding
 # Collision-resistant digest for attacker-controlled cache keys (QUERY bodies)
 # and ETags.
-sha2 = "0.10"
+sha2 = "0.11"
 httpdate = "1.0"
 async-trait = "0.1"
 flate2 = "1.1.10"

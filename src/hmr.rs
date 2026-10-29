@@ -725,6 +725,15 @@ pub async fn inject_hmr_script(html: String, hmr_manager: &HmrManager) -> String
 mod tests {
     use super::*;
 
+    /// An ephemeral-port config that may start in any build profile.
+    ///
+    /// The benchmark workflow runs these tests through `cargo bench -- --test`,
+    /// a release build, where the server refuses to start unless allowed —
+    /// the release gate itself is covered by its own tests.
+    fn test_config() -> HmrConfig {
+        HmrConfig::new().websocket_port(0).allow_in_release(true)
+    }
+
     #[test]
     fn test_hmr_config_builder() {
         let config = HmrConfig::new()
@@ -792,7 +801,7 @@ mod tests {
     #[tokio::test]
     async fn test_websocket_server_delivers_reload_message() {
         // Bind on an ephemeral port so the test never collides with a real server.
-        let config = HmrConfig::new().websocket_port(0);
+        let config = test_config();
         let manager = HmrManager::new(config);
         let port = manager.start_websocket_server().await.unwrap();
 
@@ -864,7 +873,7 @@ mod tests {
     async fn test_websocket_refuses_wrong_origin_or_missing_token() {
         use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 
-        let manager = HmrManager::new(HmrConfig::new().websocket_port(0));
+        let manager = HmrManager::new(test_config());
         let port = manager.start_websocket_server().await.unwrap();
 
         // Right token, hostile origin.
@@ -961,7 +970,7 @@ mod tests {
         // A client that opens a raw TCP connection but never sends a WebSocket
         // handshake must not be counted as a connected client, and the handshake
         // is bounded by a timeout so the per-connection task cannot leak.
-        let config = HmrConfig::new().websocket_port(0);
+        let config = test_config();
         let manager = HmrManager::new(config);
         let port = manager.start_websocket_server().await.unwrap();
 

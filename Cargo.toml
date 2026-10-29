@@ -22,7 +22,7 @@ matchit = "0.9"  # High-performance router (same as Axum)
 # parallel set, and — under the default `h1-backend` feature — serves HTTP/1.1
 # through it rather than through hyper. The `tls` feature is what lets the
 # HTTPS listeners hand it a rustls config; hyper still serves HTTP/2.
-armature-h1 = { version = "0.4", features = ["tls"] }
+armature-h1 = { version = "0.5", features = ["tls"] }
 tokio = { version = "1.53", features = ["rt", "rt-multi-thread", "macros", "sync", "time", "net", "io-util", "fs", "signal"] }
 hyper = { version = "1.11", features = ["full"] }
 hyper-util = { version = "0.1", features = ["server", "http1", "http2", "tokio"] }

@@ -170,13 +170,12 @@ pub struct PipelineConfig {
     /// creates.
     pub keep_alive_timeout: Duration,
 
-    /// How long a handler may run before the connection answers `408` and
+    /// How long a handler may run before the connection answers `503` and
     /// closes, or `None` for no limit.
     ///
     /// **Wired on the `h1-backend` path**, to `armature-h1`'s
-    /// `Limits::body_timeout` — which despite its name races the *whole*
-    /// handler future, and so covers the handler's reads of the request body
-    /// as well as its own work.
+    /// `Limits::handler_timeout`, which races the whole handler future from
+    /// the moment it is called.
     ///
     /// `None` by default, and deliberately: a finite default would cancel
     /// every long-poll, SSE stream and slow handler. Set it when you know your

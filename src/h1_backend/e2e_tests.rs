@@ -60,9 +60,19 @@ where
     Fut: std::future::Future<Output = T> + Send,
     T: Send + 'static,
 {
+    with_server_config(state, &PipelineConfig::default(), body).await
+}
+
+/// [`with_server`] under a non-default [`PipelineConfig`].
+async fn with_server_config<F, Fut, T>(state: ServeState, pipeline: &PipelineConfig, body: F) -> T
+where
+    F: FnOnce(std::net::SocketAddr) -> Fut + Send + 'static,
+    Fut: std::future::Future<Output = T> + Send,
+    T: Send + 'static,
+{
     let cfg = h1_config(
         "127.0.0.1:0".parse().expect("addr"),
-        &PipelineConfig::default(),
+        pipeline,
         state.max_body_size(),
         // One worker: the test asserts on responses, not on load balancing, and
         // a worker per core would open N listeners for no added coverage.
@@ -1769,6 +1779,40 @@ async fn a_stalled_body_is_answered_408_on_both_adapters() {
         via_h1.starts_with("HTTP/1.1 408"),
         "armature-h1: {via_h1:?}"
     );
+    assert!(
+        started.elapsed() < Duration::from_secs(4),
+        "the deadline, not the client's read timeout, must end the request"
+    );
+}
+
+async fn never_answers(_req: HttpRequest) -> Result<HttpResponse, Error> {
+    tokio::time::sleep(Duration::from_secs(60)).await;
+    Ok(HttpResponse::ok())
+}
+
+/// `request_timeout` is the handler deadline on this path: a handler still
+/// running when it passes is answered `503` and the connection closed, rather
+/// than left holding the connection for as long as the handler likes.
+#[tokio::test]
+async fn a_handler_past_the_request_timeout_is_answered_503() {
+    let mut router = Router::new();
+    router.add_route(Route::new(HttpMethod::GET, "/slow", never_answers));
+    let state = ServeState::for_test(
+        Arc::new(OptimizedRouter::from_router(&router)),
+        DEFAULT_MAX_BODY_SIZE,
+    );
+    let pipeline = PipelineConfig {
+        request_timeout: Some(Duration::from_millis(200)),
+        ..PipelineConfig::default()
+    };
+
+    let started = std::time::Instant::now();
+    let (answer, closed) = with_server_config(state, &pipeline, |addr| async move {
+        roundtrip_closed(addr, b"GET /slow HTTP/1.1\r\nHost: a\r\n\r\n").await
+    })
+    .await;
+    assert!(answer.starts_with("HTTP/1.1 503"), "{answer:?}");
+    assert!(closed, "a timed-out handler's connection must close");
     assert!(
         started.elapsed() < Duration::from_secs(4),
         "the deadline, not the client's read timeout, must end the request"

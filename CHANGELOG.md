@@ -10,6 +10,8 @@ Changes at or before `0.6.0` are recorded in the workspace
 
 ## [Unreleased]
 
+## [0.12.0] - 2026-10-29
+
 ### Changed
 
 - **`armature-h1` 0.6 (breaking).** `HeaderId`, `ByteStr` and `Method` are re-exported from `armature-h1`, so their types change with it. 0.6 carries `armature-h1`'s security sweep. On the default `h1-backend` path, a request target whose `%` does not start a complete percent-encoding (`/a%zz`, `?q=100%`) is now `400` + close, and an empty `Host` beside an absolute-form target with an authority is refused. A handler's response header named through `HeaderId::Other` with a well-known name (`Other("Content-Length")`) is now treated as that header; build runtime names with `header_id::intern`.

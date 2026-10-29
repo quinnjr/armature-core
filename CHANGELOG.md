@@ -12,6 +12,7 @@ Changes at or before `0.6.0` are recorded in the workspace
 
 ### Changed
 
+- **`armature-h1` 0.6 (breaking).** `HeaderId`, `ByteStr` and `Method` are re-exported from `armature-h1`, so their types change with it. 0.6 carries `armature-h1`'s security sweep. On the default `h1-backend` path, a request target whose `%` does not start a complete percent-encoding (`/a%zz`, `?q=100%`) is now `400` + close, and an empty `Host` beside an absolute-form target with an authority is refused. A handler's response header named through `HeaderId::Other` with a well-known name (`Other("Content-Length")`) is now treated as that header; build runtime names with `header_id::intern`.
 - **`armature-h1` 0.5.** `PipelineConfig::request_timeout` now maps to `armature-h1`'s new `Limits::handler_timeout`. In 0.5, `body_timeout` bounds only the body's arrival, so the old mapping would no longer have bounded the handler. A handler still running at the deadline is now answered **`503 Service Unavailable`** (was `408`) and the connection closes. `body_timeout` is left unbounded: the `BodyReadPolicy` (inactivity + minimum rate) remains the slow-body defence, the same as on every other transport.
 
 ## [0.11.0] - 2026-10-17

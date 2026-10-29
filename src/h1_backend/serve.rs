@@ -40,8 +40,10 @@ use std::time::Duration;
 /// own `deadline::FAR_FUTURE`, which its author chose to stay well inside
 /// tokio's representable timer range.
 ///
-/// Only reachable when the caller explicitly asks for no limit; see
-/// [`PipelineConfig::request_timeout`](crate::pipeline::PipelineConfig::request_timeout).
+/// Used for `body_timeout`, which the application's
+/// [`BodyReadPolicy`](crate::BodyReadPolicy) supersedes, and for a write
+/// deadline the caller explicitly turns off; see
+/// [`PipelineConfig::write_timeout`](crate::pipeline::PipelineConfig::write_timeout).
 const NO_DEADLINE: Duration = Duration::from_secs(365 * 24 * 60 * 60);
 
 /// Signals shutdown when dropped.
@@ -112,17 +114,20 @@ pub(crate) fn h1_config(
         // send. Refusing early and cheaply wins over the nicer body.
         max_body_bytes: max_body_size as u64,
         idle_timeout: pipeline.keep_alive_timeout,
-        // Both come from `PipelineConfig` rather than from `Limits::default()`,
-        // and they default differently on purpose.
+        // All three come from `PipelineConfig` rather than from
+        // `Limits::default()`, and they default differently on purpose.
         //
-        // `body_timeout` in `armature-h1` does not bound body *reads* alone —
-        // it races the entire handler future, answering a bare `408` and
-        // closing when it expires, so a finite default would cancel every
-        // long-poll and SSE stream. It therefore follows `request_timeout`,
-        // `None` by default. The slow-body defence does not depend on it:
-        // `dispatch_via_h1` reads the body under the application's
-        // `BodyReadPolicy` (inactivity + minimum rate), which is finite by
-        // default and touches nothing after the body is in.
+        // `handler_timeout` is the handler deadline: it races the handler
+        // future and answers a bare `503` and a close when it expires. It
+        // follows `request_timeout`, `None` by default, because a finite
+        // default would cancel every long-poll and SSE stream.
+        //
+        // `body_timeout` bounds only the body's arrival, and is left
+        // unbounded: `dispatch_via_h1` already reads the body under the
+        // application's `BodyReadPolicy` (inactivity + minimum rate), which
+        // is finite by default and the same on every transport. A fixed total
+        // on top of it would cap how large an upload a slow-but-steady client
+        // can send, which no other transport does.
         //
         // `write_timeout` defaults finite, because the failure it prevents is
         // not a slow handler but a peer that stops reading. `armature-h1` caps
@@ -130,7 +135,8 @@ pub(crate) fn h1_config(
         // deadline lets a client hold a worker's connection slot, its fd and
         // its whole response buffer indefinitely by shrinking its receive
         // window to zero — an unauthenticated hold costing one socket.
-        body_timeout: pipeline.request_timeout.unwrap_or(NO_DEADLINE),
+        body_timeout: NO_DEADLINE,
+        handler_timeout: pipeline.request_timeout,
         write_timeout: pipeline.write_timeout.unwrap_or(NO_DEADLINE),
         // `header_timeout` is left at the default on purpose: it bounds how
         // long a peer may take to send a complete head once it has sent a
@@ -366,11 +372,17 @@ mod tests {
             None,
         );
 
+        assert_eq!(
+            cfg.limits.handler_timeout, None,
+            "no handler deadline unless the caller asks for one: a finite one \
+             would cancel every long-poll with a bare 503, no envelope, and \
+             nothing logged"
+        );
         assert!(
             cfg.limits.body_timeout >= Duration::from_secs(300 * 24 * 60 * 60),
-            "no handler deadline unless the caller asks for one: inheriting \
-             armature-h1's 30s default would cancel every long-poll and slow \
-             upload with a bare 408, no envelope, and nothing logged"
+            "the body is bounded by the BodyReadPolicy; inheriting \
+             armature-h1's 30s total would cut off slow-but-steady uploads \
+             that every other transport accepts"
         );
         assert_eq!(
             cfg.limits.write_timeout,
@@ -391,8 +403,8 @@ mod tests {
         let cfg = h1_config(addr(), &pipeline, crate::DEFAULT_MAX_BODY_SIZE, None);
 
         assert_eq!(
-            cfg.limits.body_timeout,
-            Duration::from_secs(45),
+            cfg.limits.handler_timeout,
+            Some(Duration::from_secs(45)),
             "a deployment that knows its handlers' upper bound must be able to \
              say so"
         );

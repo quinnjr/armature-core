@@ -377,6 +377,13 @@ impl<T: DeserializeOwned> FromRequest for PathParams<T> {
 
 /// Extracts a header value by name
 ///
+/// [`from_request`](FromRequestNamed::from_request) and
+/// [`optional`](Self::optional) take the **first** value of a repeated
+/// header, so with two `Authorization` fields (one from the client, one
+/// added by a proxy) the order decides which you get. For a header you treat
+/// as a credential or an authorization input, use [`unique`](Self::unique),
+/// which refuses the request instead.
+///
 /// # Example
 ///
 /// ```rust,ignore
@@ -385,6 +392,9 @@ impl<T: DeserializeOwned> FromRequest for PathParams<T> {
 ///
 /// // Or as optional
 /// let custom: Option<Header> = Header::optional(&request, "X-Custom-Header");
+///
+/// // A credential: absent is `None`, repeated is a 400.
+/// let key: Option<Header> = Header::unique(&request, "X-Api-Key")?;
 /// ```
 #[derive(Clone)]
 pub struct Header {
@@ -421,6 +431,30 @@ impl Header {
         // One lookup: header names intern case-insensitively, so the
         // lowercased retry was always redundant.
         request.headers.get(name).map(|v| Header::new(name, v))
+    }
+
+    /// Extract a header that must appear at most once.
+    ///
+    /// `Ok(None)` when absent (or not UTF-8, as with
+    /// [`optional`](Self::optional)); `Err(Validation)` (400) when repeated,
+    /// since there is no telling which copy the client sent.
+    ///
+    /// ```
+    /// use armature_core::{Header, HttpRequest};
+    ///
+    /// let mut request = HttpRequest::new("GET", "/");
+    /// request.headers.append("x-api-key", "a");
+    /// request.headers.append("x-api-key", "b");
+    /// assert!(Header::unique(&request, "X-Api-Key").is_err());
+    /// ```
+    pub fn unique(request: &HttpRequest, name: &str) -> Result<Option<Self>, Error> {
+        let value = request
+            .headers
+            .get_unique(name)
+            .map_err(|_| Error::Validation(format!("Repeated header: {}", name)))?;
+        Ok(value
+            .and_then(|v| std::str::from_utf8(v).ok())
+            .map(|v| Header::new(name, v)))
     }
 }
 
@@ -889,6 +923,21 @@ mod tests {
 
         let missing = Header::optional(&request, "X-Missing");
         assert!(missing.is_none());
+    }
+
+    #[test]
+    fn header_unique_refuses_a_repeated_header() {
+        let mut request = create_request();
+        request.headers.append("x-api-key", "a");
+        request.headers.append("x-api-key", "b");
+
+        assert!(matches!(
+            Header::unique(&request, "X-Api-Key"),
+            Err(Error::Validation(_))
+        ));
+        let auth = Header::unique(&request, "Authorization").unwrap().unwrap();
+        assert_eq!(auth.value(), "Bearer token123");
+        assert!(Header::unique(&request, "X-Missing").unwrap().is_none());
     }
 
     #[test]

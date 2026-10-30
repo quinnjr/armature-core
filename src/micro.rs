@@ -686,13 +686,26 @@ impl Middleware for Logger {
                         "Request completed"
                     );
                 }
-                Err(e) => {
+                // A client can produce 4xx at will (no credentials, a bad
+                // parameter, an unknown path); logging those at `error` lets
+                // any peer flood the error log. Only server faults are errors.
+                Err(e) if e.status_code() >= 500 => {
                     tracing::error!(
                         method = %method,
                         path = %path,
                         error = %e.log_display(),
                         duration_ms = elapsed.as_millis() as u64,
                         "Request failed"
+                    );
+                }
+                Err(e) => {
+                    tracing::debug!(
+                        method = %method,
+                        path = %path,
+                        status = e.status_code(),
+                        error = %e.log_display(),
+                        duration_ms = elapsed.as_millis() as u64,
+                        "Request rejected"
                     );
                 }
             }
@@ -703,6 +716,14 @@ impl Middleware for Logger {
 }
 
 /// CORS middleware
+///
+/// The CORS headers go on the responses that come back through it as `Ok`.
+/// A downstream `Err` propagates unchanged and is rendered by the server
+/// after the whole middleware stack has run, so that error response carries
+/// no CORS headers and a browser hides its body from the calling origin. A
+/// handler whose rejection reason the origin must be able to read should
+/// answer with an `Ok` response carrying the error status (e.g.
+/// `Ok(err.to_client_response())`).
 pub struct Cors {
     allowed_origins: Vec<String>,
     allowed_methods: Vec<String>,
@@ -1438,6 +1459,16 @@ async fn handle_micro_request(
     // Handle request
     let response = app.handle(http_req).await;
 
+    // Same rejection summary as `Application`, counted once on the outcome:
+    // a 401/403 can come back as a response as well as an error.
+    let status = match &response {
+        Ok(resp) => resp.status,
+        Err(e) => e.status_code(),
+    };
+    if crate::application::is_auth_rejection(status) {
+        crate::application::note_auth_rejection();
+    }
+
     // Convert to hyper response
     match response {
         Ok(resp) => Ok(to_hyper_response(resp)),
@@ -2108,6 +2139,41 @@ mod tests {
         )
         .await;
         String::from_utf8_lossy(&buf).into_owned()
+    }
+
+    /// The micro server feeds the same rejection summary as `Application`:
+    /// a 401/403 answered as a response or as an error is counted once.
+    #[tokio::test]
+    async fn micro_auth_rejections_are_counted_once() {
+        async fn forbidden_response(_req: HttpRequest) -> Result<HttpResponse, Error> {
+            Ok(HttpResponse::new(403))
+        }
+        async fn unauthorized_error(_req: HttpRequest) -> Result<HttpResponse, Error> {
+            Err(Error::Unauthorized("no".to_string()))
+        }
+        let app = App::new()
+            .route("/response", get(forbidden_response))
+            .route("/error", get(unauthorized_error))
+            .route("/ok", get(test_handler))
+            .build();
+        let addr = spawn_test_server(app).await;
+        let noted = || crate::application::AUTH_REJECTIONS_NOTED.with(|n| n.get());
+
+        for (path, status, counted) in [
+            ("/response", "403", 1),
+            ("/error", "401", 1),
+            ("/ok", "200", 0),
+        ] {
+            let before = noted();
+            let request =
+                format!("GET {path} HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n");
+            let response = send_raw_request(addr, request.as_bytes()).await;
+            assert!(
+                response.starts_with(&format!("HTTP/1.1 {status}")),
+                "{path}: {response}"
+            );
+            assert_eq!(noted() - before, counted, "{path}");
+        }
     }
 
     /// A request declaring a `Content-Length` far above the configured limit

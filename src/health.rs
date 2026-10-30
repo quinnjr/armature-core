@@ -463,6 +463,10 @@ impl HealthIndicator for MemoryHealthIndicator {
 }
 
 /// Disk health indicator that checks available disk space.
+///
+/// At most one disk probe runs at a time per indicator: checks that arrive
+/// while one is in flight wait for that probe's result rather than starting
+/// another, so a hung filesystem cannot pile up stuck blocking threads.
 pub struct DiskHealthIndicator {
     /// Path to check disk space for
     pub path: String,
@@ -470,6 +474,7 @@ pub struct DiskHealthIndicator {
     pub degraded_threshold: f64,
     /// Threshold percentage of used space above which status becomes DOWN
     pub critical_threshold: f64,
+    probe: DiskProbe,
 }
 
 impl Default for DiskHealthIndicator {
@@ -478,7 +483,77 @@ impl Default for DiskHealthIndicator {
             path: "/".to_string(),
             degraded_threshold: 80.0,
             critical_threshold: 95.0,
+            probe: DiskProbe::new(read_disk_info),
         }
+    }
+}
+
+/// `(total, available)` bytes for a path, or `None` if unreadable.
+type DiskInfo = Option<(u64, u64)>;
+
+/// A probe running on the blocking pool, shareable between the checks
+/// waiting on it.
+type SharedProbe = futures_util::future::Shared<futures_util::future::BoxFuture<'static, DiskInfo>>;
+
+/// Single-flight runner for the blocking disk probe.
+///
+/// `statvfs` on a hung filesystem (a stale NFS mount) blocks its thread until
+/// the filesystem answers, and neither the health service's timeout nor
+/// dropping the future can cancel a `spawn_blocking` task. Spawning one per
+/// check would let a public health endpoint pile up stuck threads until the
+/// blocking pool is exhausted. Instead the in-flight probe is shared: checks
+/// that arrive while it runs await the same result (each still bounded by its
+/// own timeout, so a hung filesystem reads as DOWN), and a new probe starts
+/// only once the previous one has returned.
+struct DiskProbe {
+    read: Arc<dyn Fn(&str) -> DiskInfo + Send + Sync>,
+    in_flight: std::sync::Mutex<Option<SharedProbe>>,
+}
+
+impl DiskProbe {
+    fn new(read: impl Fn(&str) -> DiskInfo + Send + Sync + 'static) -> Self {
+        Self {
+            read: Arc::new(read),
+            in_flight: std::sync::Mutex::new(None),
+        }
+    }
+
+    /// The running probe's result, starting a probe if none is running.
+    fn sample(&self, path: &str) -> SharedProbe {
+        use futures_util::FutureExt;
+
+        // A poisoned lock only means a panic elsewhere mid-update; the slot
+        // is still a valid `Option`.
+        let mut slot = self
+            .in_flight
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(probe) = slot.as_ref()
+            && probe.peek().is_none()
+        {
+            return probe.clone();
+        }
+        let read = Arc::clone(&self.read);
+        let path = path.to_owned();
+        let probe = tokio::task::spawn_blocking(move || read(&path))
+            .map(|joined| joined.ok().flatten())
+            .boxed()
+            .shared();
+        *slot = Some(probe.clone());
+        probe
+    }
+}
+
+/// Disk totals for `path` (blocking).
+fn read_disk_info(path: &str) -> DiskInfo {
+    #[cfg(unix)]
+    {
+        get_unix_disk_info(path)
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = path;
+        None
     }
 }
 
@@ -508,23 +583,13 @@ impl HealthIndicator for DiskHealthIndicator {
     async fn check(&self) -> HealthCheckResult {
         let start = Instant::now();
 
-        // Get disk info (platform-specific implementation)
         // `statvfs` is a blocking syscall that can hang for as long as the
         // filesystem does (a stale NFS mount), so it runs on the blocking pool
         // rather than stalling an executor thread — and every request queued
-        // behind it — for the duration. The indicator's timeout still bounds
-        // how long the check itself waits.
-        #[cfg(unix)]
-        let disk_info = {
-            let path = self.path.clone();
-            tokio::task::spawn_blocking(move || get_unix_disk_info(&path))
-                .await
-                .ok()
-                .flatten()
-        };
-
-        #[cfg(not(unix))]
-        let disk_info: Option<(u64, u64)> = None;
+        // behind it — for the duration, and only one at a time (see
+        // `DiskProbe`). The indicator's timeout still bounds how long the
+        // check itself waits.
+        let disk_info = self.probe.sample(&self.path).await;
 
         let duration = start.elapsed();
 
@@ -1153,6 +1218,48 @@ mod tests {
         assert!(get_unix_disk_info("--version").is_none());
         assert!(get_unix_disk_info("/\0").is_none());
         assert!(get_unix_disk_info("/nonexistent/armature/path").is_none());
+    }
+
+    /// A hung filesystem must not cost one stuck blocking thread per health
+    /// request: checks that arrive while a probe is stuck share it, and a new
+    /// probe starts only after it returns.
+    #[tokio::test]
+    async fn test_disk_probe_is_single_flight() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let calls = Arc::new(AtomicUsize::new(0));
+        let (release, gate) = std::sync::mpsc::channel::<()>();
+        let gate = std::sync::Mutex::new(gate);
+        let indicator = DiskHealthIndicator {
+            probe: DiskProbe::new({
+                let calls = Arc::clone(&calls);
+                move |_path: &str| {
+                    calls.fetch_add(1, Ordering::SeqCst);
+                    // Hang like a stale mount until released.
+                    let _ = gate.lock().unwrap().recv();
+                    Some((100, 90))
+                }
+            }),
+            ..DiskHealthIndicator::new("/")
+        };
+
+        for _ in 0..5 {
+            let timed_out =
+                tokio::time::timeout(Duration::from_millis(20), indicator.check()).await;
+            assert!(timed_out.is_err(), "the probe is hung");
+        }
+        assert_eq!(calls.load(Ordering::SeqCst), 1, "one probe, not five");
+
+        // The filesystem answers: the stuck probe's result is used, then the
+        // next check starts a fresh probe.
+        release.send(()).unwrap();
+        let result = indicator.check().await;
+        assert_eq!(result.status, HealthStatus::Up);
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        release.send(()).unwrap();
+        let result = indicator.check().await;
+        assert_eq!(result.status, HealthStatus::Up);
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
     }
 
     #[tokio::test]

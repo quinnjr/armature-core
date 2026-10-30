@@ -73,6 +73,12 @@ static SENSITIVE_PATTERNS: LazyLock<Vec<(regex::Regex, &'static str)>> = LazyLoc
     // the closing bracket of a Rails/PHP-style key (`user[password]=x`,
     // `user%5Bpassword%5D=x`).
     const SEP: &str = r"(?:\]|%5d)?\s*[=:]";
+    // A `key=value` value: one token, plus any further digit groups joined
+    // by the separators the card pattern allows. Without them, `card_number:
+    // 4907 0742 4950 3781` would lose only its first group and leave the
+    // other twelve digits, too few for the card pattern to recognise.
+    const VALUE: &str =
+        r"\S+(?:[ \t\-./_\x{A0}\x{2013}\x{202F}\x{3000}\x{FF0D}]{1,3}[0-9\x{FF10}-\x{FF19}]+)*";
     // A JSON key may be dotted or bracketed (`"user.password"`).
     const KEY_CHARS: &str = r"[a-z0-9_.\[\]-]";
     // A JSON value: a string (escapes honoured) or a bare number.
@@ -87,9 +93,9 @@ static SENSITIVE_PATTERNS: LazyLock<Vec<(regex::Regex, &'static str)>> = LazyLoc
                                        signature|cookie|passcode|card[_-]?number|cc[_-]?num|\
                                        account[_-]?number";
     let form_substring =
-        format!(r"(?-u:\b)([a-z0-9_-]*(?:{FORM_SUBSTRING_KEYS})[a-z0-9_-]*){SEP}\s*\S+");
+        format!(r"(?-u:\b)([a-z0-9_-]*(?:{FORM_SUBSTRING_KEYS})[a-z0-9_-]*){SEP}\s*{VALUE}");
     let form_delimited = format!(
-        r"(?-u:\b)((?:[a-z0-9]+(?:[_-]|\[|%5b))*(?:{DELIMITED_KEYS}|{CODE_KEYS}|code)){SEP}\s*\S+"
+        r"(?-u:\b)((?:[a-z0-9]+(?:[_-]|\[|%5b))*(?:{DELIMITED_KEYS}|{CODE_KEYS}|code)){SEP}\s*{VALUE}"
     );
 
     let patterns: Vec<(String, &str)> = vec![
@@ -102,23 +108,23 @@ static SENSITIVE_PATTERNS: LazyLock<Vec<(regex::Regex, &'static str)>> = LazyLoc
         // bare-key patterns: matching only up to the scheme would leave the
         // credential itself behind.
         (
-            format!(r"authorization{SEP}\s*(?:(?:bearer|basic|digest|negotiate|token)\s+)?\S+"),
+            format!(r"authorization{SEP}\s*(?:(?:bearer|basic|digest|negotiate|token)\s+)?{VALUE}"),
             "authorization=[FILTERED]",
         ),
         // Passwords
-        (format!(r"password{SEP}\s*\S+"), "password=[FILTERED]"),
-        (format!(r"pwd{SEP}\s*\S+"), "pwd=[FILTERED]"),
+        (format!(r"password{SEP}\s*{VALUE}"), "password=[FILTERED]"),
+        (format!(r"pwd{SEP}\s*{VALUE}"), "pwd=[FILTERED]"),
         // API keys
-        (format!(r"api[_-]?key{SEP}\s*\S+"), "api_key=[FILTERED]"),
-        (format!(r"apikey{SEP}\s*\S+"), "apikey=[FILTERED]"),
+        (format!(r"api[_-]?key{SEP}\s*{VALUE}"), "api_key=[FILTERED]"),
+        (format!(r"apikey{SEP}\s*{VALUE}"), "apikey=[FILTERED]"),
         // Tokens
-        (format!(r"token{SEP}\s*\S+"), "token=[FILTERED]"),
+        (format!(r"token{SEP}\s*{VALUE}"), "token=[FILTERED]"),
         (r"bearer\s+\S+".into(), "Bearer [FILTERED]"),
         // Basic credentials are base64 `user:pass`; the length floor keeps
         // prose such as "basic auth failed" intact.
         (r"(?-u:\b)basic\s+[a-z0-9+/]{6,}=*".into(), "Basic [FILTERED]"),
         // Secrets
-        (format!(r"secret{SEP}\s*\S+"), "secret=[FILTERED]"),
+        (format!(r"secret{SEP}\s*{VALUE}"), "secret=[FILTERED]"),
         // Session ids, passwd, card security codes, PINs, OTPs, SSNs and
         // one-time/authorization codes in `key=value` / `key: value` form.
         (form_substring, "$1=[FILTERED]"),
@@ -417,6 +423,43 @@ pub(crate) fn redact_sensitive(s: &str) -> Cow<'_, str> {
     }
     result
 }
+
+/// `value` with [`redact_sensitive`] applied to every string inside it, and
+/// members whose key [`is_sensitive_key`] replaced by `[FILTERED]`.
+fn redact_json_strings(value: serde_json::Value) -> serde_json::Value {
+    use serde_json::Value;
+    match value {
+        Value::String(s) => match redact_sensitive(&s) {
+            Cow::Borrowed(_) => Value::String(s),
+            Cow::Owned(redacted) => Value::String(redacted),
+        },
+        Value::Array(items) => Value::Array(items.into_iter().map(redact_json_strings).collect()),
+        Value::Object(members) => Value::Object(
+            members
+                .into_iter()
+                .map(|(key, member)| {
+                    let member = if is_sensitive_key(&key) {
+                        Value::String("[FILTERED]".to_string())
+                    } else {
+                        redact_json_strings(member)
+                    };
+                    (key, member)
+                })
+                .collect(),
+        ),
+        other => other,
+    }
+}
+
+/// E-mail addresses, for [`ErrorTransformer::redact_email_addresses`]. ASCII
+/// local parts and dotted domains: enough for the addresses that end up in
+/// error messages, not an RFC 5322 parser.
+static EMAIL_PATTERN: LazyLock<Option<regex::Regex>> = LazyLock::new(|| {
+    let re =
+        regex::Regex::new(r"[A-Za-z0-9._%+\-]+@[A-Za-z0-9\-]+(?:\.[A-Za-z0-9\-]+)*\.[A-Za-z]{2,}");
+    debug_assert!(re.is_ok(), "bad e-mail pattern: {re:?}");
+    re.ok()
+});
 
 // ============================================================================
 // Error Response Types
@@ -858,7 +901,12 @@ pub struct ValidationError {
     /// Validation rule that failed
     #[serde(skip_serializing_if = "Option::is_none")]
     pub rule: Option<String>,
-    /// Invalid value (sanitized)
+    /// The rejected value, echoed back to the client.
+    ///
+    /// [`value`](Self::value) sanitizes it: replaced whole by `[FILTERED]`
+    /// when [`field`](Self::field) names a credential or PII, otherwise with
+    /// card numbers, SSNs and `key=value` secrets in its strings redacted. A
+    /// value assigned to this field directly is sent as given.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub value: Option<serde_json::Value>,
 }
@@ -880,9 +928,20 @@ impl ValidationError {
         self
     }
 
-    /// Set the invalid value.
+    /// Set the invalid value, sanitized (see [`value`](Self#structfield.value)).
+    ///
+    /// Call it after the field name is set (as [`new`](Self::new) does): the
+    /// name decides whether the value is withheld entirely.
     pub fn value(mut self, value: impl Serialize) -> Self {
-        self.value = serde_json::to_value(value).ok();
+        self.value = serde_json::to_value(value).ok().map(|value| {
+            // A rejected password is still a password, and this goes back
+            // to the client (and into whatever logs the response).
+            if is_sensitive_key(&self.field) {
+                serde_json::Value::String("[FILTERED]".to_string())
+            } else {
+                redact_json_strings(value)
+            }
+        });
         self
     }
 }
@@ -1231,6 +1290,8 @@ pub struct ErrorTransformer {
     include_stack_trace: bool,
     /// Whether to filter sensitive data
     filter_sensitive: bool,
+    /// Whether to redact e-mail addresses (off by default)
+    redact_emails: bool,
     /// Custom transformers (checked in order)
     transformers: Vec<TransformerFn>,
     /// Error filters
@@ -1255,6 +1316,7 @@ impl ErrorTransformer {
             format: ResponseFormat::Json,
             include_stack_trace: false,
             filter_sensitive: true,
+            redact_emails: false,
             transformers: Vec::new(),
             filters: Vec::new(),
             loggers: Vec::new(),
@@ -1280,6 +1342,20 @@ impl ErrorTransformer {
     /// Enable or disable sensitive data filtering.
     pub fn filter_sensitive_data(mut self, filter: bool) -> Self {
         self.filter_sensitive = filter;
+        self
+    }
+
+    /// Enable or disable e-mail address redaction (off by default).
+    ///
+    /// [`filter_sensitive_data`](Self::filter_sensitive_data) removes
+    /// credentials, card numbers and SSNs but keeps e-mail addresses, which
+    /// are usually what makes an error such as "no account for x@y" useful.
+    /// Turning this on replaces them with `[EMAIL FILTERED]` in error
+    /// messages as a data-minimisation choice, e.g. where error bodies are
+    /// stored or shown to someone other than the address's owner. It applies
+    /// whether or not `filter_sensitive_data` is on.
+    pub fn redact_email_addresses(mut self, redact: bool) -> Self {
+        self.redact_emails = redact;
         self
     }
 
@@ -1367,7 +1443,7 @@ impl ErrorTransformer {
 
     /// Apply error filters.
     fn apply_filters(&self, error: &Error) -> Error {
-        let mut current = if self.filter_sensitive {
+        let mut current = if self.filter_sensitive || self.redact_emails {
             self.filter_error_message(error)
         } else {
             self.clone_error(error)
@@ -1396,7 +1472,30 @@ impl ErrorTransformer {
     /// Uses the module-level [`SENSITIVE_PATTERNS`] regexes, which are compiled
     /// once on first use rather than on every call.
     fn filter_sensitive_string(&self, s: &str) -> String {
-        redact_sensitive(s).into_owned()
+        let filtered = if self.filter_sensitive {
+            redact_sensitive(s)
+        } else {
+            Cow::Borrowed(s)
+        };
+        match EMAIL_PATTERN.as_ref() {
+            Some(email) if self.redact_emails => email
+                .replace_all(&filtered, "[EMAIL FILTERED]")
+                .into_owned(),
+            // A pattern that failed to compile cannot honour the opt-in;
+            // fail closed by dropping the message's `@`-bearing words.
+            None if self.redact_emails => filtered
+                .split(' ')
+                .map(|word| {
+                    if word.contains('@') {
+                        "[EMAIL FILTERED]"
+                    } else {
+                        word
+                    }
+                })
+                .collect::<Vec<_>>()
+                .join(" "),
+            _ => filtered.into_owned(),
+        }
     }
 
     /// Default error transformation.
@@ -1492,6 +1591,7 @@ impl Clone for ErrorTransformer {
             format: self.format,
             include_stack_trace: self.include_stack_trace,
             filter_sensitive: self.filter_sensitive,
+            redact_emails: self.redact_emails,
             transformers: self.transformers.clone(),
             filters: self.filters.clone(),
             loggers: self.loggers.clone(),
@@ -2061,8 +2161,59 @@ mod tests {
         assert!(!filtered.contains("sk_live_secret"));
         assert!(filtered.contains("[FILTERED]"));
 
-        // Non-secret email address is preserved (not part of the redaction set).
+        // E-mail addresses are kept unless `redact_email_addresses` is on.
         assert!(filtered.contains("user@example.com"));
+    }
+
+    /// A rejected value is echoed back to the client, so it is redacted the
+    /// way a log line would be: the whole value when the field names a
+    /// credential, and card numbers / SSNs inside any string.
+    #[test]
+    fn validation_error_value_is_sanitized() {
+        let err = ValidationError::new("password", "too short").value("hunter2");
+        assert_eq!(err.value, Some(serde_json::json!("[FILTERED]")));
+        let err = ValidationError::new("user.apiKey", "bad").value(serde_json::json!({"k": 1}));
+        assert_eq!(err.value, Some(serde_json::json!("[FILTERED]")));
+
+        let err = ValidationError::new("note", "too long")
+            .value(serde_json::json!({"a": ["card 4111 1111 1111 1111"], "b": "ssn 123-45-6789"}));
+        let rendered = err.value.as_ref().unwrap().to_string();
+        assert!(!rendered.contains("4111"), "{rendered}");
+        assert!(!rendered.contains("123-45-6789"), "{rendered}");
+        assert!(rendered.contains("[CARD FILTERED]"), "{rendered}");
+
+        // Ordinary values are kept as they are.
+        let err = ValidationError::new("email", "Invalid").value("not-an-email");
+        assert_eq!(err.value, Some(serde_json::json!("not-an-email")));
+        let err = ValidationError::new("age", "too young").value(12);
+        assert_eq!(err.value, Some(serde_json::json!(12)));
+    }
+
+    /// E-mail addresses are kept by default and redacted on request.
+    #[test]
+    fn email_redaction_is_opt_in() {
+        let input = "no account for Jane.Doe+tag@mail.example.co.uk (retry later)";
+        let kept = ErrorTransformer::new().filter_sensitive_string(input);
+        assert!(kept.contains("Jane.Doe+tag@mail.example.co.uk"), "{kept}");
+
+        let transformer = ErrorTransformer::new().redact_email_addresses(true);
+        let redacted = transformer.filter_sensitive_string(input);
+        assert!(!redacted.contains('@'), "{redacted}");
+        assert!(redacted.contains("[EMAIL FILTERED]"), "{redacted}");
+        assert!(redacted.contains("(retry later)"), "{redacted}");
+
+        // Through the whole transform, and independent of the other filters.
+        let response = ErrorTransformer::new()
+            .filter_sensitive_data(false)
+            .redact_email_addresses(true)
+            .transform(
+                &Error::NotFound("user a@b.example".into()),
+                &HttpRequest::new("GET", "/".to_string()),
+            );
+        assert!(!String::from_utf8_lossy(&response.body).contains("a@b.example"));
+        // Clones keep the setting.
+        let cloned = transformer.clone();
+        assert!(!cloned.filter_sensitive_string(input).contains('@'));
     }
 
     /// The widened key set: authorization schemes, basic credentials, PINs,
@@ -2133,6 +2284,22 @@ mod tests {
     /// Card numbers of every real length (13-19 digits) are redacted,
     /// grouped or not, when they pass the Luhn check; digit runs that fail it
     /// (order ids, timestamps) are left readable.
+    #[test]
+    fn key_value_redaction_takes_the_whole_spaced_number() {
+        for input in [
+            "card_number: 4907 0742 4950 3781",
+            "pan: 4907 0742 4950 3781",
+            "auth: 4907-0742-4950-3781",
+            "ssn: 123 45 6789",
+            "pin: 123 45 6789",
+        ] {
+            let out = redact_sensitive(input);
+            for leaked in ["0742", "4950", "3781", "45 6789", "6789"] {
+                assert!(!out.contains(leaked), "{input} -> {out}");
+            }
+        }
+    }
+
     #[test]
     fn test_redact_sensitive_card_lengths_and_luhn() {
         for (input, card) in [

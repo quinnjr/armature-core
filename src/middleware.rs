@@ -27,6 +27,51 @@ pub type HandlerFn = Arc<
 pub trait Middleware: Send + Sync {
     /// Process the request and optionally pass to next middleware
     async fn handle(&self, req: HttpRequest, next: Next) -> Result<HttpResponse, Error>;
+
+    /// Decorate the response the application rendered from an error.
+    ///
+    /// When the pipeline ends in an `Err`, the error propagates out of
+    /// [`handle`](Self::handle) untouched, so the application's exception
+    /// filters see it; the filters (or, without one that handles it, the
+    /// default [`Error::to_client_response`]) then render the response. That
+    /// final response is passed here, so a middleware that adds headers on
+    /// its `Ok` path (security headers, CORS) can add them to error responses
+    /// too without turning the error into an `Ok` and hiding it from the
+    /// filters.
+    ///
+    /// Called by `Application` on every **global** middleware
+    /// ([`Application::use_middleware`](crate::Application::use_middleware)),
+    /// innermost first, so an outer middleware's header wins as it does on the
+    /// `Ok` path, and whichever middleware or handler raised the error.
+    /// Route-scoped middleware is not called: an error leaving a route is
+    /// decorated by the global middleware only.
+    ///
+    /// The default does nothing, so implementing it is optional.
+    fn decorate_error_response(&self, ctx: &ErrorResponseContext<'_>, response: &mut HttpResponse) {
+        let _ = (ctx, response);
+    }
+}
+
+/// What [`Middleware::decorate_error_response`] knows about the request whose
+/// error is being rendered.
+///
+/// The request itself has been consumed by the pipeline by then; this carries
+/// what is still available without keeping a copy of every request on the
+/// success path.
+#[derive(Debug, Clone, Copy)]
+#[non_exhaustive]
+pub struct ErrorResponseContext<'a> {
+    /// The request method.
+    pub method: &'a crate::Method,
+    /// The request path, without the query string.
+    pub path: &'a str,
+}
+
+impl<'a> ErrorResponseContext<'a> {
+    /// The context for a request to `method` `path` (query string excluded).
+    pub fn new(method: &'a crate::Method, path: &'a str) -> Self {
+        Self { method, path }
+    }
 }
 
 /// Middleware chain executor
@@ -57,6 +102,18 @@ impl MiddlewareChain {
     /// Whether the chain has no middleware.
     pub fn is_empty(&self) -> bool {
         self.middlewares.is_empty()
+    }
+
+    /// Let every middleware in the chain decorate a response rendered from an
+    /// error, innermost first (see [`Middleware::decorate_error_response`]).
+    pub fn decorate_error_response(
+        &self,
+        ctx: &ErrorResponseContext<'_>,
+        response: &mut HttpResponse,
+    ) {
+        for middleware in self.middlewares.iter().rev() {
+            middleware.decorate_error_response(ctx, response);
+        }
     }
 
     /// Execute the middleware chain with a handler
@@ -121,6 +178,12 @@ impl Default for MiddlewareChain {
 /// is set, because that pair is invalid and browsers reject it. For a list of
 /// origins, reflection, or regex matching use `armature-security`'s CORS, or
 /// [`crate::micro::Cors`].
+///
+/// Error responses carry the CORS headers too, so the allowed origin can read
+/// why a request was rejected: a downstream `Err` still propagates as an
+/// `Err` (exception filters see it), and when this is global middleware the
+/// application adds the headers to the response rendered from it (see
+/// [`Middleware::decorate_error_response`]).
 pub struct CorsMiddleware {
     pub allow_origin: String,
     pub allow_methods: String,
@@ -207,21 +270,39 @@ impl Middleware for CorsMiddleware {
             return Ok(HttpResponse::with_status_and_headers(204, headers));
         }
 
-        // Process request and add CORS headers to response
+        // Process request and add CORS headers to response. An error goes on
+        // as an `Err`, for the exception filters; the response rendered from
+        // it is decorated in `decorate_error_response`.
         let mut response = next(req).await?;
+        self.apply(&mut response);
+        Ok(response)
+    }
 
+    /// Without the headers a browser hides a 4xx body (why the request was
+    /// rejected) from the allowed origin.
+    fn decorate_error_response(
+        &self,
+        _ctx: &ErrorResponseContext<'_>,
+        response: &mut HttpResponse,
+    ) {
+        self.apply(response);
+    }
+}
+
+impl CorsMiddleware {
+    /// The CORS headers of an actual (non-preflight) response.
+    fn apply(&self, response: &mut HttpResponse) {
         response.headers.insert(
             "Access-Control-Allow-Origin".to_string(),
             self.allow_origin.clone(),
         );
-        if credentials {
+        // Credentials never go out with a wildcard origin.
+        if self.allow_credentials && self.allow_origin.trim() != "*" {
             response.headers.insert(
                 "Access-Control-Allow-Credentials".to_string(),
                 "true".to_string(),
             );
         }
-
-        Ok(response)
     }
 }
 
@@ -297,13 +378,27 @@ impl Middleware for LoggerMiddleware {
                     "response sent"
                 );
             }
-            Err(e) => {
+            // A client can produce 4xx at will (no credentials, a bad
+            // parameter, an unknown path); logging those at `error` lets any
+            // peer flood the error log or page someone. Only server faults
+            // are errors.
+            Err(e) if e.status_code() >= 500 => {
                 error!(
                     method = %method,
                     path = %path,
                     error = %e.log_display(),
                     duration_ms = duration.as_millis(),
                     "request failed"
+                );
+            }
+            Err(e) => {
+                debug!(
+                    method = %method,
+                    path = %path,
+                    status = e.status_code(),
+                    error = %e.log_display(),
+                    duration_ms = duration.as_millis(),
+                    "request rejected"
                 );
             }
         }
@@ -369,39 +464,169 @@ impl Middleware for BodySizeLimitMiddleware {
 
 /// Security headers middleware
 ///
-/// Sets `Strict-Transport-Security`, `X-Content-Type-Options: nosniff`,
-/// `X-Frame-Options: DENY` and `X-XSS-Protection: 0`.
+/// By default sets `Strict-Transport-Security`, `X-Content-Type-Options:
+/// nosniff`, `X-Frame-Options: DENY`, `X-XSS-Protection: 0` and
+/// `Referrer-Policy: strict-origin-when-cross-origin`. Any of them can be
+/// replaced ([`with_header`](Self::with_header) and the typed helpers) or
+/// dropped ([`without`](Self::without)); a `Content-Security-Policy` or
+/// `Cross-Origin-Opener-Policy` is added only when configured, since a policy
+/// that fits one application breaks another.
 ///
 /// `X-XSS-Protection` is sent as `0` (filter off), per OWASP: the legacy
 /// browser XSS auditor that `1; mode=block` switched on could itself be
 /// abused to detect or block page content cross-site (XS-leaks), and modern
 /// browsers have removed it. Use a `Content-Security-Policy` instead.
+///
+/// The headers go on error responses too, because a 401/403/404/500 page is
+/// as framable and sniffable as any other: a downstream `Err` still
+/// propagates as an `Err` (exception filters see it), and when this is global
+/// middleware the application applies the headers to the response rendered
+/// from it (see [`Middleware::decorate_error_response`]).
+#[derive(Debug, Clone)]
 pub struct SecurityHeadersMiddleware {
-    hsts_enabled: bool,
-    nosniff_enabled: bool,
-    xss_protection_enabled: bool,
-    frame_options: Option<String>,
+    /// `(name, value)` pairs in the order they are applied; names are unique
+    /// ignoring ASCII case.
+    headers: Vec<(String, String)>,
 }
+
+const HSTS_HEADER: &str = "Strict-Transport-Security";
+const HSTS_DEFAULT: &str = "max-age=31536000; includeSubDomains";
 
 impl SecurityHeadersMiddleware {
     pub fn new() -> Self {
+        let headers = [
+            (HSTS_HEADER, HSTS_DEFAULT),
+            ("X-Content-Type-Options", "nosniff"),
+            ("X-XSS-Protection", "0"),
+            ("X-Frame-Options", "DENY"),
+            // Full URLs (paths and query strings, which can carry tokens)
+            // must not leak to other origins through `Referer`.
+            ("Referrer-Policy", "strict-origin-when-cross-origin"),
+        ];
         Self {
-            hsts_enabled: true,
-            nosniff_enabled: true,
-            xss_protection_enabled: true,
-            frame_options: Some("DENY".to_string()),
+            headers: headers
+                .into_iter()
+                .map(|(name, value)| (name.to_string(), value.to_string()))
+                .collect(),
         }
     }
 
-    pub fn with_hsts(mut self, enabled: bool) -> Self {
-        self.hsts_enabled = enabled;
+    pub fn with_hsts(self, enabled: bool) -> Self {
+        if enabled {
+            self.with_header(HSTS_HEADER, HSTS_DEFAULT)
+        } else {
+            self.without(HSTS_HEADER)
+        }
+    }
+
+    /// Set `X-Frame-Options`.
+    ///
+    /// # Panics
+    ///
+    /// As [`with_header`](Self::with_header), on a value that is not a valid
+    /// header value.
+    pub fn with_frame_options(self, value: &str) -> Self {
+        self.with_header("X-Frame-Options", value)
+    }
+
+    /// Set `Referrer-Policy` (default `strict-origin-when-cross-origin`).
+    ///
+    /// # Panics
+    ///
+    /// As [`with_header`](Self::with_header).
+    pub fn with_referrer_policy(self, value: &str) -> Self {
+        self.with_header("Referrer-Policy", value)
+    }
+
+    /// Set `Content-Security-Policy` (not sent by default).
+    ///
+    /// # Panics
+    ///
+    /// As [`with_header`](Self::with_header).
+    pub fn with_content_security_policy(self, value: &str) -> Self {
+        self.with_header("Content-Security-Policy", value)
+    }
+
+    /// Set `Cross-Origin-Opener-Policy` (not sent by default).
+    ///
+    /// # Panics
+    ///
+    /// As [`with_header`](Self::with_header).
+    pub fn with_cross_origin_opener_policy(self, value: &str) -> Self {
+        self.with_header("Cross-Origin-Opener-Policy", value)
+    }
+
+    /// Set `name: value` on every response, replacing a configured header of
+    /// the same name (ignoring case).
+    ///
+    /// # Panics
+    ///
+    /// If `name` is not an HTTP token or `value` contains a control character
+    /// (CR, LF, NUL, ...). This is configuration, checked once at startup:
+    /// failing there beats emitting a split or rejected header on every
+    /// response. Use [`try_with_header`](Self::try_with_header) to handle it.
+    pub fn with_header(self, name: &str, value: &str) -> Self {
+        match self.try_with_header(name, value) {
+            Ok(this) => this,
+            Err(err) => panic!("SecurityHeadersMiddleware: {err}"),
+        }
+    }
+
+    /// [`with_header`](Self::with_header), returning an error instead of
+    /// panicking on an invalid name or value.
+    pub fn try_with_header(mut self, name: &str, value: &str) -> Result<Self, Error> {
+        validate_header(name, value)?;
+        self.headers
+            .retain(|(existing, _)| !existing.eq_ignore_ascii_case(name));
+        self.headers.push((name.to_string(), value.to_string()));
+        Ok(self)
+    }
+
+    /// Stop sending `name` (ignoring case), e.g. `X-XSS-Protection` or
+    /// `X-Content-Type-Options`.
+    pub fn without(mut self, name: &str) -> Self {
+        self.headers
+            .retain(|(existing, _)| !existing.eq_ignore_ascii_case(name));
         self
     }
 
-    pub fn with_frame_options(mut self, value: &str) -> Self {
-        self.frame_options = Some(value.to_string());
-        self
+    fn apply(&self, response: &mut HttpResponse) {
+        for (name, value) in &self.headers {
+            set_header(response, name, value);
+        }
     }
+}
+
+/// Reject a header line that would be malformed or split on the wire: the name
+/// must be an RFC 9110 token, the value free of control characters other than
+/// horizontal tab.
+fn validate_header(name: &str, value: &str) -> Result<(), Error> {
+    let token = |b: u8| b.is_ascii_alphanumeric() || b"!#$%&'*+-.^_`|~".contains(&b);
+    if name.is_empty() || !name.bytes().all(token) {
+        return Err(Error::Internal(format!("invalid header name {name:?}")));
+    }
+    if value.chars().any(|c| c.is_control() && c != '\t') {
+        return Err(Error::Internal(format!(
+            "invalid value for header {name}: contains a control character"
+        )));
+    }
+    Ok(())
+}
+
+/// Set `name` on `response`, dropping any other casing of it first: response
+/// header keys are case-sensitive here, and two casings would go out as two
+/// header lines.
+fn set_header(response: &mut HttpResponse, name: &str, value: &str) {
+    let stale: Vec<String> = response
+        .headers
+        .iter()
+        .filter(|(existing, _)| existing.as_str() != name && existing.eq_ignore_ascii_case(name))
+        .map(|(existing, _)| existing.clone())
+        .collect();
+    for existing in stale {
+        response.headers.remove(&existing);
+    }
+    response.headers.insert(name.to_string(), value.to_string());
 }
 
 impl Default for SecurityHeadersMiddleware {
@@ -413,34 +638,19 @@ impl Default for SecurityHeadersMiddleware {
 #[async_trait]
 impl Middleware for SecurityHeadersMiddleware {
     async fn handle(&self, req: HttpRequest, next: Next) -> Result<HttpResponse, Error> {
+        // An error goes on as an `Err`, for the exception filters; the
+        // response rendered from it is decorated below.
         let mut response = next(req).await?;
-
-        if self.hsts_enabled {
-            response.headers.insert(
-                "Strict-Transport-Security".to_string(),
-                "max-age=31536000; includeSubDomains".to_string(),
-            );
-        }
-
-        if self.nosniff_enabled {
-            response
-                .headers
-                .insert("X-Content-Type-Options".to_string(), "nosniff".to_string());
-        }
-
-        if self.xss_protection_enabled {
-            response
-                .headers
-                .insert("X-XSS-Protection".to_string(), "0".to_string());
-        }
-
-        if let Some(frame_opts) = &self.frame_options {
-            response
-                .headers
-                .insert("X-Frame-Options".to_string(), frame_opts.clone());
-        }
-
+        self.apply(&mut response);
         Ok(response)
+    }
+
+    fn decorate_error_response(
+        &self,
+        _ctx: &ErrorResponseContext<'_>,
+        response: &mut HttpResponse,
+    ) {
+        self.apply(response);
     }
 }
 
@@ -973,13 +1183,26 @@ impl Middleware for LoggingMiddleware {
                     );
                 }
             }
-            Err(err) => {
+            // Client-caused failures stay below `error` (see
+            // `LoggerMiddleware`): a peer must not be able to flood the
+            // error log at will.
+            Err(err) if err.status_code() >= 500 => {
                 crate::logging::error!(
                     method = %method,
                     path = %path,
                     duration_ms = duration.as_millis(),
                     error = %err.log_display(),
                     "HTTP request failed"
+                );
+            }
+            Err(err) => {
+                crate::logging::debug!(
+                    method = %method,
+                    path = %path,
+                    status = err.status_code(),
+                    duration_ms = duration.as_millis(),
+                    error = %err.log_display(),
+                    "HTTP request rejected"
                 );
             }
         }
@@ -1406,6 +1629,233 @@ mod tests {
             !logged.contains("SECRET"),
             "a query secret was logged: {logged}"
         );
+    }
+
+    /// Levels of the events emitted while the returned guard is held (on
+    /// this thread, which a current-thread `#[tokio::test]` stays on).
+    fn capture_levels() -> (
+        Arc<std::sync::Mutex<Vec<tracing::Level>>>,
+        tracing::subscriber::DefaultGuard,
+    ) {
+        use tracing_subscriber::layer::SubscriberExt;
+
+        struct Levels(Arc<std::sync::Mutex<Vec<tracing::Level>>>);
+        impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for Levels {
+            fn on_event(
+                &self,
+                event: &tracing::Event<'_>,
+                _: tracing_subscriber::layer::Context<'_, S>,
+            ) {
+                self.0.lock().unwrap().push(*event.metadata().level());
+            }
+        }
+        let levels = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let subscriber = tracing_subscriber::registry().with(Levels(Arc::clone(&levels)));
+        let guard = tracing::subscriber::set_default(subscriber);
+        // Callsite interest is cached process-wide; a parallel test may have
+        // cached "never" for these callsites before this subscriber existed.
+        tracing::callsite::rebuild_interest_cache();
+        (levels, guard)
+    }
+
+    fn failing(err: fn() -> Error) -> Next {
+        Box::new(move |_req| Box::pin(async move { Err(err()) }))
+    }
+
+    /// A client-caused failure is not an `error` (a peer could flood the
+    /// error log at will); a server fault still is.
+    #[tokio::test]
+    async fn logging_middlewares_log_client_errors_below_error() {
+        let (levels, _guard) = capture_levels();
+        let req = || HttpRequest::new("GET", "/x".to_string());
+        let not_found = || Error::NotFound("nope".into());
+        let internal = || Error::Internal("boom".into());
+
+        let _ = LoggerMiddleware::new()
+            .handle(req(), failing(not_found))
+            .await;
+        let _ = LoggingMiddleware::new()
+            .handle(req(), failing(not_found))
+            .await;
+        assert!(
+            !levels.lock().unwrap().contains(&tracing::Level::ERROR),
+            "{:?}",
+            levels.lock().unwrap()
+        );
+
+        let _ = LoggerMiddleware::new()
+            .handle(req(), failing(internal))
+            .await;
+        let _ = LoggingMiddleware::new()
+            .handle(req(), failing(internal))
+            .await;
+        let errors = levels
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|l| **l == tracing::Level::ERROR)
+            .count();
+        assert_eq!(errors, 2);
+    }
+
+    fn error_ctx() -> (crate::Method, &'static str) {
+        (HttpRequest::new("GET", "/".to_string()).method, "/")
+    }
+
+    /// Error responses are as framable and sniffable as any other: the
+    /// error itself still propagates (for the exception filters), and the
+    /// response rendered from it gets the security headers.
+    #[tokio::test]
+    async fn security_headers_apply_to_error_responses() {
+        let middleware = SecurityHeadersMiddleware::new();
+        let (method, path) = error_ctx();
+        for (err, status) in [
+            (Error::Unauthorized("who".into()), 401),
+            (Error::NotFound("nope".into()), 404),
+            (Error::Internal("db password=hunter2".into()), 500),
+        ] {
+            let next: Next = Box::new(move |_req| Box::pin(async move { Err(err) }));
+            let err = middleware
+                .handle(HttpRequest::new("GET", "/".to_string()), next)
+                .await
+                .expect_err("an error propagates, so exception filters see it");
+            assert_eq!(err.status_code(), status);
+
+            let mut response = err.to_client_response();
+            middleware
+                .decorate_error_response(&ErrorResponseContext::new(&method, path), &mut response);
+            for name in [
+                "Strict-Transport-Security",
+                "X-Content-Type-Options",
+                "X-Frame-Options",
+                "Referrer-Policy",
+            ] {
+                assert!(response.headers.contains_key(name), "{status}: {name}");
+            }
+            assert!(!String::from_utf8_lossy(&response.body).contains("hunter2"));
+        }
+    }
+
+    /// The allowed origin can read why its request was rejected; credentials
+    /// still go out only with a specific origin.
+    #[tokio::test]
+    async fn cors_headers_apply_to_error_responses() {
+        let (method, path) = error_ctx();
+        let ctx = ErrorResponseContext::new(&method, path);
+        let cors = CorsMiddleware::new()
+            .allow_origin("https://app.example")
+            .allow_credentials(true);
+        let mut req = HttpRequest::new("GET", "/api".to_string());
+        req.headers.insert("origin", "https://app.example");
+        let err = cors
+            .handle(req, failing(|| Error::Forbidden("no".into())))
+            .await
+            .expect_err("an error propagates, so exception filters see it");
+        assert_eq!(err.status_code(), 403);
+
+        let mut response = err.to_client_response();
+        cors.decorate_error_response(&ctx, &mut response);
+        let get = |r: &HttpResponse, name: &str| r.headers.get(name).cloned();
+        assert_eq!(
+            get(&response, "Access-Control-Allow-Origin").as_deref(),
+            Some("https://app.example")
+        );
+        assert_eq!(
+            get(&response, "Access-Control-Allow-Credentials").as_deref(),
+            Some("true")
+        );
+
+        let wildcard = CorsMiddleware::new().allow_credentials(true);
+        let mut response = Error::Forbidden("no".into()).to_client_response();
+        wildcard.decorate_error_response(&ctx, &mut response);
+        assert_eq!(
+            get(&response, "Access-Control-Allow-Origin").as_deref(),
+            Some("*")
+        );
+        assert!(
+            !response
+                .headers
+                .contains_key("Access-Control-Allow-Credentials")
+        );
+    }
+
+    async fn secured(
+        middleware: &SecurityHeadersMiddleware,
+        response: HttpResponse,
+    ) -> HttpResponse {
+        let next: Next = Box::new(move |_req| Box::pin(async move { Ok(response) }));
+        middleware
+            .handle(HttpRequest::new("GET", "/".to_string()), next)
+            .await
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn security_headers_are_configurable() {
+        let middleware = SecurityHeadersMiddleware::new()
+            .with_content_security_policy("default-src 'self'")
+            .with_cross_origin_opener_policy("same-origin")
+            .with_referrer_policy("no-referrer")
+            .with_header("Permissions-Policy", "camera=()")
+            .without("x-xss-protection")
+            .without("X-Content-Type-Options")
+            .with_hsts(false);
+        let response = secured(&middleware, HttpResponse::ok()).await;
+        let get = |name: &str| response.headers.get(name).map(String::as_str);
+        assert_eq!(get("Content-Security-Policy"), Some("default-src 'self'"));
+        assert_eq!(get("Cross-Origin-Opener-Policy"), Some("same-origin"));
+        assert_eq!(get("Referrer-Policy"), Some("no-referrer"));
+        assert_eq!(get("Permissions-Policy"), Some("camera=()"));
+        assert_eq!(get("X-Frame-Options"), Some("DENY"));
+        assert!(!response.headers.contains_key("X-XSS-Protection"));
+        assert!(!response.headers.contains_key("X-Content-Type-Options"));
+        assert!(!response.headers.contains_key("Strict-Transport-Security"));
+    }
+
+    #[tokio::test]
+    async fn security_headers_default_referrer_policy_and_replace_other_casings() {
+        let mut handler_response = HttpResponse::ok();
+        handler_response
+            .headers
+            .insert("x-frame-options".to_string(), "ALLOWALL".to_string());
+        let response = secured(&SecurityHeadersMiddleware::new(), handler_response).await;
+        assert_eq!(
+            response.headers.get("Referrer-Policy").map(String::as_str),
+            Some("strict-origin-when-cross-origin")
+        );
+        // One `X-Frame-Options` line goes out, not two.
+        let frame: Vec<_> = response
+            .headers
+            .iter()
+            .filter(|(name, _)| name.eq_ignore_ascii_case("x-frame-options"))
+            .collect();
+        assert_eq!(frame.len(), 1, "{frame:?}");
+        assert_eq!(frame[0].1, "DENY");
+    }
+
+    /// Header injection is caught when the middleware is configured, not on
+    /// the wire.
+    #[test]
+    fn security_headers_reject_invalid_names_and_values() {
+        let base = SecurityHeadersMiddleware::new;
+        assert!(
+            base()
+                .try_with_header(
+                    "Content-Security-Policy",
+                    "default-src 'self'\r\nSet-Cookie: a=b"
+                )
+                .is_err()
+        );
+        assert!(base().try_with_header("X-Frame-Options", "DENY\n").is_err());
+        assert!(base().try_with_header("X-Frame-Options", "DE\0NY").is_err());
+        assert!(base().try_with_header("Bad Name", "x").is_err());
+        assert!(base().try_with_header("Bad:Name", "x").is_err());
+        assert!(base().try_with_header("", "x").is_err());
+        assert!(base().try_with_header("X-Ok", "a\tb").is_ok());
+        let panicked = std::panic::catch_unwind(|| {
+            SecurityHeadersMiddleware::new().with_referrer_policy("no-referrer\r\nX-Evil: 1")
+        });
+        assert!(panicked.is_err());
     }
 
     #[tokio::test]

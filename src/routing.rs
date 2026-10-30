@@ -427,6 +427,8 @@ pub fn layer_handler(
                 match run_guards(&guards, req).await? {
                     Ok(req) => inner.call(req).await,
                     Err(forbidden) => {
+                        // Counted toward the auth-rejection summary by its
+                        // 403 status where the request is dispatched.
                         debug!("Request rejected by a route-scoped guard");
                         Ok(forbidden)
                     }

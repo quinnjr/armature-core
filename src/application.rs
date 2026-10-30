@@ -2474,8 +2474,26 @@ where
 /// How often [`note_auth_rejection`] reports at `warn`.
 const AUTH_REJECTION_REPORT_INTERVAL: Duration = Duration::from_secs(60);
 
+/// Whether `status` is an authentication or authorization refusal.
+pub(crate) fn is_auth_rejection(status: u16) -> bool {
+    matches!(status, 401 | 403)
+}
+
+#[cfg(test)]
+thread_local! {
+    // Rejections `note_auth_rejection` has counted on this thread, so a test
+    // on a current-thread runtime can pin "counted exactly once" without
+    // seeing other tests' requests.
+    pub(crate) static AUTH_REJECTIONS_NOTED: std::cell::Cell<u64> =
+        const { std::cell::Cell::new(0) };
+}
+
 /// Count a 401/403 and, at most once per [`AUTH_REJECTION_REPORT_INTERVAL`],
 /// report the count at `warn`.
+///
+/// Call it once per request, on the final outcome (`dispatch_request`, the
+/// micro server's request handler), not at each place a request can be
+/// refused: that is what keeps a refusal from being missed or counted twice.
 ///
 /// Each rejection is logged at `debug` (any client can cause one at will, so
 /// one `warn` per request lets a peer flood the log), but a credential-
@@ -2490,6 +2508,9 @@ pub(crate) fn note_auth_rejection() {
     static SINCE_REPORT: AtomicU64 = AtomicU64::new(0);
     // `u64::MAX`: never reported, so the first rejection reports at once.
     static LAST_REPORT_MS: AtomicU64 = AtomicU64::new(u64::MAX);
+
+    #[cfg(test)]
+    AUTH_REJECTIONS_NOTED.with(|n| n.set(n.get() + 1));
 
     SINCE_REPORT.fetch_add(1, Ordering::Relaxed);
     let now = EPOCH.get_or_init(Instant::now).elapsed().as_millis() as u64;
@@ -3538,6 +3559,7 @@ async fn dispatch_request(
         }
     };
 
+    let mut auth_rejected = false;
     let response = match outcome {
         Ok(resp) => {
             debug!(method = %method, path = %path, status = resp.status, "Request handled successfully");
@@ -3551,13 +3573,28 @@ async fn dispatch_request(
                 warn!(method = %method, path = %path, error = %err.log_display(), "Request handling failed");
             } else {
                 debug!(method = %method, path = %path, error = %err.log_display(), "Request rejected");
-                if matches!(err.status_code(), 401 | 403) {
-                    note_auth_rejection();
-                }
             }
-            respond_to_error(err, filter_ctx_request, state.filter_chain.clone()).await
+            auth_rejected = is_auth_rejection(err.status_code());
+            let mut response =
+                respond_to_error(err, filter_ctx_request, state.filter_chain.clone()).await;
+            // The error reached the filters as an `Err`; now the global
+            // middleware that adds headers on its `Ok` path (security headers,
+            // CORS) gets to add them to the rendered response too.
+            if let Some(chain) = &state.middleware {
+                let ctx = crate::middleware::ErrorResponseContext::new(&method, path);
+                chain.decorate_error_response(&ctx, &mut response);
+            }
+            response
         }
     };
+
+    // Counted here, once, on the outcome rather than at each place a request
+    // can be refused: a guard's `Ok(false)` and a handler that answers 401
+    // itself both arrive as an `Ok` response, and a refusal an exception
+    // filter rewrites to another status was still a refusal.
+    if auth_rejected || is_auth_rejection(response.status) {
+        note_auth_rejection();
+    }
 
     let duration = start.elapsed();
     debug!(
@@ -3583,7 +3620,6 @@ async fn guarded_route(
         Ok(request) => request,
         Err(forbidden) => {
             debug!("Request rejected by a global guard");
-            note_auth_rejection();
             return Ok(forbidden);
         }
     };
@@ -4953,6 +4989,152 @@ mod tests {
         let response = through_pipeline(&state, "GET", "/nowhere").await;
         assert_eq!(response.status, 404);
         assert_eq!(*log.lock().unwrap(), vec!["global middleware"]);
+    }
+
+    fn auth_rejections_noted() -> u64 {
+        AUTH_REJECTIONS_NOTED.with(|n| n.get())
+    }
+
+    /// A route-scoped guard's `Ok(false)` is a 403 response, not an `Err`; it
+    /// used to escape the rejection summary.
+    #[tokio::test]
+    async fn a_route_guard_refusal_is_counted_once() {
+        let state = ServeState::for_test(
+            Arc::new(OptimizedRouter::from_router(&guarded_router())),
+            DEFAULT_MAX_BODY_SIZE,
+        );
+        let before = auth_rejections_noted();
+        let response = through_pipeline(&state, "GET", "/admin/users").await;
+        assert_eq!(response.status, 403);
+        assert_eq!(auth_rejections_noted() - before, 1);
+    }
+
+    /// A global guard's refusal is counted once, not once where it is
+    /// refused and again on the way out.
+    #[tokio::test]
+    async fn a_global_guard_refusal_is_counted_once() {
+        let state = Application::new(Container::new(), Router::new())
+            .with_guard(Arc::new(DenyGuard))
+            .serve_state();
+        let before = auth_rejections_noted();
+        let response = through_pipeline(&state, "GET", "/nowhere").await;
+        assert_eq!(response.status, 403);
+        assert_eq!(auth_rejections_noted() - before, 1);
+    }
+
+    /// A handler that answers 401 itself (rather than returning an `Err`) is
+    /// still an authentication rejection; an `Err(Unauthorized)` is too, once.
+    #[tokio::test]
+    async fn handler_auth_rejections_are_counted_once() {
+        async fn unauthorized_response(_req: HttpRequest) -> Result<HttpResponse, Error> {
+            Ok(HttpResponse::new(401))
+        }
+        async fn unauthorized_error(_req: HttpRequest) -> Result<HttpResponse, Error> {
+            Err(Error::Unauthorized("no".to_string()))
+        }
+        let mut router = Router::new();
+        router.get("/response", unauthorized_response);
+        router.get("/error", unauthorized_error);
+        router.get("/ok", ok_handler);
+        let state = ServeState::for_test(Arc::new(OptimizedRouter::from_router(&router)), 1024);
+
+        for (path, status, counted) in [("/response", 401, 1), ("/error", 401, 1), ("/ok", 200, 0)]
+        {
+            let before = auth_rejections_noted();
+            let response = through_pipeline(&state, "GET", path).await;
+            assert_eq!(response.status, status, "{path}");
+            assert_eq!(auth_rejections_noted() - before, counted, "{path}");
+        }
+    }
+
+    /// An error passing through `SecurityHeadersMiddleware` still reaches the
+    /// exception filters (whose response is the one sent), and that response
+    /// carries the security headers.
+    #[tokio::test]
+    async fn exception_filters_see_errors_through_header_middleware() {
+        async fn not_found(_req: HttpRequest) -> Result<HttpResponse, Error> {
+            Err(Error::NotFound("gone".to_string()))
+        }
+        let called = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let mut router = Router::new();
+        router.get("/x", not_found);
+        let state = Application::new(Container::new(), router)
+            .use_middleware(crate::middleware::SecurityHeadersMiddleware::new())
+            .use_global_filter(RecordingCatchAllFilter {
+                called: called.clone(),
+            })
+            .serve_state();
+
+        let response = through_pipeline(&state, "GET", "/x").await;
+        assert!(called.load(std::sync::atomic::Ordering::SeqCst));
+        assert_eq!(response.status, 599, "the filter's response is used");
+        assert!(String::from_utf8_lossy(&response.body).contains("RecordingCatchAllFilter"));
+        for name in [
+            "Strict-Transport-Security",
+            "X-Content-Type-Options",
+            "X-Frame-Options",
+            "Referrer-Policy",
+        ] {
+            assert!(response.headers.contains_key(name), "{name}");
+        }
+    }
+
+    /// An allowed origin can read an error response: global `CorsMiddleware`
+    /// decorates it.
+    #[tokio::test]
+    async fn cors_middleware_decorates_error_responses() {
+        async fn forbidden(_req: HttpRequest) -> Result<HttpResponse, Error> {
+            Err(Error::Forbidden("no".to_string()))
+        }
+        let mut router = Router::new();
+        router.get("/api", forbidden);
+        let state = Application::new(Container::new(), router)
+            .use_middleware(
+                crate::middleware::CorsMiddleware::new()
+                    .allow_origin("https://app.example")
+                    .allow_credentials(true),
+            )
+            .serve_state();
+
+        let mut req = HttpRequest::new("GET", "/api".to_string());
+        req.headers.insert("origin", "https://app.example");
+        let response = match admit(&mut req, &state).await {
+            Admission::Respond(response, _) => response,
+            Admission::Proceed(resolution) => {
+                dispatch_request(req, &state, std::time::Instant::now(), resolution).await
+            }
+        };
+        assert_eq!(response.status, 403);
+        let get = |name: &str| response.headers.get(name).map(String::as_str);
+        assert_eq!(
+            get("Access-Control-Allow-Origin"),
+            Some("https://app.example")
+        );
+        assert_eq!(get("Access-Control-Allow-Credentials"), Some("true"));
+    }
+
+    /// A 401 raised behind header-adding middleware is counted once: the
+    /// middleware no longer renders (and counts) errors itself.
+    #[tokio::test]
+    async fn auth_rejection_behind_security_headers_is_counted_once() {
+        async fn unauthorized(_req: HttpRequest) -> Result<HttpResponse, Error> {
+            Err(Error::Unauthorized("no".to_string()))
+        }
+        let mut router = Router::new();
+        router.get("/x", unauthorized);
+        let state = Application::new(Container::new(), router)
+            .use_middleware(crate::middleware::SecurityHeadersMiddleware::new())
+            .use_middleware(
+                crate::middleware::CorsMiddleware::new().allow_origin("https://app.example"),
+            )
+            .serve_state();
+
+        let before = auth_rejections_noted();
+        let response = through_pipeline(&state, "GET", "/x").await;
+        assert_eq!(response.status, 401);
+        assert!(response.headers.contains_key("X-Frame-Options"));
+        assert!(response.headers.contains_key("Access-Control-Allow-Origin"));
+        assert_eq!(auth_rejections_noted() - before, 1);
     }
 
     /// With a global guard, an unauthenticated caller learns nothing about

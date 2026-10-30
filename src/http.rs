@@ -147,6 +147,36 @@ impl std::fmt::Debug for HttpRequest {
     }
 }
 
+/// The `X-Forwarded-For` chain, one element per comma-separated hop across
+/// every field line, or `None` if the chain cannot be read faithfully.
+///
+/// Every field line counts, not just the first. A repeated field is one list
+/// (RFC 9110 §5.3), and a proxy that adds its own line instead of extending
+/// the client's puts the only entries worth believing on a line `get` would
+/// never reach. Splitting each line and chaining them is the same sequence
+/// joining them with commas would produce, without the intermediate `String`.
+///
+/// Empty elements are kept rather than filtered, which looks like sloppiness
+/// and is the opposite. Discarding them shortens the list, and since the entry
+/// is chosen by counting from the *right*, a shorter list slides the index one
+/// position further left — onto an entry the client supplied. A malformed or
+/// empty hop means the chain is not the one the deployment was configured for,
+/// and the safe answer to that is no answer: the empty string fails to parse
+/// and the callers return `None`.
+///
+/// A line that is not valid UTF-8 makes the whole chain `None` for the same
+/// reason. Skipping it (as `HeaderMap::get_all` does) would drop exactly the
+/// line a proxy appended to when the client's line ahead of it carried a stray
+/// byte, leaving only client-written hops to count from.
+fn forwarded_for_hops(headers: &HeaderMap) -> Option<Vec<&str>> {
+    let mut hops = Vec::new();
+    for line in headers.get_all_bytes("X-Forwarded-For") {
+        let line = std::str::from_utf8(line).ok()?;
+        hops.extend(line.split(',').map(str::trim));
+    }
+    Some(hops)
+}
+
 /// Parse one `X-Forwarded-For` element into a canonical address.
 ///
 /// Accepts a bare address (`203.0.113.7`, `2001:db8::1`) and the forms some
@@ -286,27 +316,7 @@ impl HttpRequest {
             return self.peer.map(|peer| peer.ip().to_canonical());
         }
 
-        // Across every field line, not just the first. A repeated field is one
-        // list (RFC 9110 §5.3), and a proxy that adds its own line instead of
-        // extending the client's puts the only entries worth believing on a
-        // line `get` would never reach. Splitting each line and chaining them is
-        // the same sequence joining them with commas would produce, without the
-        // intermediate `String`.
-        // Empty elements are kept rather than filtered, which looks like
-        // sloppiness and is the opposite. Discarding them shortens the list,
-        // and since the entry is chosen by counting from the *right*, a shorter
-        // list slides the index one position further left — onto an entry the
-        // client supplied. A malformed or empty hop means the chain is not the
-        // one the deployment was configured for, and the safe answer to that is
-        // no answer: the empty string fails `parse` below and the function
-        // returns `None`.
-        let hops: Vec<&str> = self
-            .headers
-            .get_all("X-Forwarded-For")
-            .into_iter()
-            .flat_map(|line| line.split(','))
-            .map(str::trim)
-            .collect();
+        let hops = forwarded_for_hops(&self.headers)?;
 
         // Counting from the right. A depth deeper than the chain present means
         // the request did not traverse the proxies it was configured to, so
@@ -361,6 +371,13 @@ impl HttpRequest {
     /// [`client_address_trusted`](Self::client_address_trusted) with an
     /// arbitrary trust predicate (e.g. a CIDR membership test). Addresses are
     /// passed in canonical form, so an IPv4-mapped IPv6 peer is seen as IPv4.
+    ///
+    /// Only `X-Forwarded-For` is read; the standard `Forwarded` header is not.
+    /// Each trusted proxy must therefore *append to* (or overwrite) the
+    /// `X-Forwarded-For` it received. A proxy that records the client only in
+    /// `Forwarded:` leaves the client-written `X-Forwarded-For` as the sole
+    /// chain here, and its rightmost entry would be believed. A chain with a
+    /// line that is not valid UTF-8 is treated as malformed (`None`).
     pub fn client_address_trusted_by(&self, is_trusted: impl Fn(IpAddr) -> bool) -> Option<IpAddr> {
         let peer = self.peer?.ip().to_canonical();
         if !is_trusted(peer) {
@@ -368,14 +385,8 @@ impl HttpRequest {
         }
 
         // Same joining rule as `client_address`: every field line, in order,
-        // empty elements kept so a malformed chain yields `None`.
-        let hops: Vec<&str> = self
-            .headers
-            .get_all("X-Forwarded-For")
-            .into_iter()
-            .flat_map(|line| line.split(','))
-            .map(str::trim)
-            .collect();
+        // empty elements and unreadable lines making the chain malformed.
+        let hops = forwarded_for_hops(&self.headers)?;
 
         let mut leftmost = None;
         for hop in hops.iter().rev() {
@@ -1877,6 +1888,23 @@ mod tests {
             HttpRequest::with_extensions_capacity("GET", "/", 4).peer,
             None
         );
+    }
+
+    /// A client line carrying a non-UTF-8 byte, to which the proxy appended
+    /// the real address: the whole last line is unreadable. Skipping it would
+    /// leave the client's earlier line as the "proxy-observed" hop; the chain
+    /// must instead be rejected.
+    #[test]
+    fn client_address_rejects_non_utf8_forwarded_line() {
+        let mut req = HttpRequest::new("GET", "/").with_peer(Some(proxy()));
+        req.headers.append("X-Forwarded-For", "198.51.100.9");
+        req.headers
+            .append("X-Forwarded-For", &b"\xff, 203.0.113.7"[..]);
+
+        assert_eq!(req.client_address(1), None);
+        assert_eq!(req.client_address_trusted(&[proxy().ip()]), None);
+        // Peer not trusted: the header is never read, so it cannot matter.
+        assert_eq!(req.client_address_trusted(&[]), Some(proxy().ip()));
     }
 
     #[test]

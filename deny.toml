@@ -7,6 +7,7 @@ all-features = true
 
 [advisories]
 version = 2
+yanked = "deny"
 
 [bans]
 multiple-versions = "allow"
@@ -25,6 +26,13 @@ deny = [
     { crate = "aws-lc-fips-sys", reason = "the crypto provider is ring" },
     { crate = "aws-lc-rs", reason = "the crypto provider is ring" },
 ]
+
+# zstd is used to encode only; these features compile C decoders and
+# dictionary tooling that nothing here calls. Denied so a dependency cannot
+# quietly turn them back on.
+[[bans.features]]
+crate = "zstd-sys"
+deny = ["legacy", "zdict_builder"]
 
 [sources]
 unknown-registry = "deny"

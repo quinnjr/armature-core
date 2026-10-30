@@ -74,6 +74,10 @@ impl std::fmt::Debug for FormField {
 /// filesystems cap a component at 255 bytes.
 pub const MAX_SAFE_FILENAME_LEN: usize = 255;
 
+/// Longest extension, in bytes, that [`FormFile::safe_filename`] keeps intact
+/// when it has to shorten an over-long name.
+pub const MAX_PRESERVED_EXTENSION_LEN: usize = 16;
+
 /// Uploaded file data
 ///
 /// `Debug` prints the data's length, not its bytes (which may be sensitive,
@@ -121,17 +125,24 @@ impl FormFile {
         }
     }
 
-    /// Get the file extension (without the dot), or `None` if the name has
-    /// none.
+    /// The extension (without the dot) of [`safe_filename`](Self::safe_filename),
+    /// or `None` if that name has none.
     ///
-    /// Only the last path component is considered, and a leading dot does not
-    /// start an extension (`.bashrc` has none), mirroring
-    /// [`Path::extension`]. Still client-controlled: do not use it to decide
-    /// how a file is executed or served.
-    pub fn extension(&self) -> Option<&str> {
-        let name = last_component(&self.filename);
-        let (stem, ext) = name.rsplit_once('.')?;
-        (!stem.is_empty() && !ext.is_empty()).then_some(ext)
+    /// It is read from the sanitized name, not the raw client one, so the
+    /// extension an allowlist checks is always the one
+    /// [`save_into`](Self::save_into) stores the file under: stripping and
+    /// truncation cannot turn a checked `x.html.png` into a stored `x.html`.
+    /// A leading dot does not start an extension, mirroring
+    /// [`Path::extension`]. Still client-chosen: check it against an
+    /// allowlist rather than trusting it to say what the content is.
+    ///
+    /// ```
+    /// use armature_core::form::FormFile;
+    /// let f = FormFile::new("dir/photo.JPG".into(), "image/jpeg".into(), vec![]);
+    /// assert_eq!(f.extension().as_deref(), Some("JPG"));
+    /// ```
+    pub fn extension(&self) -> Option<String> {
+        split_extension(&self.safe_filename()).map(|(_, ext)| ext.to_string())
     }
 
     /// A filename derived from [`filename`](Self::filename) that is safe to
@@ -143,9 +154,12 @@ impl FormFile {
     /// as something it is not, and `:` (an NTFS alternate data stream
     /// separator); strips leading dots (no hidden files, no `..`) and trailing
     /// dots and spaces (which Windows silently drops), and caps the length at
-    /// [`MAX_SAFE_FILENAME_LEN`] bytes. A Windows reserved device name (`CON`,
-    /// `NUL`, `COM1`, `lpt1.txt`, ...) gets a `_` prefix. Falls back to
-    /// `"file"` when nothing is left.
+    /// [`MAX_SAFE_FILENAME_LEN`] bytes. An over-long name is shortened in its
+    /// stem so the final extension survives (one longer than
+    /// [`MAX_PRESERVED_EXTENSION_LEN`] bytes is not preserved); see
+    /// [`extension`](Self::extension). A Windows reserved device name (`CON`,
+    /// `NUL`, `COM1`, `CONIN$`, `lpt1.txt`, ...) gets a `_` prefix. Falls back
+    /// to `"file"` when nothing is left.
     ///
     /// ```
     /// use armature_core::form::FormFile;
@@ -159,16 +173,18 @@ impl FormFile {
             .chars()
             .filter(|&c| !c.is_control() && !is_format_char(c) && c != ':')
             .collect();
-        let name = name.trim().trim_start_matches('.');
-        let name = truncate_filename(name, MAX_SAFE_FILENAME_LEN);
+        let name = name
+            .trim()
+            .trim_start_matches('.')
+            .trim_end_matches(['.', ' ']);
 
         if name.is_empty() {
             "file".to_string()
         } else if is_windows_reserved(name) {
             // One byte for the prefix keeps the result within the cap.
-            format!("_{}", truncate_filename(name, MAX_SAFE_FILENAME_LEN - 1))
+            format!("_{}", fit_filename(name, MAX_SAFE_FILENAME_LEN - 1))
         } else {
-            name.to_string()
+            fit_filename(name, MAX_SAFE_FILENAME_LEN)
         }
     }
 
@@ -249,6 +265,38 @@ impl FormFile {
     }
 }
 
+/// `name` (non-empty, already trimmed) shortened to at most `max` bytes.
+///
+/// A plain cut would drop the real extension and could expose an inner one:
+/// `A..A.html.png` cut to 255 bytes is `A..A.html`, which a static file server
+/// then serves as HTML although the upload was checked as a PNG. So the stem
+/// is shortened instead and the final extension kept, unless that extension
+/// is longer than [`MAX_PRESERVED_EXTENSION_LEN`] (no real one is), in which
+/// case the name is just cut; either way
+/// [`FormFile::extension`] reads the result, so checks see what is stored.
+fn fit_filename(name: &str, max: usize) -> String {
+    if name.len() <= max {
+        return name.to_string();
+    }
+    if let Some((stem, ext)) = split_extension(name)
+        && ext.len() <= MAX_PRESERVED_EXTENSION_LEN
+    {
+        // At least `max - 17` bytes of stem are kept, and it begins with a
+        // character that is neither a dot nor a space (the name was trimmed),
+        // so it cannot trim away to nothing.
+        let stem = truncate_filename(stem, max - ext.len() - 1);
+        return format!("{stem}.{ext}");
+    }
+    truncate_filename(name, max).to_string()
+}
+
+/// `(stem, extension)` of a single-component name, split at its last dot,
+/// when both halves are non-empty (as [`Path::extension`] would see it).
+fn split_extension(name: &str) -> Option<(&str, &str)> {
+    let (stem, ext) = name.rsplit_once('.')?;
+    (!stem.is_empty() && !ext.is_empty()).then_some((stem, ext))
+}
+
 /// `name` cut to at most `max` bytes on a char boundary, then stripped of
 /// trailing dots and spaces -- after the cut, since a cut can expose new ones
 /// that Windows would silently drop.
@@ -293,14 +341,14 @@ fn is_format_char(c: char) -> bool {
 }
 
 /// Whether Windows treats `name` as a device (`CON`, `PRN`, `AUX`, `NUL`,
-/// `COM1`-`COM9`, `LPT1`-`LPT9`, and the superscript-digit variants), with or
-/// without an extension: opening `uploads\con.txt` opens the console, not a
-/// file.
+/// `CONIN$`, `CONOUT$`, `COM1`-`COM9`, `LPT1`-`LPT9`, and the
+/// superscript-digit variants), with or without an extension: opening
+/// `uploads\con.txt` opens the console, not a file.
 fn is_windows_reserved(name: &str) -> bool {
     let stem = name.split('.').next().unwrap_or(name).trim_end_matches(' ');
     let upper = stem.to_ascii_uppercase();
     match upper.as_str() {
-        "CON" | "PRN" | "AUX" | "NUL" => true,
+        "CON" | "PRN" | "AUX" | "NUL" | "CONIN$" | "CONOUT$" => true,
         _ => {
             let Some(digit) = upper
                 .strip_prefix("COM")
@@ -486,11 +534,21 @@ impl MultipartParser {
             }
         };
 
+        // Lines end in CRLF and nothing else. A bare LF or CR is a line break
+        // to lenient parsers but not to us, so `X-Pad: x\nContent-Disposition:
+        // ..` would carry a header past this check and into theirs; NUL and
+        // other controls are similarly truncated or dropped by some readers.
+        // Checked on the raw bytes, before lossy decoding can rewrite them.
+        if !header_block_is_clean(header_block) {
+            return Err(multipart_error("invalid character in part headers"));
+        }
+
         // Headers are ASCII per RFC 7578, so parsing them as UTF-8 is safe.
         let headers = String::from_utf8_lossy(header_block);
 
         let mut disposition = None;
         let mut content_type = None;
+        let mut transfer_encoding = None;
 
         for line in headers.split("\r\n") {
             // A line starting with SP/HT is an obsolete folded continuation
@@ -515,6 +573,8 @@ impl MultipartParser {
                 &mut disposition
             } else if name.eq_ignore_ascii_case("Content-Type") {
                 &mut content_type
+            } else if name.eq_ignore_ascii_case("Content-Transfer-Encoding") {
+                &mut transfer_encoding
             } else {
                 continue;
             };
@@ -523,6 +583,18 @@ impl MultipartParser {
             if slot.replace(value.trim()).is_some() {
                 return Err(multipart_error("duplicate part header"));
             }
+        }
+
+        // RFC 7578 §4.7 deprecates Content-Transfer-Encoding. A part claiming
+        // base64 or quoted-printable would be decoded by some readers and
+        // stored verbatim by us -- two different contents for one upload --
+        // so only the identity encodings are accepted.
+        if let Some(cte) = transfer_encoding
+            && !["7bit", "8bit", "binary"]
+                .iter()
+                .any(|identity| cte.eq_ignore_ascii_case(identity))
+        {
+            return Err(multipart_error("unsupported Content-Transfer-Encoding"));
         }
 
         let disposition =
@@ -623,17 +695,24 @@ impl MultipartParts<'_> {
     /// delimiter line at all.
     fn after_delimiter(&self, at: usize) -> Option<Option<usize>> {
         let rest = &self.body[at..];
-        if rest.starts_with(b"--") {
-            return Some(None);
-        }
         // transport-padding is linear whitespace before the CRLF.
-        let padding = rest
-            .iter()
-            .take_while(|&&b| b == b' ' || b == b'\t')
-            .count();
-        rest[padding..]
+        let padding = |bytes: &[u8]| {
+            bytes
+                .iter()
+                .take_while(|&&b| b == b' ' || b == b'\t')
+                .count()
+        };
+        if let Some(after) = rest.strip_prefix(b"--") {
+            // The close delimiter, too, must end its line (or the body):
+            // `--boundary--junk` is a content line, not the end of the form,
+            // or a reader that agrees with RFC 2046 would see parts we do not.
+            let after = &after[padding(after)..];
+            return (after.is_empty() || after.starts_with(b"\r\n")).then_some(None);
+        }
+        let pad = padding(rest);
+        rest[pad..]
             .starts_with(b"\r\n")
-            .then_some(Some(at + padding + 2))
+            .then_some(Some(at + pad + 2))
     }
 
     /// The next real delimiter at or after `from`: where it starts (its
@@ -714,6 +793,17 @@ impl Iterator for MultipartParts<'_> {
         }
         Some(result)
     }
+}
+
+/// Whether a part's raw header block uses only CRLF line breaks and holds no
+/// control characters other than HTAB.
+fn header_block_is_clean(block: &[u8]) -> bool {
+    block.iter().enumerate().all(|(i, &b)| match b {
+        b'\r' => block.get(i + 1) == Some(&b'\n'),
+        b'\n' => i > 0 && block[i - 1] == b'\r',
+        b'\t' => true,
+        _ => b >= 0x20 && b != 0x7f,
+    })
 }
 
 fn multipart_error(msg: &str) -> Error {
@@ -850,7 +940,7 @@ mod tests {
             vec![1, 2, 3],
         );
 
-        assert_eq!(file.extension(), Some("pdf"));
+        assert_eq!(file.extension().as_deref(), Some("pdf"));
     }
 
     #[test]
@@ -1155,7 +1245,7 @@ mod tests {
         assert_eq!(f(".bashrc").extension(), None);
         assert_eq!(f("trailing.").extension(), None);
         assert_eq!(f("dir.d/file").extension(), None);
-        assert_eq!(f("a.tar.gz").extension(), Some("gz"));
+        assert_eq!(f("a.tar.gz").extension().as_deref(), Some("gz"));
     }
 
     #[test]
@@ -1217,6 +1307,132 @@ mod tests {
         let got = f(&"é".repeat(200));
         assert!(got.len() <= MAX_SAFE_FILENAME_LEN);
         assert!(got.chars().all(|c| c == 'é'));
+    }
+
+    /// Truncating an over-long name must not cut off the real extension:
+    /// `A..A.html.png` checked as `png` but stored as `A..A.html` would be
+    /// served as HTML.
+    #[test]
+    fn long_filename_keeps_its_final_extension() {
+        let name = format!("{}.html.png", "A".repeat(250));
+        let file = FormFile::new(name, "image/png".into(), vec![]);
+        let safe = file.safe_filename();
+        assert!(safe.len() <= MAX_SAFE_FILENAME_LEN, "{}", safe.len());
+        assert!(safe.ends_with(".png"), "{safe}");
+        assert_eq!(file.extension().as_deref(), Some("png"));
+
+        // Windows reserved stem plus a long name: the `_` prefix must not
+        // push the extension out either.
+        let name = format!("CON.{}.png", "b".repeat(300));
+        let safe = FormFile::new(name, String::new(), vec![]).safe_filename();
+        assert!(
+            safe.starts_with("_CON.") && safe.ends_with(".png"),
+            "{safe}"
+        );
+        assert!(safe.len() <= MAX_SAFE_FILENAME_LEN);
+    }
+
+    /// An extension too long to preserve is not kept, and whatever the
+    /// stored name ends up ending in is exactly what `extension()` reports.
+    #[test]
+    fn extension_always_matches_the_stored_name() {
+        let name = format!("{}.html.{}", "A".repeat(249), "x".repeat(20));
+        let file = FormFile::new(name, String::new(), vec![]);
+        let safe = file.safe_filename();
+        assert!(safe.len() <= MAX_SAFE_FILENAME_LEN);
+        let stored_ext = Path::new(&safe)
+            .extension()
+            .map(|e| e.to_str().unwrap().to_string());
+        assert_eq!(file.extension(), stored_ext);
+        // The raw name's `xxx..` extension is not what gets stored.
+        assert_ne!(file.extension(), Some("x".repeat(20)));
+
+        let f = |name: &str| FormFile::new(name.to_string(), String::new(), vec![]);
+        // Control/format characters stripped from the name are stripped from
+        // the extension too.
+        assert_eq!(f("a.ht\u{200B}ml").extension().as_deref(), Some("html"));
+        assert_eq!(f("x.png. . ").extension().as_deref(), Some("png"));
+    }
+
+    #[test]
+    fn windows_console_device_names_are_reserved() {
+        let f = |name: &str| FormFile::new(name.to_string(), String::new(), vec![]).safe_filename();
+        for (input, want) in [
+            ("CONIN$", "_CONIN$"),
+            ("conout$", "_conout$"),
+            ("CONIN$.txt", "_CONIN$.txt"),
+            ("ConOut$.log", "_ConOut$.log"),
+        ] {
+            assert_eq!(f(input), want, "{input}");
+        }
+        for ok in ["CONIN", "CONOUT$x", "CONIN$$"] {
+            assert_eq!(f(ok), ok);
+        }
+    }
+
+    /// Bare LF/CR, NUL and other control characters inside part headers are
+    /// read differently by LF-tolerant parsers (an `X-Pad: x\nContent-
+    /// Disposition: ..` line hides a second header from us): reject them.
+    #[test]
+    fn part_headers_with_bare_line_breaks_or_controls_are_rejected() {
+        let body = |headers: &[u8]| {
+            let mut b = b"--XB\r\nContent-Disposition: form-data; name=\"a\"\r\n".to_vec();
+            b.extend_from_slice(headers);
+            b.extend_from_slice(b"\r\n\r\nv\r\n--XB--");
+            b
+        };
+        for bad in [
+            &b"X-Pad: x\nContent-Disposition: form-data; name=\"b\""[..],
+            b"X-Pad: x\rContent-Type: text/html",
+            b"X-Pad: a\0b",
+            b"X-Pad: a\x01b",
+            b"X-Pad: a\x7fb",
+            b"X-Pad: x\r",
+        ] {
+            assert!(parser("XB").parse(&body(bad)).is_err(), "{bad:?}");
+        }
+        // HTAB inside a value is fine.
+        assert!(parser("XB").parse(&body(b"X-Pad: a\tb")).is_ok());
+        // Bare LF in the first header line too.
+        let b = b"--XB\r\nX-Pad: x\nContent-Disposition: form-data; name=\"a\"\r\n\r\nv\r\n--XB--";
+        assert!(parser("XB").parse(b).is_err());
+    }
+
+    #[test]
+    fn close_delimiter_must_end_its_line() {
+        // `--XB--junk` is not a close delimiter, so the body never closes.
+        let body = b"--XB\r\nContent-Disposition: form-data; name=\"a\"\r\n\r\nv\r\n--XB--junk";
+        assert!(parser("XB").parse(body).is_err());
+        // ...and as content it stays part of the field.
+        let body =
+            b"--XB\r\nContent-Disposition: form-data; name=\"a\"\r\n\r\nv\r\n--XB--junk\r\n--XB--";
+        let fields = parser("XB").parse(body).unwrap();
+        assert_eq!(fields.len(), 1);
+        assert_eq!(fields[0].value.as_deref(), Some("v\r\n--XB--junk"));
+        // Padding, then CRLF (with an epilogue) or end of body, is a close.
+        for tail in [&b"--XB--"[..], b"--XB-- \t", b"--XB--\r\nepilogue"] {
+            let mut body =
+                b"--XB\r\nContent-Disposition: form-data; name=\"a\"\r\n\r\nv\r\n".to_vec();
+            body.extend_from_slice(tail);
+            assert_eq!(parser("XB").parse(&body).unwrap().len(), 1, "{tail:?}");
+        }
+    }
+
+    #[test]
+    fn non_identity_content_transfer_encoding_is_rejected() {
+        let body = |cte: &str| {
+            format!(
+                "--XB\r\nContent-Disposition: form-data; name=\"a\"\r\nContent-Transfer-Encoding: {cte}\r\n\r\nv\r\n--XB--"
+            )
+        };
+        for ok in ["7bit", "8BIT", "Binary"] {
+            assert!(parser("XB").parse(body(ok).as_bytes()).is_ok(), "{ok}");
+        }
+        for bad in ["base64", "quoted-printable", "x-custom", ""] {
+            assert!(parser("XB").parse(body(bad).as_bytes()).is_err(), "{bad}");
+        }
+        let dup = "--XB\r\nContent-Disposition: form-data; name=\"a\"\r\nContent-Transfer-Encoding: binary\r\ncontent-transfer-encoding: binary\r\n\r\nv\r\n--XB--";
+        assert!(parser("XB").parse(dup.as_bytes()).is_err());
     }
 
     #[test]

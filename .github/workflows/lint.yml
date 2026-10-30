@@ -28,3 +28,5 @@ jobs:
       - run: cargo fmt --check
       # Matches the framework gate: the whole target graph, warnings denied.
       - run: cargo clippy --locked --all-targets --all-features -- -D warnings
+      # The hyper HTTP/1.1 transport only compiles without `h1-backend`.
+      - run: cargo clippy --locked --all-targets --no-default-features -- -D warnings

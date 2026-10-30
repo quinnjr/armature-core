@@ -343,7 +343,7 @@ pub struct Http3Stats {
     total_streams: AtomicU64,
     /// Total requests processed
     total_requests: AtomicU64,
-    /// 0-RTT connections accepted
+    /// Requests served from 0-RTT early data
     zero_rtt_accepted: AtomicU64,
     /// Connection migrations (IP/port changes)
     connection_migrations: AtomicU64,
@@ -391,7 +391,8 @@ impl Http3Stats {
         self.total_requests.fetch_add(1, Ordering::Relaxed);
     }
 
-    /// Record 0-RTT connection accepted
+    /// Record a request served from 0-RTT early data (one that arrived
+    /// before the handshake was confirmed and was not answered `425`).
     #[inline]
     pub fn zero_rtt_accepted(&self) {
         self.zero_rtt_accepted.fetch_add(1, Ordering::Relaxed);
@@ -440,7 +441,11 @@ impl Http3Stats {
         self.total_requests.load(Ordering::Relaxed)
     }
 
-    /// Get 0-RTT connections accepted
+    /// Get the number of requests served from 0-RTT early data.
+    ///
+    /// Counts requests, not handshakes: a server-side "0-RTT accepted"
+    /// handshake result only says early data was *allowed*, and is reported
+    /// for every confirmed handshake whether or not the client sent any.
     #[inline]
     pub fn total_zero_rtt_accepted(&self) -> u64 {
         self.zero_rtt_accepted.load(Ordering::Relaxed)
@@ -769,25 +774,22 @@ mod server {
         };
         let conn = if options.enable_0rtt {
             // `into_0rtt` always succeeds on the server, and its future
-            // resolves when the handshake completes — `true` when the client's
-            // early data was accepted, which is what the statistic counts.
+            // resolves when the handshake completes. Its `bool` is meaningless
+            // here: on the server it is `true` for every confirmed handshake,
+            // early data or not, so the statistic counts requests actually
+            // served from early data instead (see `handle_request_resolver`).
             match connecting.into_0rtt() {
-                Ok((conn, zero_rtt_accepted)) => {
-                    let stats_0rtt = Arc::clone(&stats);
+                Ok((conn, handshake_done)) => {
                     let confirmed = Arc::clone(&confirmed);
                     let watched = conn.clone();
                     tokio::spawn(async move {
-                        match tokio::time::timeout(handshake_timeout, zero_rtt_accepted).await {
-                            // The future also resolves (`false`) when the
-                            // connection is lost mid-handshake. Only a
-                            // connection that is still open has actually
-                            // confirmed it; anything else must keep being
-                            // treated as early data.
-                            Ok(accepted) if watched.close_reason().is_none() => {
+                        match tokio::time::timeout(handshake_timeout, handshake_done).await {
+                            // The future also resolves when the connection is
+                            // lost mid-handshake. Only a connection that is
+                            // still open has actually confirmed it; anything
+                            // else must keep being treated as early data.
+                            Ok(_) if watched.close_reason().is_none() => {
                                 confirmed.store(true, Ordering::Release);
-                                if accepted {
-                                    stats_0rtt.zero_rtt_accepted();
-                                }
                             }
                             Ok(_) => {}
                             // Early data is being served on a connection
@@ -864,8 +866,17 @@ mod server {
             .await
             .map_err(|e| Error::Internal(format!("H3 connection failed: {}", e)))?;
 
-        // Handle requests using the new RequestResolver API
+        // Every request task is owned by the connection, not detached: the
+        // connection's slot in the cap is released when this function
+        // returns, so a request still running then would be work the cap no
+        // longer counts — a client could close connection after connection,
+        // each leaving a slow handler behind, and run unbounded handlers
+        // while holding a single slot. Dropping the set aborts them.
+        let mut requests = tokio::task::JoinSet::new();
+        let mut graceful = false;
         loop {
+            // Reap finished requests so the set holds only live ones.
+            while requests.try_join_next().is_some() {}
             match h3_conn.accept().await {
                 Ok(Some(resolver)) => {
                     let _stream = OpenStream::new(Arc::clone(&stats));
@@ -877,7 +888,7 @@ mod server {
                     let confirmed = Arc::clone(&confirmed);
                     let tracker = Arc::clone(&tracker);
 
-                    tokio::spawn(async move {
+                    requests.spawn(async move {
                         let _stream = _stream;
                         if let Err(e) = handle_request_resolver(
                             resolver, state, stats, &confirmed, &tracker, options,
@@ -892,7 +903,9 @@ mod server {
                     });
                 }
                 Ok(None) => {
-                    // Connection closed gracefully
+                    // A graceful close (GOAWAY): no new requests, but those
+                    // already accepted are still owed their responses.
+                    graceful = true;
                     break;
                 }
                 Err(e) => {
@@ -901,6 +914,17 @@ mod server {
                 }
             }
         }
+        if graceful {
+            // Bounded: every request is under the handler and write deadlines
+            // and the minimum response rate; and the connection closing
+            // outright ends the wait, aborting whatever is left.
+            tokio::select! {
+                () = async { while requests.join_next().await.is_some() {} } => {}
+                _ = quic_conn.closed() => {}
+            }
+        }
+        requests.abort_all();
+        drop(requests);
 
         watcher.abort();
         stats.connection_closed();
@@ -1067,6 +1091,9 @@ mod server {
         // confirmed when its head arrived. A replayed copy of someone else's
         // 0-RTT packets never confirms, so it is always caught by this.
         let early = !confirmed.load(Ordering::Acquire);
+        if early && safe_for_early_data(request.method()) {
+            stats.zero_rtt_accepted();
+        }
 
         let response = if early && !safe_for_early_data(request.method()) {
             // RFC 8470 §5.2: the client retries once the handshake completes.
@@ -1113,8 +1140,16 @@ mod server {
         let http_response: http::Response<()> = Response::from_parts(parts, ());
 
         // Every write waits on the peer's flow-control credit, so each is
-        // bounded: see `Http3Server::with_write_timeout`.
-        let sent = send_response(&mut stream, http_response, body, options.write_timeout).await;
+        // bounded: see `Http3Server::with_write_timeout`. The response as a
+        // whole is held to the policy's minimum rate as well.
+        let sent = send_response(
+            &mut stream,
+            http_response,
+            body,
+            options.write_timeout,
+            state.body_read(),
+        )
+        .await;
         if sent.is_err() {
             // Abandon the stream outright rather than leave a half-sent
             // response queued against credit that may never come.
@@ -1124,23 +1159,42 @@ mod server {
     }
 
     /// Write a response head, its body in [`RESPONSE_CHUNK`] pieces, and the
-    /// end of the stream, each under `write_timeout`.
+    /// end of the stream, each under `write_timeout` and the minimum rate of
+    /// `rate` (see [`BodyReadPolicy`](crate::BodyReadPolicy)).
+    ///
+    /// The write timeout alone bounds a stall, not the transfer: a peer that
+    /// grants one chunk of credit just inside every timeout never stalls, and
+    /// would hold the stream — with the whole response buffered — for
+    /// `size / RESPONSE_CHUNK × write_timeout`, on every stream it may open.
+    /// So the write that completes with `n` bytes sent must also finish by
+    /// the rate budget for `n` bytes, counted from the start of the response.
     async fn send_response<S>(
         stream: &mut h3::server::RequestStream<S, Bytes>,
         head: http::Response<()>,
         mut body: Bytes,
         write_timeout: Option<Duration>,
+        rate: crate::BodyReadPolicy,
     ) -> Result<(), Error>
     where
         S: h3::quic::BidiStream<Bytes>,
     {
+        let started = tokio::time::Instant::now();
+        // When the write that brings the total to `sent` bytes must finish.
+        let deadline = |sent: usize| {
+            let stall = write_timeout.map(|limit| tokio::time::Instant::now() + limit);
+            let rate = rate.rate_budget(sent).map(|budget| started + budget);
+            match (stall, rate) {
+                (Some(a), Some(b)) => Some(a.min(b)),
+                (a, b) => a.or(b),
+            }
+        };
         async fn bounded<T, E: std::fmt::Display>(
-            write_timeout: Option<Duration>,
+            deadline: Option<tokio::time::Instant>,
             what: &str,
             write: impl std::future::Future<Output = Result<T, E>>,
         ) -> Result<T, Error> {
-            let written = match write_timeout {
-                Some(limit) => tokio::time::timeout(limit, write)
+            let written = match deadline {
+                Some(at) => tokio::time::timeout_at(at, write)
                     .await
                     .map_err(|_| Error::Internal(format!("{what} timed out")))?,
                 None => write.await,
@@ -1148,12 +1202,14 @@ mod server {
             written.map_err(|e| Error::Internal(format!("Failed to {what}: {e}")))
         }
 
-        bounded(write_timeout, "send response", stream.send_response(head)).await?;
+        bounded(deadline(0), "send response", stream.send_response(head)).await?;
+        let mut sent = 0usize;
         while !body.is_empty() {
             let chunk = body.split_to(body.len().min(RESPONSE_CHUNK));
-            bounded(write_timeout, "send body", stream.send_data(chunk)).await?;
+            sent = sent.saturating_add(chunk.len());
+            bounded(deadline(sent), "send body", stream.send_data(chunk)).await?;
         }
-        bounded(write_timeout, "finish stream", stream.finish()).await
+        bounded(deadline(sent), "finish stream", stream.finish()).await
     }
 }
 
@@ -1569,6 +1625,44 @@ mod tests {
         max_connections: usize,
         write_timeout: Option<Duration>,
     ) -> (SocketAddr, std::sync::Arc<Http3Stats>) {
+        spawn_h3_policy(
+            config,
+            tls,
+            max_connections,
+            write_timeout,
+            crate::BodyReadPolicy::default(),
+        )
+    }
+
+    /// Handlers of `/hang` that have started, and that have been dropped.
+    #[cfg(all(feature = "http3", feature = "self-signed-certs"))]
+    static HANG_STARTED: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+    #[cfg(all(feature = "http3", feature = "self-signed-certs"))]
+    static HANG_DROPPED: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+    /// [`spawn_h3_with`] with a body-read policy (whose minimum rate also
+    /// governs responses); also serves `/hang`, a handler that never returns
+    /// and counts itself in [`HANG_STARTED`] / [`HANG_DROPPED`].
+    #[cfg(all(feature = "http3", feature = "self-signed-certs"))]
+    fn spawn_h3_policy(
+        config: Http3Config,
+        tls: &crate::TlsConfig,
+        max_connections: usize,
+        write_timeout: Option<Duration>,
+        policy: crate::BodyReadPolicy,
+    ) -> (SocketAddr, std::sync::Arc<Http3Stats>) {
+        async fn hang(_req: crate::HttpRequest) -> Result<crate::HttpResponse, crate::Error> {
+            struct Dropped;
+            impl Drop for Dropped {
+                fn drop(&mut self) {
+                    HANG_DROPPED.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                }
+            }
+            let _dropped = Dropped;
+            HANG_STARTED.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            std::future::pending::<()>().await;
+            unreachable!()
+        }
         async fn hello(req: crate::HttpRequest) -> Result<crate::HttpResponse, crate::Error> {
             let host = req.headers.get("host").unwrap_or_default().to_owned();
             Ok(crate::HttpResponse::ok().with_body(host.into_bytes()))
@@ -1579,10 +1673,12 @@ mod tests {
         let mut router = crate::Router::new();
         router.get("/hello", hello);
         router.get("/big", big);
+        router.get("/hang", hang);
         let state = crate::application::ServeState::for_test(
             std::sync::Arc::new(crate::route_cache::OptimizedRouter::from_router(&router)),
             crate::DEFAULT_MAX_BODY_SIZE,
-        );
+        )
+        .with_body_read_for_test(policy);
         let server = Http3Server::from_state(config, state, max_connections)
             .with_write_timeout(write_timeout);
         let stats = server.stats();
@@ -1784,5 +1880,133 @@ mod tests {
             "{reason:?}"
         );
         drop(stream);
+    }
+
+    /// The finding: request tasks were detached, so closing a connection
+    /// released its slot in the cap while its handlers ran on — a client could
+    /// keep unbounded handlers running from one slot. They are now owned by
+    /// the connection and cancelled with it.
+    #[cfg(all(feature = "http3", feature = "self-signed-certs"))]
+    #[tokio::test]
+    async fn test_h3_handlers_are_cancelled_when_the_connection_closes() {
+        use std::sync::atomic::Ordering::SeqCst;
+        let (tls, client) = quic_pair();
+        let addr = spawn_h3(Http3Config::default(), &tls, 16);
+        let conn = connect(&client, addr).await;
+        let (mut driver, mut send) = h3::client::new(h3_quinn::Connection::new(conn.clone()))
+            .await
+            .unwrap();
+        tokio::spawn(async move {
+            let _ = std::future::poll_fn(|cx| driver.poll_close(cx)).await;
+        });
+        let dropped_before = HANG_DROPPED.load(SeqCst);
+        let started_before = HANG_STARTED.load(SeqCst);
+        let mut stream = send
+            .send_request(
+                http::Request::get("https://localhost/hang")
+                    .body(())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        stream.finish().await.unwrap();
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while HANG_STARTED.load(SeqCst) == started_before {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("the handler started");
+
+        conn.close(quinn::VarInt::from_u32(0), b"bye");
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while HANG_DROPPED.load(SeqCst) == dropped_before {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("the in-flight handler must be cancelled with its connection");
+        drop(stream);
+    }
+
+    /// Read `/big` over a 16 KiB stream window, pausing `pause` after every
+    /// chunk, from a server with a `min_rate` floor (after a 200 ms grace) and
+    /// a write timeout far longer than any pause. Returns the bytes received
+    /// and whether the body ended cleanly.
+    #[cfg(all(feature = "http3", feature = "self-signed-certs"))]
+    async fn read_h3_big_at(pause: Duration, min_rate: u64) -> (usize, bool) {
+        use bytes::Buf;
+        let (tls, client) = quic_pair();
+        let policy = crate::BodyReadPolicy {
+            idle_timeout: Duration::from_millis(200),
+            min_bytes_per_sec: min_rate,
+        };
+        let (addr, _) = spawn_h3_policy(
+            Http3Config::default(),
+            &tls,
+            16,
+            Some(Duration::from_secs(5)),
+            policy,
+        );
+        let conn = connect(&pinging(client, Some(16 * 1024)), addr).await;
+        let (mut driver, mut send) = h3::client::new(h3_quinn::Connection::new(conn.clone()))
+            .await
+            .unwrap();
+        tokio::spawn(async move {
+            let _ = std::future::poll_fn(|cx| driver.poll_close(cx)).await;
+        });
+        let mut stream = send
+            .send_request(
+                http::Request::get("https://localhost/big")
+                    .body(())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        stream.finish().await.unwrap();
+        let mut received = 0usize;
+        let Ok(response) = stream.recv_response().await else {
+            return (0, false);
+        };
+        assert_eq!(response.status(), 200);
+        loop {
+            match stream.recv_data().await {
+                Ok(None) => return (received, true),
+                Err(_) => return (received, false),
+                Ok(Some(chunk)) => received += chunk.remaining(),
+            }
+            tokio::time::sleep(pause).await;
+        }
+    }
+
+    /// The finding: each write needed only to finish within the write
+    /// timeout, so a peer granting a little credit at a time held a stream and
+    /// its buffered response for hours. A response accepted below the minimum
+    /// rate now has its stream reset.
+    #[cfg(all(feature = "http3", feature = "self-signed-certs"))]
+    #[tokio::test]
+    async fn test_h3_response_below_the_minimum_rate_is_reset() {
+        // At most ~160 KiB/s against a 512 KiB/s floor.
+        let (received, complete) = tokio::time::timeout(
+            Duration::from_secs(5),
+            read_h3_big_at(Duration::from_millis(100), 512 * 1024),
+        )
+        .await
+        .expect("a below-rate response must be cut off, not trickled out");
+        assert!(!complete && received < 1 << 20, "received {received}");
+    }
+
+    /// A reader above the floor is served in full.
+    #[cfg(all(feature = "http3", feature = "self-signed-certs"))]
+    #[tokio::test]
+    async fn test_h3_response_above_the_minimum_rate_completes() {
+        let (received, complete) = tokio::time::timeout(
+            Duration::from_secs(10),
+            read_h3_big_at(Duration::from_millis(2), 64 * 1024),
+        )
+        .await
+        .expect("served in time");
+        assert!(complete);
+        assert_eq!(received, 1 << 20);
     }
 }

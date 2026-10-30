@@ -203,6 +203,10 @@ struct Clients {
 const MIN_PRUNE_AT: usize = 64;
 
 impl SseBroadcaster {
+    /// A broadcaster with **no cap** on the number of clients. Each one costs
+    /// a buffered channel and a slot every broadcast visits, so an endpoint
+    /// open to anonymous clients should use
+    /// [`with_max_clients`](Self::with_max_clients).
     pub fn new() -> Self {
         Self {
             clients: tokio::sync::RwLock::new(Clients {

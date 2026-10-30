@@ -305,11 +305,39 @@ impl Stream for JsonStream {
     }
 }
 
+/// `json` with U+2028, U+2029 and U+0085 written as `\uXXXX` escapes.
+///
+/// `serde_json` emits them raw, but JavaScript line splitters and
+/// Unicode-aware readers treat them as line breaks, which would cut an NDJSON
+/// record in two. Only called on valid JSON, where they can appear only inside
+/// strings and the escape denotes the same character.
+fn escape_unicode_line_breaks(json: &str) -> std::borrow::Cow<'_, str> {
+    const BREAKS: [char; 3] = ['\u{2028}', '\u{2029}', '\u{0085}'];
+    if !json.contains(BREAKS) {
+        return std::borrow::Cow::Borrowed(json);
+    }
+    let mut out = String::with_capacity(json.len() + 8);
+    for c in json.chars() {
+        match c {
+            '\u{2028}' => out.push_str("\\u2028"),
+            '\u{2029}' => out.push_str("\\u2029"),
+            '\u{0085}' => out.push_str("\\u0085"),
+            c => out.push(c),
+        }
+    }
+    std::borrow::Cow::Owned(out)
+}
+
 impl JsonStreamSender {
     /// Send a JSON-serializable value.
+    ///
+    /// U+2028, U+2029 and U+0085 in strings are escaped, since some NDJSON
+    /// readers split lines on them.
     pub async fn send_json<T: Serialize>(&self, value: &T) -> Result<(), Error> {
         let json = serde_json::to_string(value).map_err(|e| Error::Serialization(e.to_string()))?;
-        self.inner.send(format!("{}\n", json)).await?;
+        self.inner
+            .send(format!("{}\n", escape_unicode_line_breaks(&json)))
+            .await?;
         self.items_sent.fetch_add(1, Ordering::Relaxed);
         Ok(())
     }
@@ -323,6 +351,8 @@ impl JsonStreamSender {
     /// value followed by trailing data, is read by lenient consumers as a
     /// different record (or records) than the caller intended. Leading and
     /// trailing whitespace (including a trailing newline) is trimmed first.
+    /// U+2028, U+2029 and U+0085 inside strings are escaped, as in
+    /// [`send_json`](Self::send_json).
     pub async fn send_raw(&self, json: &str) -> Result<(), Error> {
         let json = json.trim();
         if json.contains(['\n', '\r']) {
@@ -335,7 +365,11 @@ impl JsonStreamSender {
         serde_json::from_str::<serde::de::IgnoredAny>(json).map_err(|_| {
             Error::Serialization("raw NDJSON record must be exactly one JSON value".to_string())
         })?;
-        self.inner.send(format!("{}\n", json)).await?;
+        // Valid JSON allows these characters only inside strings, where the
+        // `\uXXXX` escape is the same value, so a plain replace is safe here.
+        self.inner
+            .send(format!("{}\n", escape_unicode_line_breaks(json)))
+            .await?;
         self.items_sent.fetch_add(1, Ordering::Relaxed);
         Ok(())
     }
@@ -423,7 +457,16 @@ impl Stream for TextStream {
 
 impl TextStreamSender {
     /// Send a line of text (newline is added automatically).
+    ///
+    /// An interior `\n` or `\r` would split the line and let the remainder
+    /// be read as a separate, caller-unintended line, so such input is
+    /// rejected rather than sent.
     pub async fn send_line(&self, line: &str) -> Result<(), Error> {
+        if line.contains(['\n', '\r']) {
+            return Err(Error::Serialization(
+                "text line must not contain a line break".to_string(),
+            ));
+        }
         self.inner.send(format!("{}\n", line)).await?;
         self.lines_sent.fetch_add(1, Ordering::Relaxed);
         Ok(())
@@ -940,6 +983,45 @@ mod tests {
         );
         assert!(stream.next().await.is_none());
         assert_eq!(sender.items_sent(), 1);
+    }
+
+    #[tokio::test]
+    async fn send_line_rejects_interior_line_breaks() {
+        let (mut stream, sender) = TextStream::new();
+        assert!(sender.send_line("ok\nINJECTED").await.is_err());
+        assert!(sender.send_line("ok\rINJECTED").await.is_err());
+        sender.send_line("fine").await.unwrap();
+        sender.close().await;
+        assert_eq!(&stream.next().await.unwrap().unwrap()[..], b"fine\n");
+        assert!(stream.next().await.is_none());
+        assert_eq!(sender.lines_sent(), 1);
+    }
+
+    /// U+2028/U+2029/U+0085 are line breaks to some splitters (JavaScript,
+    /// Unicode-aware `lines()`), so an NDJSON record carrying them raw can be
+    /// split in two. They are escaped, which is the same JSON value.
+    #[tokio::test]
+    async fn ndjson_escapes_unicode_line_separators() {
+        let (mut stream, sender) = JsonStream::new();
+        let tricky = "a\u{2028}b\u{2029}c\u{0085}d";
+        sender.send_json(&tricky).await.unwrap();
+        sender
+            .send_raw(&format!("{{\"k\":\"{tricky}\"}}"))
+            .await
+            .unwrap();
+        sender.close().await;
+
+        let first = stream.next().await.unwrap().unwrap();
+        let first = std::str::from_utf8(&first).unwrap();
+        assert_eq!(first, "\"a\\u2028b\\u2029c\\u0085d\"\n");
+        assert_eq!(serde_json::from_str::<String>(first).unwrap(), tricky);
+
+        let second = stream.next().await.unwrap().unwrap();
+        let second = std::str::from_utf8(&second).unwrap();
+        assert_eq!(second, "{\"k\":\"a\\u2028b\\u2029c\\u0085d\"}\n");
+        let v: serde_json::Value = serde_json::from_str(second).unwrap();
+        assert_eq!(v["k"], tricky);
+        assert!(stream.next().await.is_none());
     }
 
     #[tokio::test]

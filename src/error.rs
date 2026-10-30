@@ -3,7 +3,10 @@
 use crate::{HttpResponse, HttpStatus};
 use thiserror::Error;
 
-#[derive(Error, Debug)]
+// `Debug` is implemented by hand (below) so `{:?}` -- used by the
+// `development()` error-transform preset and by `unwrap()`/`expect()` panics --
+// cannot print the request input that serde quotes in a Deserialization error.
+#[derive(Error)]
 pub enum Error {
     #[error("HTTP error: {0}")]
     Http(String),
@@ -427,15 +430,61 @@ impl Error {
     }
 }
 
-/// Reduce a serde error message to fields safe to log: the leading error
-/// category (text before any `:`, backtick or quote, which is where serde
-/// starts quoting input) and the trailing `line N column M` position.
-fn deserialization_log_fields(detail: &str) -> (&str, Option<u64>, Option<u64>) {
-    let kind = detail
-        .split([':', '`', '"', '\''])
-        .next()
-        .unwrap_or("")
-        .trim();
+/// Known deserializer error categories, as `(needle, label)`. Only the static
+/// label is ever logged: a message is classified by the earliest needle it
+/// contains, so input quoted *after* the category cannot change what is
+/// written. The needles are the fixed leading text of serde's `de::Error`
+/// constructors, serde_json's syntax errors, and the `std` parse errors that
+/// serde_urlencoded surfaces for query/form/path values.
+const DESERIALIZATION_CATEGORIES: &[(&str, &str)] = &[
+    ("invalid type", "invalid type"),
+    ("invalid value", "invalid value"),
+    ("invalid length", "invalid length"),
+    ("unknown variant", "unknown variant"),
+    ("unknown field", "unknown field"),
+    ("missing field", "missing field"),
+    ("duplicate field", "duplicate field"),
+    ("data did not match any variant", "no matching variant"),
+    ("EOF while parsing", "EOF while parsing"),
+    ("expected value", "expected value"),
+    ("expected ident", "expected ident"),
+    ("expected `", "expected token"),
+    ("trailing characters", "trailing characters"),
+    ("trailing comma", "trailing comma"),
+    ("key must be a string", "key must be a string"),
+    ("key must be a number", "key must be a number"),
+    ("control character", "control character in string"),
+    ("invalid escape", "invalid escape"),
+    ("invalid number", "invalid number"),
+    ("number out of range", "number out of range"),
+    ("invalid unicode code point", "invalid unicode code point"),
+    ("lone leading surrogate", "lone leading surrogate"),
+    (
+        "unexpected end of hex escape",
+        "unexpected end of hex escape",
+    ),
+    ("recursion limit exceeded", "recursion limit exceeded"),
+    ("invalid digit", "invalid digit"),
+    ("cannot parse integer from empty string", "empty integer"),
+    ("number too large", "number too large"),
+    ("number too small", "number too small"),
+    ("invalid float literal", "invalid float literal"),
+    ("provided string was not `true` or `false`", "invalid bool"),
+];
+
+/// Reduce a deserializer error message to fields safe to log: a known error
+/// category (see [`DESERIALIZATION_CATEGORIES`], else `"custom"`) and the
+/// trailing `line N column M` position.
+///
+/// The category is never taken from the message text itself. A custom
+/// deserializer is free to write the offending value anywhere (`"hunter2 is
+/// too short"`), so splitting on serde's usual quote characters is not enough.
+fn deserialization_log_fields(detail: &str) -> (&'static str, Option<u64>, Option<u64>) {
+    let kind = DESERIALIZATION_CATEGORIES
+        .iter()
+        .filter_map(|(needle, label)| detail.find(needle).map(|at| (at, *label)))
+        .min_by_key(|(at, _)| *at)
+        .map_or("custom", |(_, label)| label);
     let (line, column) = match detail.rsplit_once(" at line ") {
         Some((_, pos)) => {
             let mut parts = pos.split_whitespace();
@@ -471,6 +520,87 @@ impl std::fmt::Display for LogDisplay<'_> {
     }
 }
 
+/// Same shape as a derived `Debug` (`Variant("detail")`), except that a
+/// [`Error::Deserialization`] prints its [`Error::log_display`] form: serde's
+/// text quotes the offending request input.
+impl std::fmt::Debug for Error {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Error::Deserialization(_) => f
+                .debug_tuple("Deserialization")
+                .field(&format_args!("{}", self.log_display()))
+                .finish(),
+            Error::Http(v) => f.debug_tuple("Http").field(v).finish(),
+            Error::RouteNotFound(v) => f.debug_tuple("RouteNotFound").field(v).finish(),
+            Error::MethodNotAllowed(v) => f.debug_tuple("MethodNotAllowed").field(v).finish(),
+            Error::DependencyInjection(v) => f.debug_tuple("DependencyInjection").field(v).finish(),
+            Error::ProviderNotFound(v) => f.debug_tuple("ProviderNotFound").field(v).finish(),
+            Error::Serialization(v) => f.debug_tuple("Serialization").field(v).finish(),
+            Error::Validation(v) => f.debug_tuple("Validation").field(v).finish(),
+            Error::Internal(v) => f.debug_tuple("Internal").field(v).finish(),
+            Error::Forbidden(v) => f.debug_tuple("Forbidden").field(v).finish(),
+            Error::Io(v) => f.debug_tuple("Io").field(v).finish(),
+            Error::BadRequest(v) => f.debug_tuple("BadRequest").field(v).finish(),
+            Error::Unauthorized(v) => f.debug_tuple("Unauthorized").field(v).finish(),
+            Error::PaymentRequired(v) => f.debug_tuple("PaymentRequired").field(v).finish(),
+            Error::NotFound(v) => f.debug_tuple("NotFound").field(v).finish(),
+            Error::NotAcceptable(v) => f.debug_tuple("NotAcceptable").field(v).finish(),
+            Error::ProxyAuthenticationRequired(v) => f
+                .debug_tuple("ProxyAuthenticationRequired")
+                .field(v)
+                .finish(),
+            Error::RequestTimeout(v) => f.debug_tuple("RequestTimeout").field(v).finish(),
+            Error::Conflict(v) => f.debug_tuple("Conflict").field(v).finish(),
+            Error::Gone(v) => f.debug_tuple("Gone").field(v).finish(),
+            Error::LengthRequired(v) => f.debug_tuple("LengthRequired").field(v).finish(),
+            Error::PreconditionFailed(v) => f.debug_tuple("PreconditionFailed").field(v).finish(),
+            Error::PayloadTooLarge(v) => f.debug_tuple("PayloadTooLarge").field(v).finish(),
+            Error::UriTooLong(v) => f.debug_tuple("UriTooLong").field(v).finish(),
+            Error::UnsupportedMediaType(v) => {
+                f.debug_tuple("UnsupportedMediaType").field(v).finish()
+            }
+            Error::RangeNotSatisfiable(v) => f.debug_tuple("RangeNotSatisfiable").field(v).finish(),
+            Error::ExpectationFailed(v) => f.debug_tuple("ExpectationFailed").field(v).finish(),
+            Error::ImATeapot(v) => f.debug_tuple("ImATeapot").field(v).finish(),
+            Error::MisdirectedRequest(v) => f.debug_tuple("MisdirectedRequest").field(v).finish(),
+            Error::UnprocessableEntity(v) => f.debug_tuple("UnprocessableEntity").field(v).finish(),
+            Error::Locked(v) => f.debug_tuple("Locked").field(v).finish(),
+            Error::FailedDependency(v) => f.debug_tuple("FailedDependency").field(v).finish(),
+            Error::TooEarly(v) => f.debug_tuple("TooEarly").field(v).finish(),
+            Error::UpgradeRequired(v) => f.debug_tuple("UpgradeRequired").field(v).finish(),
+            Error::PreconditionRequired(v) => {
+                f.debug_tuple("PreconditionRequired").field(v).finish()
+            }
+            Error::TooManyRequests(v) => f.debug_tuple("TooManyRequests").field(v).finish(),
+            Error::RequestHeaderFieldsTooLarge(v) => f
+                .debug_tuple("RequestHeaderFieldsTooLarge")
+                .field(v)
+                .finish(),
+            Error::UnavailableForLegalReasons(v) => f
+                .debug_tuple("UnavailableForLegalReasons")
+                .field(v)
+                .finish(),
+            Error::NotImplemented(v) => f.debug_tuple("NotImplemented").field(v).finish(),
+            Error::BadGateway(v) => f.debug_tuple("BadGateway").field(v).finish(),
+            Error::ServiceUnavailable(v) => f.debug_tuple("ServiceUnavailable").field(v).finish(),
+            Error::GatewayTimeout(v) => f.debug_tuple("GatewayTimeout").field(v).finish(),
+            Error::HttpVersionNotSupported(v) => {
+                f.debug_tuple("HttpVersionNotSupported").field(v).finish()
+            }
+            Error::VariantAlsoNegotiates(v) => {
+                f.debug_tuple("VariantAlsoNegotiates").field(v).finish()
+            }
+            Error::InsufficientStorage(v) => f.debug_tuple("InsufficientStorage").field(v).finish(),
+            Error::LoopDetected(v) => f.debug_tuple("LoopDetected").field(v).finish(),
+            Error::NotExtended(v) => f.debug_tuple("NotExtended").field(v).finish(),
+            Error::NetworkAuthenticationRequired(v) => f
+                .debug_tuple("NetworkAuthenticationRequired")
+                .field(v)
+                .finish(),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -487,6 +617,46 @@ mod tests {
         let (kind, line, column) = deserialization_log_fields("unknown variant `Admin`");
         assert_eq!(kind, "unknown variant");
         assert_eq!((line, column), (None, None));
+    }
+
+    /// A custom deserializer message that names the value without serde's
+    /// quoting is reduced to a fixed category; nothing of it reaches a log.
+    #[test]
+    fn test_deserialization_log_fields_custom_message_is_not_logged() {
+        let (kind, line, column) =
+            deserialization_log_fields("hunter2 is too short at line 1 column 9");
+        assert_eq!(kind, "custom");
+        assert_eq!((line, column), (Some(1), Some(9)));
+
+        let e = Error::Deserialization("hunter2 is too short at line 1 column 9".into());
+        let logged = e.log_display().to_string();
+        assert!(!logged.contains("hunter2"), "{logged}");
+
+        // Framework-added context before the serde text still classifies.
+        let (kind, _, _) =
+            deserialization_log_fields("Invalid query parameters: invalid digit found in string");
+        assert_eq!(kind, "invalid digit");
+        let (kind, _, _) =
+            deserialization_log_fields("EOF while parsing a string at line 1 column 20");
+        assert_eq!(kind, "EOF while parsing");
+    }
+
+    /// `{:?}` (the development() preset, panics) must not print serde's
+    /// quoted input; other variants keep the derived shape.
+    #[test]
+    fn test_debug_redacts_deserialization_detail() {
+        let e = Error::Deserialization(
+            "invalid type: string \"hunter2\", expected u32 at line 1 column 17".into(),
+        );
+        let dbg = format!("{e:?}");
+        assert!(!dbg.contains("hunter2"), "{dbg}");
+        assert!(dbg.starts_with("Deserialization("), "{dbg}");
+        assert!(dbg.contains("invalid type"), "{dbg}");
+
+        assert_eq!(
+            format!("{:?}", Error::NotFound("user 7".into())),
+            "NotFound(\"user 7\")"
+        );
     }
 
     #[test]

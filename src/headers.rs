@@ -134,6 +134,20 @@ pub const SENSITIVE_HEADERS: &[&str] = &[
     "x-hub-signature-256",
     "authentication-info",
     "proxy-authentication-info",
+    // Identity asserted by an authenticating gateway or load balancer. Also
+    // matched by a fragment below; listed so the set is explicit.
+    "x-forwarded-client-cert",
+    "x-remote-user",
+    "remote-user",
+    "x-ms-client-principal",
+    "x-ms-client-principal-id",
+    "x-ms-client-principal-name",
+    "x-ms-client-principal-idp",
+    "cf-access-jwt-assertion",
+    "x-goog-iap-jwt-assertion",
+    "x-amzn-oidc-data",
+    "x-amzn-oidc-identity",
+    "x-amzn-oidc-accesstoken",
 ];
 
 /// Substrings that mark a header name as sensitive wherever they appear in it
@@ -144,6 +158,16 @@ pub const SENSITIVE_HEADERS: &[&str] = &[
 /// `x-auth-user`/`x-authz-*` style gateway headers, `session` covers
 /// `x-session-id`, and `-key` covers `x-client-key`, `x-license-key` and
 /// friends.
+///
+/// The identity fragments (`client-cert`, `principal`, `assertion`, `oidc`,
+/// `jwt`, `forwarded-user`, `forwarded-email`, `remote-user`) cover headers
+/// an authenticating proxy injects to name the caller (Envoy's
+/// `X-Forwarded-Client-Cert`, Azure's `X-MS-Client-Principal*`, Cloudflare
+/// Access and Google IAP JWT assertions, AWS ALB's `X-Amzn-OIDC-*`,
+/// oauth2-proxy's `X-Forwarded-User`/`-Email`, `Remote-User`). A response to
+/// such a request is per-caller, so the caches must bypass it like any other
+/// credential. None of them occurs in the routing headers (`X-Forwarded-For`,
+/// `-Proto`, `-Host`, `-Port`, `Forwarded`).
 pub const SENSITIVE_HEADER_FRAGMENTS: &[&str] = &[
     "token",
     "secret",
@@ -154,6 +178,14 @@ pub const SENSITIVE_HEADER_FRAGMENTS: &[&str] = &[
     "password",
     "session",
     "auth",
+    "client-cert",
+    "principal",
+    "assertion",
+    "oidc",
+    "jwt",
+    "forwarded-user",
+    "forwarded-email",
+    "remote-user",
 ];
 
 /// What `Debug` prints in place of a sensitive header's value.
@@ -686,6 +718,33 @@ impl HeaderMap {
         self.inner.iter().filter_map(|h| h.value_str())
     }
 
+    /// Every value for a header name as raw bytes, including values that are
+    /// not valid UTF-8.
+    ///
+    /// [`get_all`](Self::get_all) skips non-UTF-8 lines, which is the wrong
+    /// answer for a list whose meaning depends on position (such as
+    /// `X-Forwarded-For`, read by counting from the right): a dropped line
+    /// silently shifts every index. Callers that need to see every line, or to
+    /// reject the field when one is unreadable, use this.
+    ///
+    /// ```
+    /// use armature_core::HeaderMap;
+    /// let mut h = HeaderMap::new();
+    /// h.append("X-Forwarded-For", "203.0.113.7");
+    /// h.append("X-Forwarded-For", &b"\xff"[..]);
+    /// assert_eq!(h.get_all("x-forwarded-for").len(), 1);
+    /// assert_eq!(h.get_all_bytes("x-forwarded-for").len(), 2);
+    /// ```
+    #[inline]
+    pub fn get_all_bytes(&self, name: &str) -> Vec<&[u8]> {
+        let needle = Needle::new(name);
+        self.inner
+            .iter()
+            .filter(|h| needle.matches(&h.id))
+            .map(|h| h.value.as_ref())
+            .collect()
+    }
+
     /// Every value for a header name, for multi-value fields.
     #[inline]
     pub fn get_all(&self, name: &str) -> Vec<&str> {
@@ -1059,6 +1118,18 @@ mod tests {
             "X-Auth-User",
             "X-Client-Key",
             "Proxy-Authorization",
+            "X-Forwarded-Client-Cert",
+            "X-SSL-Client-Cert",
+            "X-Remote-User",
+            "Remote-User",
+            "X-MS-Client-Principal",
+            "X-MS-Client-Principal-Name",
+            "Cf-Access-Jwt-Assertion",
+            "X-Goog-IAP-JWT-Assertion",
+            "X-Amzn-OIDC-Data",
+            "X-Amzn-OIDC-Identity",
+            "X-Forwarded-User",
+            "X-Forwarded-Email",
         ] {
             assert!(is_sensitive_header(name), "{name} must be redacted");
         }
@@ -1069,8 +1140,21 @@ mod tests {
             "user-agent",
             "host",
             "x-forwarded-for",
+            "x-forwarded-proto",
+            "x-forwarded-host",
+            "x-forwarded-port",
+            "x-forwarded-prefix",
+            "forwarded",
+            "x-real-ip",
+            "via",
             "accept-encoding",
+            "accept-language",
             "if-none-match",
+            "if-modified-since",
+            "cache-control",
+            "content-length",
+            "origin",
+            "referer",
             "keep-alive",
         ] {
             assert!(!is_sensitive_header(name), "{name} is not a credential");
@@ -1084,6 +1168,9 @@ mod tests {
         assert!(!is_credential_header("X-CSRF-Token"));
         assert!(!is_credential_header("x-xsrf-token"));
         assert!(!is_credential_header("content-type"));
+        assert!(is_credential_header("X-Forwarded-Client-Cert"));
+        assert!(is_credential_header("X-MS-Client-Principal-Id"));
+        assert!(!is_credential_header("x-forwarded-for"));
 
         let mut map = HeaderMap::new();
         map.insert("x-session-token", "s3cret");

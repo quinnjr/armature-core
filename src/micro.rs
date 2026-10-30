@@ -1455,6 +1455,9 @@ async fn serve(listener: tokio::net::TcpListener, app: Arc<BuiltApp>) -> std::io
     use hyper::service::service_fn;
     use hyper_util::rt::TokioIo;
 
+    crate::application::warn_if_connection_cap_exceeds_fd_limit(
+        crate::pipeline::DEFAULT_MAX_CONNECTIONS,
+    );
     let limit = Arc::new(tokio::sync::Semaphore::new(
         crate::pipeline::DEFAULT_MAX_CONNECTIONS,
     ));
@@ -1463,7 +1466,7 @@ async fn serve(listener: tokio::net::TcpListener, app: Arc<BuiltApp>) -> std::io
             .acquire_owned()
             .await
             .expect("connection-limit semaphore is never closed");
-        let (stream, client_addr) = listener.accept().await?;
+        let (stream, client_addr) = crate::application::accept_tcp(&listener).await;
         // The same stalled-reader bound as `Application`'s hyper listeners,
         // at `PipelineConfig`'s default.
         let io = TokioIo::new(crate::pipeline::WriteDeadline::new(
@@ -1482,7 +1485,9 @@ async fn serve(listener: tokio::net::TcpListener, app: Arc<BuiltApp>) -> std::io
                 .serve_connection(io, service)
                 .await
             {
-                tracing::error!("Connection error: {}", err);
+                // A peer's malformed or abandoned connection, not a server
+                // fault: not worth an error-level line per client.
+                tracing::debug!(error = %err, client = %client_addr, "Connection error");
             }
         });
     }

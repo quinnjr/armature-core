@@ -7,6 +7,10 @@ updates:
     schedule:
       interval: "weekly"
       day: "monday"
+    # A hijacked release is usually yanked within days; waiting a week keeps a
+    # fresh one out of the grouped patch PR.
+    cooldown:
+      default-days: 7
     open-pull-requests-limit: 10
     commit-message:
       prefix: "deps(rust)"
@@ -26,6 +30,8 @@ updates:
     schedule:
       interval: "weekly"
       day: "monday"
+    cooldown:
+      default-days: 7
     open-pull-requests-limit: 5
     commit-message:
       prefix: "deps(fuzz)"

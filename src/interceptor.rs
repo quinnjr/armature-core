@@ -169,6 +169,14 @@ where
 /// These guards are defensive, not a substitute for correct placement: only
 /// attach this interceptor to routes whose responses are identical for every
 /// caller.
+///
+/// **Ordering.** The verified-identity check only sees what has already been
+/// attached, so the cache must run *after* every middleware that authenticates
+/// the request and inserts a [`VerifiedIdentity`](crate::VerifiedIdentity) /
+/// [`RequestRoles`](crate::RequestRoles) — in particular one that
+/// authenticates from something the header check cannot see (mTLS, or a
+/// gateway header it strips). Register the authentication middleware so it
+/// wraps the handler this interceptor is attached to.
 pub struct CacheInterceptor {
     /// Freshness window, in seconds. A cached entry is served only while its
     /// age is strictly less than this. `0` disables caching (nothing is ever
@@ -428,7 +436,6 @@ fn must_not_cache(response: &HttpResponse) -> bool {
     if !response.cookies.is_empty() {
         return true;
     }
-    let mut cache_control: Option<&str> = None;
     for (name, value) in response.headers.iter() {
         if name.eq_ignore_ascii_case("set-cookie") {
             return true;
@@ -439,19 +446,22 @@ fn must_not_cache(response: &HttpResponse) -> bool {
         if name.eq_ignore_ascii_case("content-encoding") && !value.trim().is_empty() {
             return true;
         }
-        if name.eq_ignore_ascii_case("cache-control") {
-            cache_control = Some(value.as_str());
+        // Every Cache-Control line, not just the last one iterated: the map is
+        // case-sensitive, so `Cache-Control: public` and `cache-control:
+        // private` can both be present, and either line forbidding storage
+        // is enough.
+        if name.eq_ignore_ascii_case("cache-control")
+            && value.split(',').any(|directive| {
+                // `private="Set-Cookie"` and `no-cache="..."` are still the
+                // directive; only the name decides.
+                let name = directive.split('=').next().unwrap_or("").trim();
+                name.eq_ignore_ascii_case("private")
+                    || name.eq_ignore_ascii_case("no-store")
+                    || name.eq_ignore_ascii_case("no-cache")
+            })
+        {
+            return true;
         }
-    }
-    if let Some(cc) = cache_control {
-        return cc.split(',').any(|directive| {
-            // `private="Set-Cookie"` and `no-cache="..."` are still the
-            // directive; only the name decides.
-            let name = directive.split('=').next().unwrap_or("").trim();
-            name.eq_ignore_ascii_case("private")
-                || name.eq_ignore_ascii_case("no-store")
-                || name.eq_ignore_ascii_case("no-cache")
-        });
     }
     false
 }
@@ -1098,6 +1108,27 @@ mod tests {
         }
         assert_eq!(calls.load(Ordering::SeqCst), 2);
         assert!(interceptor.is_empty());
+    }
+
+    /// Differently-cased Cache-Control lines coexist in the response map; a
+    /// `private` on either must win over a `public` on the other, whatever
+    /// order the map iterates them in.
+    #[test]
+    fn test_must_not_cache_sees_every_cache_control_line() {
+        for (a, b) in [("public", "private"), ("private", "public")] {
+            let mut resp = HttpResponse::ok();
+            resp.headers
+                .insert("Cache-Control".to_string(), a.to_string());
+            resp.headers
+                .insert("cache-control".to_string(), b.to_string());
+            assert!(must_not_cache(&resp), "{a} / {b}");
+        }
+        let mut resp = HttpResponse::ok();
+        resp.headers
+            .insert("Cache-Control".to_string(), "public".to_string());
+        resp.headers
+            .insert("CACHE-CONTROL".to_string(), "max-age=60".to_string());
+        assert!(!must_not_cache(&resp));
     }
 
     /// Different virtual hosts must not share an entry for the same path.

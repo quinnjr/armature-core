@@ -10,13 +10,30 @@ use tokio_tungstenite::tungstenite::Message as WsMessage;
 use tracing::Instrument;
 
 /// WebSocket message type
-#[derive(Debug, Clone)]
+///
+/// `Debug` shows each frame's kind and length, never its payload: messages
+/// carry chat text, tokens and other user data, and a `{:?}` in a log line or
+/// error message should not copy them into logs.
+#[derive(Clone)]
 pub enum WebSocketMessage {
     Text(String),
     Binary(Vec<u8>),
     Ping(Vec<u8>),
     Pong(Vec<u8>),
     Close,
+}
+
+impl std::fmt::Debug for WebSocketMessage {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let (kind, len) = match self {
+            Self::Text(text) => ("Text", text.len()),
+            Self::Binary(data) => ("Binary", data.len()),
+            Self::Ping(data) => ("Ping", data.len()),
+            Self::Pong(data) => ("Pong", data.len()),
+            Self::Close => return f.write_str("Close"),
+        };
+        f.debug_struct(kind).field("len", &len).finish()
+    }
 }
 
 impl From<WsMessage> for WebSocketMessage {
@@ -123,7 +140,7 @@ impl WebSocketRoom {
 
         if !dead.is_empty() {
             let mut connections = self.connections.write().await;
-            connections.retain(|id, _| !dead.contains(id));
+            reap_closed(&mut connections, &dead);
         }
 
         Ok(())
@@ -144,6 +161,25 @@ impl WebSocketRoom {
     }
 }
 
+/// Remove the connections in `dead` from `connections`, looking each up rather
+/// than scanning the room once per dead id (which was O(room × dead) under the
+/// write lock), and only if its sender is still closed: between the read lock
+/// the failed sends were seen under and this write lock, the same id may have
+/// rejoined with a live sender, which must not be dropped.
+fn reap_closed(
+    connections: &mut HashMap<String, broadcast::Sender<WebSocketMessage>>,
+    dead: &[String],
+) {
+    for id in dead {
+        if connections
+            .get(id)
+            .is_some_and(|tx| tx.receiver_count() == 0)
+        {
+            connections.remove(id);
+        }
+    }
+}
+
 /// WebSocket manager for handling multiple rooms
 ///
 /// Room names usually come from clients, so a manager that only ever adds
@@ -159,6 +195,9 @@ pub struct WebSocketManager {
 }
 
 impl WebSocketManager {
+    /// A manager with **no cap** on the number of rooms. Room names usually
+    /// come from clients, so anything reachable by them should use
+    /// [`with_max_rooms`](Self::with_max_rooms).
     pub fn new() -> Self {
         Self {
             rooms: Arc::new(RwLock::new(HashMap::new())),
@@ -670,6 +709,32 @@ mod tests {
 
         assert_eq!(room.connection_count().await, 1);
         assert!(matches!(rx1.recv().await.unwrap(), WebSocketMessage::Text(t) if t == "hi"));
+    }
+
+    /// The race: an id seen dead under the read lock may have rejoined with
+    /// a live sender by the time the write lock is taken. Only a sender that
+    /// is still closed is reaped.
+    #[test]
+    fn reaping_keeps_a_connection_that_rejoined() {
+        let (gone, _) = broadcast::channel::<WebSocketMessage>(1);
+        let (rejoined, _rx) = broadcast::channel(1);
+        let mut connections =
+            HashMap::from([("c1".to_string(), gone), ("c2".to_string(), rejoined)]);
+        reap_closed(&mut connections, &["c1".to_string(), "c2".to_string()]);
+        assert!(!connections.contains_key("c1"));
+        assert!(connections.contains_key("c2"), "a live sender was dropped");
+    }
+
+    #[test]
+    fn message_debug_shows_lengths_not_payloads() {
+        let rendered = format!(
+            "{:?} {:?} {:?}",
+            WebSocketMessage::Text("secret-token".to_string()),
+            WebSocketMessage::Binary(vec![1, 2, 3]),
+            WebSocketMessage::Close
+        );
+        assert!(!rendered.contains("secret"), "{rendered}");
+        assert_eq!(rendered, "Text { len: 12 } Binary { len: 3 } Close");
     }
 
     #[tokio::test]

@@ -555,7 +555,10 @@ impl ExceptionFilter for NotFoundExceptionFilter {
             let message = self
                 .custom_message
                 .clone()
-                .unwrap_or_else(|| error.to_string());
+                // client_message, not Display: RouteNotFound carries the request's
+                // own path plus the framework's routing hints, and this filter is
+                // installed by the production() and api() presets.
+                .unwrap_or_else(|| error.client_message());
 
             let response = ErrorResponse::new(404)
                 .message(message)
@@ -957,6 +960,22 @@ mod tests {
 
         let resp = response.unwrap();
         assert_eq!(resp.status, 404);
+    }
+
+    /// RouteNotFound's Display echoes the requested path and routing hints;
+    /// the default message is the client-safe one.
+    #[tokio::test]
+    async fn test_not_found_filter_does_not_reflect_route() {
+        let filter = NotFoundExceptionFilter::new();
+        let error = Error::RouteNotFound("GET /<script>probe</script>".to_string());
+        let request = HttpRequest::new("GET", "/x".to_string());
+        let ctx = ExceptionContext::from_request(request);
+
+        let resp = filter.catch(&error, &ctx).await.unwrap();
+        assert_eq!(resp.status, 404);
+        let body = String::from_utf8(resp.into_body_bytes().to_vec()).unwrap();
+        assert!(!body.contains("probe"), "{body}");
+        assert!(!body.contains("controller"), "{body}");
     }
 
     #[tokio::test]

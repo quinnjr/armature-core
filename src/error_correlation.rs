@@ -666,7 +666,10 @@ impl CorrelatedError {
         Self {
             error_id: IdGenerationStrategy::UuidV4.generate(),
             context,
-            message: error.to_string(),
+            // The log-safe rendering: this message is retained in the
+            // ErrorRegistry and exported by to_json, and a Deserialization
+            // error's Display quotes the request input that failed to parse.
+            message: error.log_display().to_string(),
             code: None,
             error_type: Some(error_type.to_string()),
             status,
@@ -1201,6 +1204,21 @@ impl CorrelatedErrorExt for Error {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A Deserialization error's serde text quotes request input; the
+    /// correlated record (registry + to_json export) keeps only its log-safe
+    /// form.
+    #[test]
+    fn test_from_error_does_not_retain_deserialization_input() {
+        let error = Error::Deserialization(
+            "invalid type: string \"hunter2\", expected u32 at line 1 column 17".to_string(),
+        );
+        let correlated = CorrelatedError::from_error(&error, CorrelationContext::new());
+        assert!(!correlated.message.contains("hunter2"));
+        let json = correlated.to_json();
+        assert!(!json.contains("hunter2"), "{json}");
+        assert!(json.contains("invalid type"), "{json}");
+    }
 
     #[test]
     fn test_id_generation_uuid_v4() {

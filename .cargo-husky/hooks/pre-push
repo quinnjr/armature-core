@@ -28,7 +28,7 @@ if [ -n "$pushed_refs" ] && ! printf '%s\n' "$pushed_refs" \
 fi
 
 echo "🔨 Running cargo check..."
-if ! cargo check --all-targets; then
+if ! cargo check --locked --all-targets; then
     echo ""
     echo "❌ Cargo check failed!"
     echo ""
@@ -38,7 +38,7 @@ echo "✅ Cargo check passed"
 echo ""
 
 echo "🧪 Running tests..."
-if ! cargo test; then
+if ! cargo test --locked; then
     echo ""
     echo "❌ Tests failed!"
     echo ""
@@ -48,7 +48,7 @@ echo "✅ All tests passed"
 echo ""
 
 echo "📚 Running doc tests..."
-if ! cargo test --doc; then
+if ! cargo test --locked --doc; then
     echo ""
     echo "❌ Doc tests failed!"
     echo ""
@@ -58,7 +58,7 @@ echo "✅ Doc tests passed"
 echo ""
 
 echo "📖 Checking documentation builds..."
-if ! cargo doc --no-deps --quiet; then
+if ! cargo doc --locked --no-deps --quiet; then
     echo ""
     echo "❌ Documentation build failed!"
     echo ""

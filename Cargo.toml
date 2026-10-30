@@ -11,12 +11,12 @@ homepage = "https://quinnjr.github.io/armature"
 description = "High-performance async HTTP framework core - routing, handlers, middleware"
 keywords = ["http", "async", "web", "framework"]
 categories = ["web-programming::http-server", "asynchronous"]
+publish = ["crates-io"]
 # Ship the library, not the repository tooling: CI config, git hooks and the
 # fuzz workspace are of no use to a dependent and only widen what it unpacks.
 exclude = [".github/", ".cargo-husky/", "fuzz/", "deny.toml", ".gitignore"]
 
 [dependencies]
-armature-log = { version = "0.3" }
 inventory = "0.3"
 dependency-injector = "2.1.0"
 matchit = "0.9"  # High-performance router (same as Axum)

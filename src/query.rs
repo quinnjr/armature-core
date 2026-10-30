@@ -121,7 +121,9 @@ impl<'a> IntoIterator for QueryView<'a> {
 /// re-encoded. Errors carry serde's message, for the caller to log.
 pub(crate) fn first_wins_urlencoded(input: &[u8]) -> Result<Cow<'_, [u8]>, String> {
     // Fast path on the raw keys. A key with an escape or `+` could equal
-    // another only after decoding, so those take the slow path.
+    // another only after decoding, so those take the slow path. So does any
+    // non-ASCII byte: decoding is lossy, and two distinct invalid-UTF-8 keys
+    // (`\xff`, `\xfe`) both become U+FFFD -- one key to serde, two here.
     let mut keys: SmallVec<[&[u8]; 16]> = SmallVec::new();
     let mut needs_decode = false;
     for pair in input.split(|&b| b == b'&') {
@@ -129,7 +131,7 @@ pub(crate) fn first_wins_urlencoded(input: &[u8]) -> Result<Cow<'_, [u8]>, Strin
             continue;
         }
         let key = pair.split(|&b| b == b'=').next().unwrap_or(pair);
-        if key.iter().any(|&b| b == b'%' || b == b'+') {
+        if key.iter().any(|&b| b == b'%' || b == b'+' || b >= 0x80) {
             needs_decode = true;
             break;
         }
@@ -245,6 +247,21 @@ fn decode(s: &str) -> Cow<'_, str> {
 
 #[cfg(test)]
 mod tests {
+    /// Distinct raw keys that decode to the same lossy string are one key to
+    /// serde, so they must be deduplicated (first wins) too.
+    #[test]
+    fn first_wins_dedups_keys_equal_only_after_lossy_decode() {
+        let out = super::first_wins_urlencoded(b"\xff=first&\xfe=second").unwrap();
+        let pairs: Vec<(String, String)> = serde_urlencoded::from_bytes(&out).unwrap();
+        assert_eq!(pairs, vec![("\u{FFFD}".to_string(), "first".to_string())]);
+
+        // Plain ASCII with distinct keys still borrows.
+        assert!(matches!(
+            super::first_wins_urlencoded(b"a=1&b=2").unwrap(),
+            std::borrow::Cow::Borrowed(_)
+        ));
+    }
+
     use crate::HttpRequest;
 
     #[test]

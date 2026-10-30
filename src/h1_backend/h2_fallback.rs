@@ -167,7 +167,7 @@ impl H2Fallback for HyperH2 {
         let server = self.server.clone();
         Box::pin(async move {
             if let Err(err) = server.serve(Replay::wrap(io, buffered), state).await {
-                crate::logging::error!(error = %err, "Error serving HTTP/2 connection");
+                crate::logging::debug!(error = %err, "Error serving HTTP/2 connection");
             }
         })
     }

@@ -537,8 +537,18 @@ impl Deref for Headers {
 /// let raw: RawBody = RawBody::from_request(&request)?;
 /// println!("Body length: {} bytes", raw.len());
 /// ```
-#[derive(Debug, Clone)]
+///
+/// `Debug` prints the length only: the body may carry credentials or PII.
+#[derive(Clone)]
 pub struct RawBody(pub Bytes);
+
+impl std::fmt::Debug for RawBody {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RawBody")
+            .field("len", &self.0.len())
+            .finish()
+    }
+}
 
 impl RawBody {
     /// Create a new RawBody
@@ -812,6 +822,14 @@ macro_rules! header {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn raw_body_debug_prints_length_only() {
+        let raw = crate::extractors::RawBody::new("password=hunter2");
+        let dbg = format!("{raw:?}");
+        assert!(!dbg.contains("hunter2"), "{dbg}");
+        assert!(dbg.contains("16"), "{dbg}");
+    }
 
     #[test]
     fn header_debug_redacts_credentials() {

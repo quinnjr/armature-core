@@ -94,6 +94,14 @@ pub const DEFAULT_MAX_BODY_SIZE: usize = 10 * 1024 * 1024;
 ///   a connection (and its buffered body) alive indefinitely. `0` disables the
 ///   rate rule.
 ///
+/// The minimum-rate rule also bounds how slowly an HTTP/2 or HTTP/3 client
+/// may *accept* a response: one stream's response may take at most
+/// `idle_timeout` plus one second per `min_bytes_per_sec` bytes sent before
+/// the connection (HTTP/2) or the stream (HTTP/3) is ended. On those
+/// multiplexed transports a peer granting just enough flow-control credit to
+/// dodge the write timeout could otherwise keep every one of a connection's
+/// streams pinned, each with a full response buffered, for hours.
+///
 /// ```
 /// use armature_core::BodyReadPolicy;
 /// use std::time::Duration;
@@ -123,16 +131,26 @@ impl Default for BodyReadPolicy {
 }
 
 impl BodyReadPolicy {
+    /// How long a transfer of `transferred` bytes may have taken in all and
+    /// still meet the minimum rate (the `idle_timeout` grace included);
+    /// `None` when the rate rule is disabled.
+    pub(crate) fn rate_budget(&self, transferred: usize) -> Option<Duration> {
+        if self.min_bytes_per_sec == 0 {
+            return None;
+        }
+        let earned_ms = (transferred as u64).saturating_mul(1000) / self.min_bytes_per_sec;
+        Some(
+            self.idle_timeout
+                .saturating_add(Duration::from_millis(earned_ms)),
+        )
+    }
+
     /// How long the next chunk may take to arrive, given how long the read has
     /// run and how much it has received; `None` once the budget is spent.
     fn next_wait(&self, elapsed: Duration, received: usize) -> Option<Duration> {
-        if self.min_bytes_per_sec == 0 {
+        let Some(budget) = self.rate_budget(received) else {
             return Some(self.idle_timeout);
-        }
-        let earned_ms = (received as u64).saturating_mul(1000) / self.min_bytes_per_sec;
-        let budget = self
-            .idle_timeout
-            .saturating_add(Duration::from_millis(earned_ms));
+        };
         budget
             .checked_sub(elapsed)
             .filter(|left| !left.is_zero())
@@ -407,10 +425,16 @@ impl ServeState {
     }
 
     /// Serve with a body-read policy, for tests.
-    #[cfg(all(test, feature = "h1-backend"))]
+    #[cfg(test)]
     pub(crate) fn with_body_read_for_test(mut self, policy: BodyReadPolicy) -> Self {
         self.body_read = policy;
         self
+    }
+
+    /// The body-read policy, whose minimum rate the multiplexed transports
+    /// also hold response delivery to.
+    pub(crate) fn body_read(&self) -> BodyReadPolicy {
+        self.body_read
     }
 
     /// Serve with a global exception filter chain, for tests.
@@ -647,8 +671,10 @@ impl Application {
         self
     }
 
-    /// Set how long a client may take to deliver a request body. Defaults to
-    /// [`BodyReadPolicy::default`]: 30 s of inactivity, 1 KiB/s minimum rate.
+    /// Set how long a client may take to deliver a request body (and, on
+    /// HTTP/2 and HTTP/3, the minimum rate at which it must accept a
+    /// response). Defaults to [`BodyReadPolicy::default`]: 30 s of
+    /// inactivity, 1 KiB/s minimum rate.
     pub fn with_body_read_policy(mut self, policy: BodyReadPolicy) -> Self {
         self.body_read = policy;
         self
@@ -1458,7 +1484,7 @@ impl Application {
 
         loop {
             let permit = limit.acquire().await;
-            let (stream, client_addr) = listener.accept().await?;
+            let (stream, client_addr) = accept_tcp(&listener).await;
             trace!(client_address = %client_addr, "Connection accepted");
 
             // Apply TCP_NODELAY if configured
@@ -1499,7 +1525,7 @@ impl Application {
                 });
 
                 if let Err(err) = http_builder.serve_connection(io, service).await {
-                    error!(error = %err, client = %client_addr, "Error serving connection");
+                    debug!(error = %err, client = %client_addr, "Error serving connection");
                 }
 
                 // Track connection close
@@ -1636,7 +1662,7 @@ impl Application {
 
         loop {
             let permit = limit.acquire().await;
-            let (stream, client_addr) = listener.accept().await?;
+            let (stream, client_addr) = accept_tcp(&listener).await;
             trace!(client_address = %client_addr, "HTTPS connection accepted");
 
             // Apply TCP_NODELAY if configured
@@ -1682,11 +1708,11 @@ impl Application {
                         });
 
                         if let Err(err) = http_builder.serve_connection(io, service).await {
-                            error!(error = %err, client = %client_addr, "Error serving HTTPS connection");
+                            debug!(error = %err, client = %client_addr, "Error serving HTTPS connection");
                         }
                     }
                     Err(err) => {
-                        error!(error = %err, client = %client_addr, "TLS handshake failed");
+                        debug!(error = %err, client = %client_addr, "TLS handshake failed");
                     }
                 }
 
@@ -1849,7 +1875,7 @@ impl Application {
 
         loop {
             let permit = limit.acquire().await;
-            let (stream, client_addr) = listener.accept().await?;
+            let (stream, client_addr) = accept_tcp(&listener).await;
             trace!(client_address = %client_addr, "TLS connection accepted");
 
             // Apply opt-in socket tuning to the accepted socket
@@ -1878,7 +1904,7 @@ impl Application {
                         });
 
                         if let Err(err) = http_builder.serve_connection(io, service).await {
-                            error!(error = %err, client = %client_addr, "Error serving HTTPS connection");
+                            debug!(error = %err, client = %client_addr, "Error serving HTTPS connection");
                         }
                     }
                     Err(err) => {
@@ -1961,7 +1987,7 @@ impl Application {
 
         loop {
             let permit = limit.acquire().await;
-            let (stream, client_addr) = listener.accept().await?;
+            let (stream, client_addr) = accept_tcp(&listener).await;
             trace!(client_address = %client_addr, "HTTP/2 connection accepted");
 
             // Apply opt-in socket tuning to the accepted socket
@@ -1977,7 +2003,7 @@ impl Application {
             tokio::spawn(async move {
                 let _permit = permit;
                 if let Err(err) = h2.serve(stream, state).await {
-                    error!(error = %err, client = %client_addr, "Error serving HTTP/2 connection");
+                    debug!(error = %err, client = %client_addr, "Error serving HTTP/2 connection");
                 }
             });
         }
@@ -2073,7 +2099,7 @@ impl Application {
 
         loop {
             let permit = limit.acquire().await;
-            let (stream, client_addr) = listener.accept().await?;
+            let (stream, client_addr) = accept_tcp(&listener).await;
             trace!(client_address = %client_addr, "Connection accepted, starting TLS handshake");
 
             // Apply opt-in socket tuning to the accepted socket
@@ -2102,7 +2128,7 @@ impl Application {
                         if is_h2 {
                             debug!(client = %client_addr, "Using HTTP/2 (ALPN negotiated h2)");
                             if let Err(err) = h2.serve(tls_stream, state).await {
-                                error!(error = %err, client = %client_addr, "Error serving HTTP/2 connection");
+                                debug!(error = %err, client = %client_addr, "Error serving HTTP/2 connection");
                             }
                         } else {
                             debug!(client = %client_addr, "Using HTTP/1.1 (ALPN fallback)");
@@ -2124,14 +2150,14 @@ impl Application {
                             });
 
                             if let Err(err) = h1_builder_ref.serve_connection(io, service).await {
-                                error!(error = %err, client = %client_addr, "Error serving HTTP/1.1 connection");
+                                debug!(error = %err, client = %client_addr, "Error serving HTTP/1.1 connection");
                             }
 
                             h1_stats.connection_closed();
                         }
                     }
                     Err(err) => {
-                        error!(error = %err, client = %client_addr, "TLS handshake failed");
+                        debug!(error = %err, client = %client_addr, "TLS handshake failed");
                     }
                 }
             });
@@ -2338,6 +2364,7 @@ struct ConnectionLimit(Arc<tokio::sync::Semaphore>);
 
 impl ConnectionLimit {
     fn new(max: usize) -> Self {
+        warn_if_connection_cap_exceeds_fd_limit(max);
         Self(Arc::new(tokio::sync::Semaphore::new(
             max.clamp(1, tokio::sync::Semaphore::MAX_PERMITS),
         )))
@@ -2351,6 +2378,120 @@ impl ConnectionLimit {
             .await
             .expect("connection-limit semaphore is never closed")
     }
+}
+
+/// How long an accept loop pauses after `accept` failed for lack of
+/// descriptors or memory.
+///
+/// Retrying at once would spin a core on the same error; the pause lets
+/// in-flight connections finish and release what they hold. It is far below
+/// any client's connect timeout, and the kernel's listen backlog holds the
+/// connections that arrive meanwhile.
+const ACCEPT_EXHAUSTED_BACKOFF: Duration = Duration::from_millis(50);
+
+/// Whether a failed `accept` means the process or host ran out of a resource
+/// (descriptors, socket buffers, memory) rather than one connection failing.
+///
+/// Only these warrant a warning and a pause: the rest (`ECONNABORTED`,
+/// `EPROTO`, `EPERM` from a firewall, ...) are a single peer's connection
+/// dying between the SYN and `accept`, which any client can cause at will.
+pub(crate) fn accept_error_is_resource_exhaustion(err: &std::io::Error) -> bool {
+    #[cfg(unix)]
+    if let Some(code) = err.raw_os_error() {
+        return matches!(
+            code,
+            libc::EMFILE | libc::ENFILE | libc::ENOBUFS | libc::ENOMEM
+        );
+    }
+    err.kind() == std::io::ErrorKind::OutOfMemory
+}
+
+/// Run `accept` until it yields a connection.
+///
+/// An error from `accept` is never a reason to stop listening: propagating it
+/// (`accept().await?`) would end the server for good on the first `EMFILE` —
+/// easy to reach, since the default connection cap is above the common
+/// 1024-descriptor soft limit — or on an `ECONNABORTED` from a client that
+/// reset its connection while it sat in the backlog. Per-connection failures
+/// are logged at `debug` and retried at once; resource exhaustion is logged at
+/// `warn` (at most once a second, so a sustained shortage does not flood the
+/// log) and retried after [`ACCEPT_EXHAUSTED_BACKOFF`].
+pub(crate) async fn accept_retrying<T, F, Fut>(mut accept: F) -> T
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = std::io::Result<T>>,
+{
+    use std::sync::OnceLock;
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::time::Instant;
+
+    // Milliseconds since `EPOCH` of the last warning, shared by every
+    // listener: the shortage is process-wide, so is the rate limit.
+    static EPOCH: OnceLock<Instant> = OnceLock::new();
+    static LAST_WARN_MS: AtomicU64 = AtomicU64::new(u64::MAX);
+
+    loop {
+        match accept().await {
+            Ok(accepted) => return accepted,
+            Err(err) if accept_error_is_resource_exhaustion(&err) => {
+                let now = EPOCH.get_or_init(Instant::now).elapsed().as_millis() as u64;
+                let last = LAST_WARN_MS.load(Ordering::Relaxed);
+                if (last == u64::MAX || now.saturating_sub(last) >= 1000)
+                    && LAST_WARN_MS
+                        .compare_exchange(last, now, Ordering::Relaxed, Ordering::Relaxed)
+                        .is_ok()
+                {
+                    warn!(
+                        error = %err,
+                        "accept failed: out of descriptors or memory; backing off \
+                         (raise RLIMIT_NOFILE or lower max_connections)"
+                    );
+                } else {
+                    debug!(error = %err, "accept failed: out of descriptors or memory");
+                }
+                tokio::time::sleep(ACCEPT_EXHAUSTED_BACKOFF).await;
+            }
+            Err(err) => debug!(error = %err, "accept failed; continuing"),
+        }
+    }
+}
+
+/// [`accept_retrying`] over a TCP listener.
+pub(crate) async fn accept_tcp(listener: &TcpListener) -> (tokio::net::TcpStream, SocketAddr) {
+    accept_retrying(|| listener.accept()).await
+}
+
+/// Warn when `max_connections` is above the process's descriptor soft limit.
+///
+/// Each connection holds a descriptor, so such a cap cannot be reached: the
+/// server hits `EMFILE` first and [`accept_retrying`] has to back off where
+/// the cap should have applied. Said once at startup, where it is actionable.
+pub(crate) fn warn_if_connection_cap_exceeds_fd_limit(max_connections: usize) {
+    // `rlim_t` is `u64` on Linux and macOS but not on every unix, so the casts
+    // below are only "unnecessary" where this is linted.
+    #[cfg(unix)]
+    #[allow(clippy::unnecessary_cast)]
+    {
+        let mut limit = libc::rlimit {
+            rlim_cur: 0,
+            rlim_max: 0,
+        };
+        // SAFETY: `getrlimit` only writes the `rlimit` it is handed, which is
+        // a valid, exclusively borrowed local.
+        if unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut limit) } == 0
+            && limit.rlim_cur != libc::RLIM_INFINITY
+            && u64::try_from(max_connections).unwrap_or(u64::MAX) > limit.rlim_cur as u64
+        {
+            warn!(
+                max_connections,
+                rlimit_nofile = limit.rlim_cur as u64,
+                "max_connections exceeds the open-file soft limit (RLIMIT_NOFILE); \
+                 accept will fail with EMFILE before the connection cap applies"
+            );
+        }
+    }
+    #[cfg(not(unix))]
+    let _ = max_connections;
 }
 
 /// How long a TLS handshake may take before the connection is dropped.
@@ -2389,6 +2530,12 @@ struct RedirectTarget {
 /// Split a `Host` header value into its host (lowercased, IPv6 literals kept
 /// in brackets) and validate any port; `None` if it is not a valid authority.
 fn host_of_authority(value: &str) -> Option<String> {
+    // The shared `uri-host [":" port]` grammar first: the split below only
+    // narrows it, and `u16::from_str` alone would let a signed port ("+80")
+    // through.
+    if !is_valid_authority(value.as_bytes()) {
+        return None;
+    }
     let (host, port) = if let Some(rest) = value.strip_prefix('[') {
         let (inside, after) = rest.split_once(']')?;
         if inside.is_empty()
@@ -2469,7 +2616,7 @@ async fn serve_http_redirect(
     let limit = ConnectionLimit::new(max_connections);
     loop {
         let permit = limit.acquire().await;
-        let (stream, client_addr) = listener.accept().await?;
+        let (stream, client_addr) = accept_tcp(&listener).await;
         // Under the same write deadline as every other hyper path: a client
         // that never reads its 301 must not hold a connection slot forever.
         let io = TokioIo::new(crate::pipeline::WriteDeadline::new(stream, write_timeout));
@@ -2572,8 +2719,11 @@ pub(crate) fn reconcile_authority<'a, 'h>(
     if http1 && !is_connect {
         return Err("absolute-form request targets are not accepted");
     }
-    if authority.contains('@') {
-        return Err("the request authority must not carry userinfo");
+    // Held to the `Host` grammar (which also rules out userinfo): when `Host`
+    // is absent the authority is copied into it verbatim, and when present
+    // they must match, so it reaches handlers either way.
+    if !is_valid_authority(authority.as_bytes()) {
+        return Err("the request authority is not a valid authority");
     }
     match host {
         Some(host) if !host.eq_ignore_ascii_case(authority.as_bytes()) => {
@@ -4774,6 +4924,14 @@ mod tests {
             );
             assert!(reconcile(version, false, Some("api.example"), &["admin.example"]).is_err());
             assert!(reconcile(version, false, Some("u@api.example"), &[]).is_err());
+            // An authority copied into an absent `Host` is held to the same
+            // grammar a `Host` header is.
+            for bad in ["a b", "api.example:99999", "api.example:+80", "a/b", "[zz]"] {
+                assert!(
+                    reconcile(version, false, Some(bad), &[]).is_err(),
+                    "{version:?} {bad}"
+                );
+            }
             assert_eq!(reconcile(version, false, None, &["api.example"]), Ok(None));
         }
         assert!(
@@ -5040,6 +5198,58 @@ mod tests {
         assert_eq!(response.status(), 413);
     }
 
+    // ---- accept errors -------------------------------------------------------
+
+    #[test]
+    fn only_descriptor_and_memory_shortages_count_as_exhaustion() {
+        use std::io::{Error as IoError, ErrorKind};
+        #[cfg(unix)]
+        {
+            for code in [libc::EMFILE, libc::ENFILE, libc::ENOBUFS, libc::ENOMEM] {
+                assert!(accept_error_is_resource_exhaustion(
+                    &IoError::from_raw_os_error(code)
+                ));
+            }
+            for code in [libc::ECONNABORTED, libc::EPROTO, libc::EPERM, libc::EINTR] {
+                assert!(!accept_error_is_resource_exhaustion(
+                    &IoError::from_raw_os_error(code)
+                ));
+            }
+        }
+        assert!(accept_error_is_resource_exhaustion(&IoError::from(
+            ErrorKind::OutOfMemory
+        )));
+        assert!(!accept_error_is_resource_exhaustion(&IoError::from(
+            ErrorKind::ConnectionAborted
+        )));
+    }
+
+    /// A failed `accept` — exhaustion or a peer's aborted connection — must
+    /// not end the accept loop; the next connection is still served.
+    #[tokio::test]
+    async fn a_failed_accept_does_not_end_the_accept_loop() {
+        use std::io::{Error as IoError, ErrorKind};
+        let mut script: std::collections::VecDeque<std::io::Result<u32>> = [
+            Err(IoError::from(ErrorKind::OutOfMemory)),
+            Err(IoError::from(ErrorKind::ConnectionAborted)),
+            #[cfg(unix)]
+            Err(IoError::from_raw_os_error(libc::EMFILE)),
+            Ok(7),
+        ]
+        .into();
+        let started = std::time::Instant::now();
+        let accepted = tokio::time::timeout(
+            Duration::from_secs(5),
+            accept_retrying(|| std::future::ready(script.pop_front().unwrap())),
+        )
+        .await
+        .expect("accept_retrying returned");
+        assert_eq!(accepted, 7);
+        assert!(script.is_empty());
+        // Exhaustion backs off rather than spinning.
+        assert!(started.elapsed() >= ACCEPT_EXHAUSTED_BACKOFF);
+    }
+
     // ---- L1: the HTTP→HTTPS redirect ---------------------------------------
 
     #[test]
@@ -5067,6 +5277,8 @@ mod tests {
             "example.com.evil.example",
             "example.com@evil.example",
             "example.com:notaport",
+            // `u16::from_str` takes a sign; the authority grammar does not.
+            "example.com:+80",
             "[::1",
             "",
         ] {

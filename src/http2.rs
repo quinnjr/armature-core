@@ -584,31 +584,31 @@ impl H2ConnectionServer {
         let stats = Arc::clone(&self.stats);
         stats.connection_opened();
 
-        let service =
-            {
+        let service = {
+            let tracker = Arc::clone(&tracker);
+            let stats = Arc::clone(&stats);
+            service_fn(move |req: hyper::Request<IncomingBody>| {
+                // Taken before the handler future exists and handed on to the
+                // response body, so it is released only once the response has
+                // been sent in full or the stream is gone (a reset, the
+                // connection closing): the idle clock runs only while nothing
+                // is in flight. Releasing it when the handler returned left a
+                // response still waiting on the peer's flow-control window
+                // uncounted, and a peer that never opens the window could pin
+                // a stream's worth of response per stream, indefinitely.
+                let active = tracker.begin();
+                stats.request_processed();
+                let state = state.clone();
                 let tracker = Arc::clone(&tracker);
-                let stats = Arc::clone(&stats);
-                service_fn(move |req: hyper::Request<IncomingBody>| {
-                    // Taken before the handler future exists and handed on to the
-                    // response body, so it is released only once the response has
-                    // been sent in full or the stream is gone (a reset, the
-                    // connection closing): the idle clock runs only while nothing
-                    // is in flight. Releasing it when the handler returned left a
-                    // response still waiting on the peer's flow-control window
-                    // uncounted, and a peer that never opens the window could pin
-                    // a stream's worth of response per stream, indefinitely.
-                    let active = tracker.begin();
-                    stats.request_processed();
-                    let state = state.clone();
-                    let tracker = Arc::clone(&tracker);
-                    async move {
-                        let response = crate::application::handle_request(req, state).await?;
-                        Ok::<_, hyper::Error>(response.map(|body| {
-                            TrackedBody::new(body, active, &tracker, limits.write_timeout)
-                        }))
-                    }
-                })
-            };
+                async move {
+                    let rate = state.body_read();
+                    let response = crate::application::handle_request(req, state).await?;
+                    Ok::<_, hyper::Error>(response.map(|body| {
+                        TrackedBody::new(body, active, &tracker, limits.write_timeout, rate)
+                    }))
+                }
+            })
+        };
 
         let io = hyper_util::rt::TokioIo::new(crate::pipeline::WriteDeadline::new(
             io,
@@ -627,15 +627,13 @@ impl H2ConnectionServer {
                         break None;
                     };
                     // hyper cannot reset one stream from out here, so a
-                    // response the peer has stopped accepting closes the
-                    // connection, the way a stalled write does on HTTP/1.1.
-                    match limits
-                        .write_timeout
-                        .map(|limit| tracker.next_stall_deadline(now, limit))
-                    {
-                        Some(Err(Stalled)) => break None,
-                        Some(Ok(Some(stall))) => deadline = next.min(stall),
-                        _ => deadline = next,
+                    // response the peer has stopped accepting (or accepts too
+                    // slowly) closes the connection, the way a stalled write
+                    // does on HTTP/1.1.
+                    match tracker.next_stall_deadline(now) {
+                        Err(Stalled) => break None,
+                        Ok(Some(stall)) => deadline = next.min(stall),
+                        Ok(None) => deadline = next,
                     }
                 }
             }
@@ -684,12 +682,13 @@ pub(crate) struct StreamTracker {
     /// When `active` last fell to zero, as nanoseconds since `started`.
     idle_since_nanos: AtomicU64,
     /// The response bodies still being sent, each as the moment (nanoseconds
-    /// since `started`) it last made progress. Weak, so a finished body drops
-    /// out by itself; the watcher sweeps the dead entries.
+    /// since `started`) by which it must next make progress. Weak, so a
+    /// finished body drops out by itself; the watcher sweeps the dead entries.
     responses: std::sync::Mutex<Vec<std::sync::Weak<AtomicU64>>>,
 }
 
-/// A response body made no progress within the write timeout.
+/// A response body missed its progress deadline: no progress within the write
+/// timeout, or below the minimum rate.
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) struct Stalled;
 
@@ -709,10 +708,11 @@ impl StreamTracker {
         u64::try_from(at.saturating_duration_since(self.started).as_nanos()).unwrap_or(u64::MAX)
     }
 
-    /// Start watching a response body for progress; the body stamps the
-    /// returned clock each time it is polled.
-    fn watch_response(&self) -> Arc<AtomicU64> {
-        let clock = Arc::new(AtomicU64::new(self.nanos_at(tokio::time::Instant::now())));
+    /// Start watching a response body that must first make progress by
+    /// `deadline`; the body moves the returned deadline each time it is
+    /// polled.
+    fn watch_response(&self, deadline: tokio::time::Instant) -> Arc<AtomicU64> {
+        let clock = Arc::new(AtomicU64::new(self.nanos_at(deadline)));
         if let Ok(mut responses) = self.responses.lock() {
             // Sweep here as well as in the watcher, so a busy connection whose
             // watcher rarely runs does not accumulate finished entries.
@@ -724,12 +724,11 @@ impl StreamTracker {
         clock
     }
 
-    /// When a response body next could have stalled past `write_timeout`,
-    /// `Ok(None)` if none is being sent, or [`Stalled`] if one already has.
+    /// The earliest progress deadline of the response bodies being sent,
+    /// `Ok(None)` if none is, or [`Stalled`] if one has already passed.
     pub(crate) fn next_stall_deadline(
         &self,
         now: tokio::time::Instant,
-        write_timeout: Duration,
     ) -> Result<Option<tokio::time::Instant>, Stalled> {
         let Ok(mut responses) = self.responses.lock() else {
             return Ok(None);
@@ -746,7 +745,7 @@ impl StreamTracker {
         let Some(oldest) = oldest else {
             return Ok(None);
         };
-        let expires = self.started + Duration::from_nanos(oldest) + write_timeout;
+        let expires = self.started + Duration::from_nanos(oldest);
         if expires <= now {
             Err(Stalled)
         } else {
@@ -799,7 +798,8 @@ const RESPONSE_CHUNK: usize = 16 * 1024;
 /// A response body that keeps its stream counted as in flight until it has
 /// been sent (or the stream is gone), and reports its progress to the
 /// connection's watcher, which closes the connection when one stops making
-/// any for the write timeout.
+/// any for the write timeout, or falls below the minimum rate of the
+/// [`BodyReadPolicy`](crate::BodyReadPolicy).
 ///
 /// A peer can stop a response dead without stalling the socket: advertise a
 /// zero (or never-replenished) stream window and the body waits on credit
@@ -808,13 +808,26 @@ const RESPONSE_CHUNK: usize = 16 * 1024;
 /// such a stream was not even counted as in flight, so the connection could
 /// also go on serving cheap requests, resetting its idle clock, while up to
 /// `max_concurrent_streams` large responses sat pinned in memory.
+///
+/// Progress alone is not enough either: a peer that grants one chunk's worth
+/// of window just inside every write timeout never stalls, yet holds the
+/// stream (and its buffered response) for `size / chunk × write_timeout` —
+/// hours, for a large body. So the body must also keep to the policy's
+/// minimum rate: chunk `k` must be accepted by `grace + bytes_before_k /
+/// min_bytes_per_sec` after the response started.
 pub(crate) struct TrackedBody {
     /// Bytes not yet handed to hyper.
     pending: bytes::Bytes,
     inner: http_body_util::Full<bytes::Bytes>,
-    /// Stamped on every poll; `None` without a write timeout.
+    /// The deadline for the next poll, moved on every poll; `None` with
+    /// neither a write timeout nor a rate rule.
     progress: Option<Arc<AtomicU64>>,
     tracker: Arc<StreamTracker>,
+    write_timeout: Option<Duration>,
+    rate: crate::BodyReadPolicy,
+    started: tokio::time::Instant,
+    /// Bytes handed to hyper so far.
+    sent: usize,
     _active: ActiveStream,
 }
 
@@ -824,18 +837,42 @@ impl TrackedBody {
         active: ActiveStream,
         tracker: &Arc<StreamTracker>,
         write_timeout: Option<Duration>,
+        rate: crate::BodyReadPolicy,
     ) -> Self {
         use hyper::body::Body as _;
-        // A body with nothing to send is never polled: hyper ends the stream
-        // with the headers.
-        let progress =
-            (write_timeout.is_some() && !inner.is_end_stream()).then(|| tracker.watch_response());
-        Self {
+        let started = tokio::time::Instant::now();
+        let mut body = Self {
             pending: bytes::Bytes::new(),
             inner,
-            progress,
+            progress: None,
             tracker: Arc::clone(tracker),
+            write_timeout,
+            rate,
+            started,
+            sent: 0,
             _active: active,
+        };
+        // A body with nothing to send is never polled: hyper ends the stream
+        // with the headers.
+        if !body.inner.is_end_stream()
+            && let Some(deadline) = body.next_deadline(started)
+        {
+            body.progress = Some(tracker.watch_response(deadline));
+        }
+        body
+    }
+
+    /// When the next poll is due, having sent `self.sent` bytes by `now`: the
+    /// sooner of the stall bound and the minimum-rate bound.
+    fn next_deadline(&self, now: tokio::time::Instant) -> Option<tokio::time::Instant> {
+        let stall = self.write_timeout.map(|limit| now + limit);
+        let rate = self
+            .rate
+            .rate_budget(self.sent)
+            .map(|budget| self.started + budget);
+        match (stall, rate) {
+            (Some(a), Some(b)) => Some(a.min(b)),
+            (a, b) => a.or(b),
         }
     }
 }
@@ -850,12 +887,6 @@ impl hyper::body::Body for TrackedBody {
     ) -> std::task::Poll<Option<Result<hyper::body::Frame<Self::Data>, Self::Error>>> {
         use std::task::Poll;
         let this = &mut *self;
-        if let Some(progress) = &this.progress {
-            progress.store(
-                this.tracker.nanos_at(tokio::time::Instant::now()),
-                Ordering::Release,
-            );
-        }
         if this.pending.is_empty() {
             match std::pin::Pin::new(&mut this.inner).poll_frame(cx) {
                 Poll::Ready(Some(Ok(frame))) => match frame.into_data() {
@@ -866,6 +897,15 @@ impl hyper::body::Body for TrackedBody {
             }
         }
         let n = this.pending.len().min(RESPONSE_CHUNK);
+        // hyper polls again only once this chunk is queued against the peer's
+        // window, so the next poll is due by when the bytes handed out so far
+        // (this chunk included) would meet the minimum rate.
+        this.sent = this.sent.saturating_add(n);
+        if let Some(progress) = &this.progress
+            && let Some(deadline) = this.next_deadline(tokio::time::Instant::now())
+        {
+            progress.store(this.tracker.nanos_at(deadline), Ordering::Release);
+        }
         Poll::Ready(Some(Ok(hyper::body::Frame::data(this.pending.split_to(n)))))
     }
 
@@ -1086,6 +1126,14 @@ mod tests {
     async fn serve_one(
         server: H2ConnectionServer,
     ) -> (tokio::net::TcpStream, tokio::task::JoinHandle<Instant>) {
+        serve_one_with(server, state()).await
+    }
+
+    /// [`serve_one`] with a given state.
+    async fn serve_one_with(
+        server: H2ConnectionServer,
+        state: ServeState,
+    ) -> (tokio::net::TcpStream, tokio::task::JoinHandle<Instant>) {
         let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
             .await
             .unwrap();
@@ -1093,7 +1141,7 @@ mod tests {
         let client = tokio::net::TcpStream::connect(addr).await.unwrap();
         let (stream, _) = listener.accept().await.unwrap();
         let done = tokio::spawn(async move {
-            let _ = server.serve(stream, state()).await;
+            let _ = server.serve(stream, state).await;
             Instant::now()
         });
         (client, done)
@@ -1312,20 +1360,97 @@ mod tests {
         assert!(started.elapsed() >= Duration::from_millis(400));
     }
 
+    /// Read `/big` with a 16 KiB stream window, pausing `pause` after every
+    /// frame, from a server whose minimum response rate is `min_rate` (after
+    /// a 200 ms grace) and whose write timeout is far longer than any pause.
+    /// Returns the bytes received and whether the body ended cleanly.
+    async fn read_big_at(pause: Duration, min_rate: u64) -> (usize, bool) {
+        let limits = H2ConnectionLimits {
+            handshake_timeout: Duration::from_millis(500),
+            idle_timeout: Duration::from_millis(300),
+            shutdown_grace: Duration::from_millis(200),
+            write_timeout: Some(Duration::from_secs(5)),
+            body_budget: 1024,
+        };
+        let server = Http2Builder::new()
+            .connection_server(&crate::pipeline::PipelineConfig::default(), 1024)
+            .with_limits(limits);
+        let policy = crate::BodyReadPolicy {
+            idle_timeout: Duration::from_millis(200),
+            min_bytes_per_sec: min_rate,
+        };
+        let (client, _done) = serve_one_with(server, state().with_body_read_for_test(policy)).await;
+        let mut builder =
+            hyper::client::conn::http2::Builder::new(hyper_util::rt::TokioExecutor::new());
+        builder
+            .initial_stream_window_size(16 * 1024)
+            .adaptive_window(false);
+        let (mut sender, conn) = builder
+            .handshake::<_, Empty<Bytes>>(hyper_util::rt::TokioIo::new(client))
+            .await
+            .expect("h2 handshake");
+        tokio::spawn(conn);
+
+        let request = hyper::Request::get("http://localhost/big")
+            .body(Empty::<Bytes>::new())
+            .unwrap();
+        let response = sender.send_request(request).await.expect("head served");
+        let mut body = response.into_body();
+        let mut received = 0usize;
+        loop {
+            match body.frame().await {
+                None => return (received, true),
+                Some(Err(_)) => return (received, false),
+                Some(Ok(frame)) => received += frame.into_data().map_or(0, |d| d.len()),
+            }
+            tokio::time::sleep(pause).await;
+        }
+    }
+
+    /// The finding: the stall check only asked for *some* progress per write
+    /// timeout, so a peer granting one chunk of window just inside it held a
+    /// stream (and its whole buffered response) for hours. A response
+    /// accepted below the minimum rate now gets the connection closed.
+    #[tokio::test]
+    async fn a_response_accepted_below_the_minimum_rate_closes_the_connection() {
+        // ~160 KiB/s against a 256 KiB/s floor; 1 MiB would take ~6.4 s.
+        let (received, complete) = tokio::time::timeout(
+            Duration::from_secs(3),
+            read_big_at(Duration::from_millis(100), 256 * 1024),
+        )
+        .await
+        .expect("a below-rate response must be cut off, not trickled out");
+        assert!(!complete && received < 1 << 20, "received {received}");
+    }
+
+    /// A reader slower than the network but above the floor is served in full.
+    #[tokio::test]
+    async fn a_response_accepted_above_the_minimum_rate_completes() {
+        // ~800 KiB/s against a 64 KiB/s floor.
+        let (received, complete) = tokio::time::timeout(
+            Duration::from_secs(10),
+            read_big_at(Duration::from_millis(20), 64 * 1024),
+        )
+        .await
+        .expect("served in time");
+        assert!(complete);
+        assert_eq!(received, 1 << 20);
+    }
+
     #[tokio::test]
     async fn the_tracker_reports_a_stalled_response() {
         let tracker = Arc::new(StreamTracker::new());
-        let limit = Duration::from_millis(100);
         let now = tokio::time::Instant::now();
-        assert_eq!(tracker.next_stall_deadline(now, limit), Ok(None));
-        let clock = tracker.watch_response();
+        assert_eq!(tracker.next_stall_deadline(now), Ok(None));
+        let clock = tracker.watch_response(now + Duration::from_millis(100));
         let expires = tracker
-            .next_stall_deadline(now, limit)
+            .next_stall_deadline(now)
             .unwrap()
             .expect("one response pending");
-        assert_eq!(tracker.next_stall_deadline(expires, limit), Err(Stalled));
+        assert_eq!(expires, now + Duration::from_millis(100));
+        assert_eq!(tracker.next_stall_deadline(expires), Err(Stalled));
         drop(clock);
-        assert_eq!(tracker.next_stall_deadline(expires, limit), Ok(None));
+        assert_eq!(tracker.next_stall_deadline(expires), Ok(None));
     }
 
     #[tokio::test]

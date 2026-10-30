@@ -20,10 +20,51 @@ use std::collections::HashMap;
 const INLINE_HEADERS: usize = 8;
 
 /// Fast inline header storage.
-#[derive(Debug, Clone)]
+///
+/// `Debug` redacts the value of a sensitive header (`Set-Cookie`,
+/// `Authorization`, ...), like every other header container in the crate.
+#[derive(Clone)]
 pub struct FastHeader {
     pub name: CompactString,
     pub value: CompactString,
+}
+
+impl std::fmt::Debug for FastHeader {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let value = if crate::headers::is_sensitive_header(&self.name) {
+            crate::headers::REDACTED
+        } else {
+            self.value.as_str()
+        };
+        f.debug_struct("FastHeader")
+            .field("name", &self.name.as_str())
+            .field("value", &value)
+            .finish()
+    }
+}
+
+impl std::fmt::Debug for FastHeaders {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        crate::headers::RedactedHeaders(
+            self.inner
+                .iter()
+                .map(|h| (h.name.as_str(), h.value.as_bytes()))
+                .collect(),
+        )
+        .fmt(f)
+    }
+}
+
+impl std::fmt::Debug for FastBody {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let kind = match self {
+            FastBody::Empty => "Empty",
+            FastBody::Static(_) => "Static",
+            FastBody::Bytes(_) => "Bytes",
+            FastBody::Owned(_) => "Owned",
+        };
+        f.debug_struct(kind).field("len", &self.len()).finish()
+    }
 }
 
 impl FastHeader {
@@ -37,7 +78,7 @@ impl FastHeader {
 }
 
 /// Fast headers using inline SmallVec storage.
-#[derive(Debug, Clone, Default)]
+#[derive(Clone, Default)]
 pub struct FastHeaders {
     inner: SmallVec<[FastHeader; INLINE_HEADERS]>,
 }
@@ -105,7 +146,9 @@ impl FastHeaders {
 }
 
 /// Body storage optimized for common cases.
-#[derive(Debug, Clone)]
+///
+/// `Debug` prints the storage kind and length, never the bytes.
+#[derive(Clone)]
 pub enum FastBody {
     /// No body (zero allocation).
     Empty,
@@ -198,11 +241,21 @@ impl FastBody {
 /// - Small headers: Inline SmallVec storage (≤8 headers)
 /// - Static bodies: Zero-copy from compile-time data
 /// - Bytes bodies: Zero-copy reference counting
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct FastResponse {
     pub status: u16,
     pub headers: FastHeaders,
     pub body: FastBody,
+}
+
+impl std::fmt::Debug for FastResponse {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("FastResponse")
+            .field("status", &self.status)
+            .field("headers", &self.headers)
+            .field("body", &self.body)
+            .finish()
+    }
 }
 
 impl Default for FastResponse {
@@ -512,6 +565,20 @@ pub mod fast {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_fast_response_debug_redacts() {
+        let resp = FastResponse::ok()
+            .header("Set-Cookie", "session=abc123")
+            .header("Content-Type", "text/plain")
+            .with_body(b"secret-body".to_vec());
+        let dbg = format!("{resp:?}");
+        assert!(!dbg.contains("abc123"), "{dbg}");
+        assert!(!dbg.contains("secret-body"), "{dbg}");
+        assert!(dbg.contains("text/plain"), "{dbg}");
+        let h = FastHeader::new("Authorization", "Bearer tok");
+        assert!(!format!("{h:?}").contains("tok\""));
+    }
 
     #[test]
     fn test_fast_response_ok() {

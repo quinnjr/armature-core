@@ -50,40 +50,81 @@ use std::sync::{Arc, LazyLock};
 /// with its replacement string. Behaviour is identical to compiling the same
 /// patterns per-call; only the compilation cost is amortized.
 static SENSITIVE_PATTERNS: LazyLock<Vec<(regex::Regex, &'static str)>> = LazyLock::new(|| {
-    let patterns: [(&str, &str); 10] = [
+    // Key names in the spirit of `SENSITIVE_HEADER_FRAGMENTS`: false positives
+    // cost a `[FILTERED]`, false negatives leak a credential.
+    //
+    // SUBSTRING_KEYS may appear anywhere in a key (`new_password`,
+    // `x_session_id`). DELIMITED_KEYS are short enough to occur inside
+    // innocent words (`shipping`, `businessname`), so they match only as a
+    // whole key or a `_`/`-`-separated final segment (`user_pin`, `sms-otp`).
+    // A bare `code` is the OAuth authorization code in a query/form body; in
+    // JSON it is too often an error code, so only qualified `*_code` keys are
+    // filtered there.
+    const SUBSTRING_KEYS: &str = "password|passwd|pwd|secret|token|api[_-]?key|apikey|\
+                                  authorization|session|credential|cvv|cvc|private[_-]?key";
+    const DELIMITED_KEYS: &str = "pin|otp|totp|ssn";
+    const CODE_KEYS: &str = "(?:auth|authorization|oauth|otp|totp|mfa|2fa|sms|verification|\
+                             verify|access|reset|recovery|security|confirmation|one[_-]?time)[_-]?code";
+    // A JSON value: a string (escapes honoured) or a bare number.
+    const JSON_VALUE: &str = r#"(?:"(?:[^"\\]|\\.)*"|-?[0-9][0-9.eE+-]*)"#;
+
+    let json_substring =
+        format!(r#""([a-z0-9_-]*(?:{SUBSTRING_KEYS})[a-z0-9_-]*)"\s*:\s*{JSON_VALUE}"#);
+    let json_delimited =
+        format!(r#""((?:[a-z0-9]+[_-])*(?:{DELIMITED_KEYS}|{CODE_KEYS}))"\s*:\s*{JSON_VALUE}"#);
+    let form_substring =
+        String::from(r"\b([a-z0-9_-]*(?:passwd|session|credential|cvv|cvc)[a-z0-9_-]*)[=:]\s*\S+");
+    let form_delimited =
+        format!(r"\b((?:[a-z0-9]+[_-])*(?:{DELIMITED_KEYS}|{CODE_KEYS}|code))[=:]\s*\S+");
+
+    let patterns: Vec<(String, &str)> = vec![
         // JSON members whose key names a credential: `"password": "x"`.
         // The key-only patterns below need `=`/`:` right after the key, so a
         // quoted JSON key would slip past them.
+        (json_substring, r#""$1":"[FILTERED]""#),
+        (json_delimited, r#""$1":"[FILTERED]""#),
+        // `Authorization: <scheme> <credentials>`, scheme included, before the
+        // bare-key patterns: matching only up to the scheme would leave the
+        // credential itself behind.
         (
-            r#""([a-z0-9_-]*(?:password|passwd|pwd|secret|token|api[_-]?key|apikey)[a-z0-9_-]*)"\s*:\s*"(?:[^"\\]|\\.)*""#,
-            r#""$1":"[FILTERED]""#,
+            r"authorization[=:]\s*(?:(?:bearer|basic|digest|negotiate|token)\s+)?\S+".into(),
+            "authorization=[FILTERED]",
         ),
         // Passwords
-        (r"password[=:]\s*\S+", "password=[FILTERED]"),
-        (r"pwd[=:]\s*\S+", "pwd=[FILTERED]"),
+        (r"password[=:]\s*\S+".into(), "password=[FILTERED]"),
+        (r"pwd[=:]\s*\S+".into(), "pwd=[FILTERED]"),
         // API keys
-        (r"api[_-]?key[=:]\s*\S+", "api_key=[FILTERED]"),
-        (r"apikey[=:]\s*\S+", "apikey=[FILTERED]"),
+        (r"api[_-]?key[=:]\s*\S+".into(), "api_key=[FILTERED]"),
+        (r"apikey[=:]\s*\S+".into(), "apikey=[FILTERED]"),
         // Tokens
-        (r"token[=:]\s*\S+", "token=[FILTERED]"),
-        (r"bearer\s+\S+", "Bearer [FILTERED]"),
+        (r"token[=:]\s*\S+".into(), "token=[FILTERED]"),
+        (r"bearer\s+\S+".into(), "Bearer [FILTERED]"),
+        // Basic credentials are base64 `user:pass`; the length floor keeps
+        // prose such as "basic auth failed" intact.
+        (r"\bbasic\s+[a-z0-9+/]{6,}=*".into(), "Basic [FILTERED]"),
         // Secrets
-        (r"secret[=:]\s*\S+", "secret=[FILTERED]"),
+        (r"secret[=:]\s*\S+".into(), "secret=[FILTERED]"),
+        // Session ids, passwd, card security codes, PINs, OTPs, SSNs and
+        // one-time/authorization codes in `key=value` / `key: value` form.
+        (form_substring, "$1=[FILTERED]"),
+        (form_delimited, "$1=[FILTERED]"),
         // Credit cards (simple pattern)
         (
-            r"\b\d{4}[- ]?\d{4}[- ]?\d{4}[- ]?\d{4}\b",
+            r"\b\d{4}[- ]?\d{4}[- ]?\d{4}[- ]?\d{4}\b".into(),
             "[CARD FILTERED]",
         ),
         // SSN
-        (r"\b\d{3}[- ]?\d{2}[- ]?\d{4}\b", "[SSN FILTERED]"),
+        (r"\b\d{3}[- ]?\d{2}[- ]?\d{4}\b".into(), "[SSN FILTERED]"),
     ];
 
     patterns
         .into_iter()
         .filter_map(|(pattern, replacement)| {
-            regex::Regex::new(&format!("(?i){pattern}"))
-                .ok()
-                .map(|re| (re, replacement))
+            let re = regex::Regex::new(&format!("(?i){pattern}"));
+            // A typo here would silently drop a redaction rule in release
+            // builds; make it loud in tests.
+            debug_assert!(re.is_ok(), "bad redaction pattern {pattern}: {re:?}");
+            re.ok().map(|re| (re, replacement))
         })
         .collect()
 });
@@ -92,8 +133,9 @@ static SENSITIVE_PATTERNS: LazyLock<Vec<(regex::Regex, &'static str)>> = LazyLoc
 /// [`SENSITIVE_PATTERNS`].
 ///
 /// Best-effort: it recognizes `key=value`, `key: value` and JSON
-/// `"key": "value"` shapes for password/secret/token/API-key names, bearer
-/// tokens, and card/SSN-like digit runs. It is not a guarantee that arbitrary
+/// `"key": "value"` shapes for password/secret/token/API-key/authorization/
+/// session/credential/PIN/OTP/CVV/SSN/one-time-code names, bearer and basic
+/// credentials, and card/SSN-like digit runs. It is not a guarantee that arbitrary
 /// payloads are free of secrets.
 pub(crate) fn redact_sensitive(s: &str) -> String {
     let mut result = s.to_string();
@@ -1748,6 +1790,42 @@ mod tests {
 
         // Non-secret email address is preserved (not part of the redaction set).
         assert!(filtered.contains("user@example.com"));
+    }
+
+    /// The widened key set: authorization schemes, basic credentials, PINs,
+    /// OTPs, CVVs, SSNs, session ids, passwd and one-time codes, in form and
+    /// JSON shapes -- without eating innocent words that contain them.
+    #[test]
+    fn test_redact_sensitive_widened_keys() {
+        let cases = [
+            "Authorization: Basic dXNlcjpodW50ZXIy",
+            "authorization=Bearer s3cr3tv4l",
+            "basic dXNlcjpodW50ZXIy",
+            "pin=4821 otp=992211 cvv=737 ssn=078051120",
+            "session_id=s3cr3tv4l passwd=s3cr3tv4l",
+            "code=s3cr3tv4l&state=xyz",
+            r#"{"pin":"4821","sms_otp":992211,"cvv":"737","ssn":"078051120"}"#,
+            r#"{"session":"s3cr3tv4l","passwd":"s3cr3tv4l","verification_code":"s3cr3tv4l"}"#,
+            r#"{"authorization":"Bearer s3cr3tv4l","card_cvc":"737"}"#,
+        ];
+        for input in cases {
+            let out = redact_sensitive(input);
+            for secret in [
+                "dXNlcjpodW50ZXIy",
+                "s3cr3tv4l",
+                "4821",
+                "992211",
+                "737",
+                "078051120",
+            ] {
+                assert!(!out.contains(secret), "{input} -> {out}");
+            }
+        }
+
+        // Words that merely contain a short key stay readable.
+        let benign =
+            r#"shipping=ground spinner=on {"error_code":"E42","mapping":"x"} basic auth failed"#;
+        assert_eq!(redact_sensitive(benign), benign);
     }
 
     #[test]

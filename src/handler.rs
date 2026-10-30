@@ -171,9 +171,10 @@ struct HandlerWrapper<H: Handler> {
     _marker: PhantomData<fn() -> H::Future>,
 }
 
-// Safety: HandlerWrapper is Send + Sync if H is Send + Sync
-unsafe impl<H: Handler> Send for HandlerWrapper<H> {}
-unsafe impl<H: Handler> Sync for HandlerWrapper<H> {}
+// No `unsafe impl Send/Sync`: `Handler` already requires `Send + Sync`, and
+// `PhantomData<fn() -> _>` is both whatever the future is, so the auto traits
+// hold on their own — an unconditional unsafe impl could only ever hide a
+// future bound being loosened.
 
 impl<H: Handler> ErasedHandler for HandlerWrapper<H> {
     #[inline(always)]

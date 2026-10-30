@@ -282,20 +282,20 @@ impl OwnedParsedRequest {
     }
 
     /// Convert to HttpRequest
-    pub fn to_http_request(&self) -> crate::HttpRequest {
-        let mut req = crate::HttpRequest::new(self.method.clone(), self.path.clone());
-
-        for (name, value) in &self.headers {
-            if let Ok(v) = std::str::from_utf8(value) {
-                req.headers.insert(name.clone(), v.to_string());
-            }
-        }
-
-        if !self.body.is_empty() {
-            req.set_body_bytes(self.body.clone());
-        }
-
-        req
+    ///
+    /// # Errors
+    ///
+    /// [`Error::BadRequest`](crate::Error::BadRequest) when `Host` and the
+    /// request target break the rules every serve path enforces (see
+    /// [`ParsedRequest::to_http_request`]).
+    pub fn to_http_request(&self) -> Result<crate::HttpRequest, crate::Error> {
+        build_http_request(
+            &self.method,
+            &self.path,
+            &self.version,
+            self.headers.iter().map(|(n, v)| (n.as_str(), v.as_slice())),
+            self.body.clone(),
+        )
     }
 }
 
@@ -348,21 +348,76 @@ impl<'a> ParsedRequest<'a> {
     }
 
     /// Convert to owned HttpRequest
-    pub fn to_http_request(&self) -> crate::HttpRequest {
-        let mut req = crate::HttpRequest::new(self.method.to_string(), self.path.to_string());
-
-        for (name, value) in &self.headers {
-            if let Ok(v) = std::str::from_utf8(value) {
-                req.headers.insert(name, v);
-            }
-        }
-
-        if !self.body.is_empty() {
-            req.set_body_bytes(Bytes::copy_from_slice(self.body));
-        }
-
-        req
+    ///
+    /// Held to the same `Host` rules as every serve path (see
+    /// `application::reconcile_authority`): exactly one syntactically valid
+    /// `Host` on HTTP/1.1, none that is malformed or repeated, and no
+    /// absolute-form target. A request built here would otherwise reach a
+    /// virtual-host router or a redirect builder carrying a `Host` that no
+    /// listener would have let through.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::BadRequest`](crate::Error::BadRequest) naming the rule broken.
+    pub fn to_http_request(&self) -> Result<crate::HttpRequest, crate::Error> {
+        build_http_request(
+            self.method,
+            self.path,
+            self.version,
+            self.headers.iter().copied(),
+            Bytes::copy_from_slice(self.body),
+        )
     }
+}
+
+/// The conversion behind both `to_http_request`s.
+fn build_http_request<'h>(
+    method: &str,
+    path: &str,
+    version: &str,
+    headers: impl Iterator<Item = (&'h str, &'h [u8])> + Clone,
+    body: Bytes,
+) -> Result<crate::HttpRequest, crate::Error> {
+    let http_version = match version {
+        "1.0" => http::Version::HTTP_10,
+        "0.9" => http::Version::HTTP_09,
+        _ => http::Version::HTTP_11,
+    };
+    // An origin-form target ("/path") has no authority; absolute-form and
+    // CONNECT's authority-form do, and `reconcile_authority` decides them.
+    let target = (!path.starts_with('/'))
+        .then(|| path.parse::<http::Uri>().ok())
+        .flatten();
+    let host_from_authority = crate::application::reconcile_authority(
+        http_version,
+        method.eq_ignore_ascii_case("CONNECT"),
+        target
+            .as_ref()
+            .and_then(|uri| uri.authority())
+            .map(|a| a.as_str()),
+        headers
+            .clone()
+            .filter(|(name, _)| name.eq_ignore_ascii_case("host"))
+            .map(|(_, value)| value),
+    )
+    .map_err(|reason| crate::Error::BadRequest(reason.to_string()))?;
+
+    let mut req = crate::HttpRequest::new(method.to_string(), path.to_string());
+    // `append`, not `insert`: a repeated field (`X-Forwarded-For`) must keep
+    // every occurrence, as it does on the serve paths, or a proxy-trust policy
+    // reads only whichever copy happened to come last.
+    for (name, value) in headers {
+        if let Ok(v) = std::str::from_utf8(value) {
+            req.headers.append(name, v);
+        }
+    }
+    if let Some(host) = host_from_authority {
+        req.headers.append("host", host);
+    }
+    if !body.is_empty() {
+        req.set_body_bytes(body);
+    }
+    Ok(req)
 }
 
 // ============================================================================
@@ -1060,7 +1115,7 @@ mod tests {
         let result = parser.parse_batch(request);
         assert_eq!(result.requests.len(), 1);
 
-        let http_req = result.requests[0].to_http_request();
+        let http_req = result.requests[0].to_http_request().unwrap();
         assert_eq!(http_req.method, "POST");
         assert_eq!(http_req.path, "/api/data");
         assert_eq!(
@@ -1068,6 +1123,52 @@ mod tests {
             Some("application/json")
         );
         assert_eq!(http_req.body_ref(), b"{\"key\":\"val\"}");
+    }
+
+    /// Repeated fields keep every occurrence, and `Host` is held to the
+    /// serve paths' rules rather than collapsed or passed through unchecked.
+    #[test]
+    fn to_http_request_keeps_repeated_headers_and_checks_host() {
+        let parser = BatchParser::new(BatchConfig::default());
+        let ok = b"GET / HTTP/1.1\r\nHost: a.example\r\nX-Forwarded-For: 1.1.1.1\r\nX-Forwarded-For: 2.2.2.2\r\n\r\n";
+        let result = parser.parse_batch(ok);
+        let req = result.requests[0].to_http_request().unwrap();
+        assert_eq!(
+            req.headers.get_all("x-forwarded-for"),
+            vec!["1.1.1.1", "2.2.2.2"]
+        );
+        let owned = |r: &ParsedRequest<'_>| OwnedParsedRequest {
+            method: r.method.to_string(),
+            path: r.path.to_string(),
+            version: r.version.to_string(),
+            headers: r
+                .headers
+                .iter()
+                .map(|(k, v)| (k.to_string(), v.to_vec()))
+                .collect(),
+            body: Bytes::copy_from_slice(r.body),
+            bytes_consumed: r.bytes_consumed,
+        };
+        let req = owned(&result.requests[0]).to_http_request().unwrap();
+        assert_eq!(req.headers.get_all("x-forwarded-for").len(), 2);
+
+        for bad in [
+            &b"GET / HTTP/1.1\r\nHost: a.example\r\nHost: b.example\r\n\r\n"[..],
+            b"GET / HTTP/1.1\r\nHost: victim.example@evil.example\r\n\r\n",
+            b"GET / HTTP/1.1\r\n\r\n",
+            b"GET http://a.example/ HTTP/1.1\r\nHost: a.example\r\n\r\n",
+        ] {
+            let result = parser.parse_batch(bad);
+            assert!(
+                matches!(
+                    result.requests[0].to_http_request(),
+                    Err(crate::Error::BadRequest(_))
+                ),
+                "{}",
+                String::from_utf8_lossy(bad)
+            );
+            assert!(owned(&result.requests[0]).to_http_request().is_err());
+        }
     }
 
     #[test]

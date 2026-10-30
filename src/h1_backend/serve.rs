@@ -221,6 +221,10 @@ pub(crate) async fn serve_bound(
     let tls = cfg.tls.is_some();
     let workers = cfg.workers;
     let idle_timeout = cfg.limits.idle_timeout;
+    // The whole-listener cap: `max_connections` here is per worker.
+    crate::application::warn_if_connection_cap_exceeds_fd_limit(
+        cfg.limits.max_connections.saturating_mul(workers),
+    );
 
     let server = Server::bind(cfg).map_err(|e| {
         error!(address = %requested, error = %e, "failed to bind");

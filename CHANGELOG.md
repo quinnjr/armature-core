@@ -98,6 +98,7 @@ Changes at or before `0.6.0` are recorded in the workspace
 - **Behaviour (round 4):** `CacheInterceptor` stores only responses marked `public`/`s-maxage`; `SecurityHeadersMiddleware` sends `X-XSS-Protection: 0`.
 - **Behaviour:** `handle_websocket` closes connections idle for 300 s; a layered route's `Route::constraints` is `None` (they are enforced inside its handler); hyper HTTP/1.1 requests without `Host` are `400`.
 - Dependencies are server-only and ring-only: hyper drops `full`, tokio-tungstenite drops `connect`, rustls/tokio-rustls/quinn drop their default features (no aws-lc, no platform verifier). `Cargo.lock` is committed and CI builds `--locked`; `cargo deny` runs in CI and weekly (including the fuzz workspace, which now has its own lockfile); zstd is built encode-only (its C decoder features are banned in `deny.toml`, which also denies yanked crates); the unused `armature-log` dependency is removed; CI also builds, lints and tests the hyper HTTP/1.1 transport (`--no-default-features`); Dependabot waits seven days before proposing a release; the crate publishes only to crates.io; the published crate excludes CI config, hooks and the fuzz workspace; cargo-husky is removed (enable the hooks with `git config core.hooksPath .cargo-husky/hooks`).
+- `sha2` 0.10 → 0.11 (drops the duplicate `digest`/`generic-array` versions; ETag and cache-key digests are unchanged). CI pins the stable toolchain to 1.99.0 instead of tracking `stable`; the fuzz job stays on nightly.
 
 ## [0.12.0] - 2026-10-29
 

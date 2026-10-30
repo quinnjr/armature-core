@@ -39,7 +39,7 @@
 //! ## Internal (`__`-prefixed) implementation details — no semver guarantee
 //!
 //! Items prefixed with `__` in this module (and anything they expand to,
-//! e.g. via [`__armature_register_lifecycle_hooks`]) are internal
+//! e.g. via `__armature_register_lifecycle_hooks`) are internal
 //! implementation details of the `#[module(...)]` / `provider_registration!`
 //! macros. They carry **no semver stability guarantee** and may change or be
 //! removed in any 0.x release without notice. Do not call them directly.
@@ -215,7 +215,7 @@ impl LifecycleManager {
     /// Synchronous, best-effort variant of [`Self::register_on_init`].
     ///
     /// Provider registration (see [`crate::container::Container::attach_lifecycle`]
-    /// and [`crate::module::provider_registration`]) runs synchronously during
+    /// and `provider_registration!`) runs synchronously during
     /// [`crate::Application::create`], so it cannot `.await` the methods
     /// above. Registration happens during single-threaded application
     /// startup, before this manager is shared with any other task, so the

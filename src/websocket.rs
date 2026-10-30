@@ -484,7 +484,11 @@ where
                 }
             }
             Err(e) => {
-                tracing::error!(error = %e, "WebSocket error");
+                // A peer that drops without a close frame, sends a bad frame
+                // or an oversized message: the client's doing, and one any
+                // client can repeat at will, so not a server `error!` (which
+                // stays for handler failures above).
+                tracing::debug!(error = %e, "WebSocket protocol error");
                 return Err(Error::Internal(format!("WebSocket protocol error: {e}")));
             }
         }
@@ -798,6 +802,55 @@ mod tests {
         }
         // Consumption stops at the first failure: "two" is never handled.
         assert_eq!(seen.lock().unwrap().len(), 1);
+    }
+
+    /// Levels of the events emitted while the returned guard is held (on
+    /// this thread, which a current-thread `#[tokio::test]` stays on).
+    fn capture_levels() -> (
+        Arc<Mutex<Vec<tracing::Level>>>,
+        tracing::subscriber::DefaultGuard,
+    ) {
+        use tracing_subscriber::layer::SubscriberExt;
+
+        struct Levels(Arc<Mutex<Vec<tracing::Level>>>);
+        impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for Levels {
+            fn on_event(
+                &self,
+                event: &tracing::Event<'_>,
+                _: tracing_subscriber::layer::Context<'_, S>,
+            ) {
+                self.0.lock().unwrap().push(*event.metadata().level());
+            }
+        }
+        let levels = Arc::new(Mutex::new(Vec::new()));
+        let subscriber = tracing_subscriber::registry().with(Levels(Arc::clone(&levels)));
+        let guard = tracing::subscriber::set_default(subscriber);
+        // Callsite interest is cached process-wide; a parallel test may have
+        // cached "never" for these callsites before this subscriber existed.
+        tracing::callsite::rebuild_interest_cache();
+        (levels, guard)
+    }
+
+    /// A peer that vanishes without a closing handshake is the client's
+    /// doing, not a server fault: it is logged below `error`, so clients
+    /// cannot flood the error log (or page someone) at will.
+    ///
+    /// Only this test reaches the protocol-error callsite, so its interest
+    /// is computed with the capturing subscriber in place. (A matching test
+    /// for the handler-error `error!` would share that callsite with
+    /// `handle_websocket_stops_and_reports_handler_error` on another thread
+    /// and race tracing's global interest cache.)
+    #[tokio::test]
+    async fn peer_protocol_error_is_not_logged_as_error() {
+        let (levels, _guard) = capture_levels();
+        let (client, server) = socket_pair().await;
+        drop(client);
+
+        let result = handle_websocket(server, "gone".to_string(), |_msg| async { Ok(()) }).await;
+        assert!(result.is_err(), "{result:?}");
+        let levels = levels.lock().unwrap();
+        assert!(!levels.is_empty());
+        assert!(!levels.contains(&tracing::Level::ERROR), "{levels:?}");
     }
 
     #[tokio::test]

@@ -258,12 +258,13 @@ impl OwnedParsedRequest {
             .map(|(_, v)| v.as_slice())
     }
 
-    /// Get Content-Length header value
+    /// The `Content-Length` this request was framed with (see
+    /// [`ParsedRequest::content_length`]).
     #[inline]
     pub fn content_length(&self) -> Option<usize> {
-        self.header("content-length")
-            .and_then(|v| std::str::from_utf8(v).ok())
-            .and_then(|s| s.trim().parse().ok())
+        declared_content_length(self.headers.iter().map(|(n, v)| (n.as_str(), v.as_slice())))
+            .ok()
+            .flatten()
     }
 
     /// Check if this is a keep-alive connection
@@ -323,12 +324,16 @@ impl<'a> ParsedRequest<'a> {
             .map(|(_, v)| *v)
     }
 
-    /// Get Content-Length header value
+    /// The `Content-Length` this request was framed with: every
+    /// `Content-Length` line and list element, read by the same strict rules
+    /// as framing. `None` when the request has none (framing then used 0) or
+    /// when they are malformed or disagree (which framing refuses); taking the
+    /// first value loosely would report a length the body was not cut by.
     #[inline]
     pub fn content_length(&self) -> Option<usize> {
-        self.header("content-length")
-            .and_then(|v| std::str::from_utf8(v).ok())
-            .and_then(|s| s.trim().parse().ok())
+        declared_content_length(self.headers.iter().copied())
+            .ok()
+            .flatten()
     }
 
     /// Check if this is a keep-alive connection
@@ -674,10 +679,19 @@ impl BatchParser {
 /// (`http3::reject_malformed_fields`), since two parsers that resolve it
 /// differently disagree about where the request ends.
 fn framing_content_length(headers: &[(&str, &[u8])]) -> Result<usize, BatchParseError> {
+    Ok(declared_content_length(headers.iter().copied())?.unwrap_or(0))
+}
+
+/// [`framing_content_length`] before defaulting: `None` when there is no
+/// `Content-Length` line at all. Shared with the `content_length` helpers so
+/// they cannot disagree with framing.
+fn declared_content_length<'h>(
+    headers: impl IntoIterator<Item = (&'h str, &'h [u8])>,
+) -> Result<Option<usize>, BatchParseError> {
     let malformed = || BatchParseError::InvalidSyntax("Malformed Content-Length".to_string());
     let mut declared: Option<usize> = None;
     for (_, value) in headers
-        .iter()
+        .into_iter()
         .filter(|(name, _)| name.eq_ignore_ascii_case("content-length"))
     {
         for element in value.split(|&b| b == b',') {
@@ -695,7 +709,7 @@ fn framing_content_length(headers: &[(&str, &[u8])]) -> Result<usize, BatchParse
             }
         }
     }
-    Ok(declared.unwrap_or(0))
+    Ok(declared)
 }
 
 // ============================================================================
@@ -1127,6 +1141,49 @@ mod tests {
         assert_eq!(req.content_length(), Some(5));
         assert!(req.is_keep_alive());
         assert_eq!(req.header("host"), Some(b"example.com".as_slice()));
+    }
+
+    /// `content_length()` reports what framing used: the list form a parser
+    /// accepted is that length, and a conflict (which framing refuses) is
+    /// not quietly resolved to the first value.
+    #[test]
+    fn content_length_helper_agrees_with_framing() {
+        let parser = BatchParser::new(BatchConfig::default());
+        let input = b"POST /x HTTP/1.1\r\nHost: a\r\nContent-Length: 5, 5\r\n\r\nhello";
+        let (parsed, _) = parser.parse_single(input).unwrap().unwrap();
+        assert_eq!(parsed.body, b"hello");
+        assert_eq!(parsed.content_length(), Some(5));
+
+        let with_headers = |headers: Vec<(&'static str, &'static [u8])>| ParsedRequest {
+            method: "POST",
+            path: "/x",
+            version: "1.1",
+            headers,
+            body: b"hello",
+            bytes_consumed: 0,
+        };
+        let conflicting = with_headers(vec![("Content-Length", b"5"), ("content-length", b"6")]);
+        assert_eq!(conflicting.content_length(), None);
+        let lenient = with_headers(vec![("Content-Length", b" +5")]);
+        assert_eq!(lenient.content_length(), None);
+        let absent = with_headers(vec![("Host", b"a")]);
+        assert_eq!(absent.content_length(), None);
+
+        let owned = |r: &ParsedRequest<'_>| OwnedParsedRequest {
+            method: r.method.to_string(),
+            path: r.path.to_string(),
+            version: r.version.to_string(),
+            headers: r
+                .headers
+                .iter()
+                .map(|(n, v)| (n.to_string(), v.to_vec()))
+                .collect(),
+            body: Bytes::copy_from_slice(r.body),
+            bytes_consumed: r.bytes_consumed,
+        };
+        assert_eq!(owned(&parsed).content_length(), Some(5));
+        assert_eq!(owned(&conflicting).content_length(), None);
+        assert_eq!(owned(&absent).content_length(), None);
     }
 
     #[test]

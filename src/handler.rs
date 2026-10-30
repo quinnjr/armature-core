@@ -40,7 +40,7 @@ pub trait Handler: Clone + Send + Sync + 'static {
     /// Handle an HTTP request.
     ///
     /// This method should be inlined by the compiler due to monomorphization.
-    /// Note: #[inline] hints are applied in implementations, not trait definitions.
+    /// Note: `#[inline]` hints are applied in implementations, not trait definitions.
     fn call(&self, req: HttpRequest) -> Self::Future;
 }
 
@@ -217,7 +217,7 @@ where
 
 /// Legacy handler function type alias.
 ///
-/// This type uses double dynamic dispatch (dyn Fn + Box<dyn Future>) which
+/// This type uses double dynamic dispatch (`dyn Fn` + `Box<dyn Future>`) which
 /// prevents inlining. Prefer using the optimized handler system.
 #[allow(clippy::type_complexity)]
 pub type LegacyHandlerFn = Arc<

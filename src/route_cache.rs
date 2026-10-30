@@ -429,7 +429,7 @@ impl CompiledRoute {
     /// Compile a route pattern.
     ///
     /// Pattern syntax is read by the same parser the linear
-    /// [`Router`](crate::routing::Router) uses, so `{name}` / `{*name}` mean
+    /// [`Router`] uses, so `{name}` / `{*name}` mean
     /// exactly what `:name` / `*name` do. A catch-all ends the pattern: any
     /// segments written after it are unreachable in the linear router, so they
     /// are dropped here rather than half-honored.
@@ -552,7 +552,7 @@ pub struct OptimizedRoute {
     ///
     /// Carried alongside the compiled pattern so the optimized dispatch can
     /// validate a matched route's parameters exactly as the linear
-    /// [`Router`](crate::routing::Router) does, returning the same
+    /// [`Router`] does, returning the same
     /// `Error::BadRequest` on failure.
     pub constraints: Option<RouteConstraints>,
 }

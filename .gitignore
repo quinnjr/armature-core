@@ -62,7 +62,6 @@ pnpm-debug.log*
 *.key
 *.crt
 *.p12
-!armature-jwt/tests/fixtures/*.pem
 *.pfx
 secrets/
 credentials/

@@ -63,8 +63,9 @@ static SENSITIVE_PATTERNS: LazyLock<Vec<(regex::Regex, &'static str)>> = LazyLoc
     // filtered there.
     const SUBSTRING_KEYS: &str = "password|passwd|passphrase|pwd|secret|token|api[_-]?key|apikey|\
                                   authorization|session|credential|cvv|cvc|private[_-]?key|\
-                                  jwt|signature|cookie";
-    const DELIMITED_KEYS: &str = "pin|otp|totp|ssn|pass|pw|auth";
+                                  jwt|signature|cookie|passcode|card[_-]?number|cc[_-]?num|\
+                                  account[_-]?number";
+    const DELIMITED_KEYS: &str = "pin|otp|totp|ssn|pass|pw|auth|pan|iban";
     const CODE_KEYS: &str = "(?:auth|authorization|oauth|otp|totp|mfa|2fa|sms|verification|\
                              verify|access|reset|recovery|security|confirmation|one[_-]?time|\
                              pin)[_-]?code";
@@ -82,8 +83,9 @@ static SENSITIVE_PATTERNS: LazyLock<Vec<(regex::Regex, &'static str)>> = LazyLoc
     let json_delimited = format!(
         r#""((?:[a-z0-9]+[_.\[\]-]+)*(?:{DELIMITED_KEYS}|{CODE_KEYS})\]?)"\s*:\s*{JSON_VALUE}"#
     );
-    const FORM_SUBSTRING_KEYS: &str =
-        "passwd|passphrase|session|credential|cvv|cvc|jwt|signature|cookie";
+    const FORM_SUBSTRING_KEYS: &str = "passwd|passphrase|session|credential|cvv|cvc|jwt|\
+                                       signature|cookie|passcode|card[_-]?number|cc[_-]?num|\
+                                       account[_-]?number";
     let form_substring = format!(r"\b([a-z0-9_-]*(?:{FORM_SUBSTRING_KEYS})[a-z0-9_-]*){SEP}\s*\S+");
     let form_delimited = format!(
         r"\b((?:[a-z0-9]+(?:[_-]|\[|%5b))*(?:{DELIMITED_KEYS}|{CODE_KEYS}|code)){SEP}\s*\S+"
@@ -120,11 +122,11 @@ static SENSITIVE_PATTERNS: LazyLock<Vec<(regex::Regex, &'static str)>> = LazyLoc
         // one-time/authorization codes in `key=value` / `key: value` form.
         (form_substring, "$1=[FILTERED]"),
         (form_delimited, "$1=[FILTERED]"),
-        // Credit cards (simple pattern)
-        (
-            r"\b\d{4}[- ]?\d{4}[- ]?\d{4}[- ]?\d{4}\b".into(),
-            "[CARD FILTERED]",
-        ),
+        // Card numbers: 13-19 digits (every real PAN length, Amex's 15 and
+        // the 19-digit ranges included), optionally split by single spaces or
+        // dashes in any grouping. Matches are Luhn-checked before replacement
+        // (see `redact_card_run`), so order ids and timestamps survive.
+        (r"\b\d(?:[ -]?\d){12,18}\b".into(), CARD_FILTERED),
         // SSN
         (r"\b\d{3}[- ]?\d{2}[- ]?\d{4}\b".into(), "[SSN FILTERED]"),
     ];
@@ -140,6 +142,82 @@ static SENSITIVE_PATTERNS: LazyLock<Vec<(regex::Regex, &'static str)>> = LazyLoc
         })
         .collect()
 });
+
+/// Replacement for a card number; also marks the one [`SENSITIVE_PATTERNS`]
+/// entry whose matches [`redact_sensitive`] Luhn-checks rather than replacing
+/// outright.
+const CARD_FILTERED: &str = "[CARD FILTERED]";
+
+/// Luhn checksum over the ASCII digits of `digits` (anything else skipped).
+fn luhn_valid(digits: &str) -> bool {
+    let sum: u32 = digits
+        .bytes()
+        .filter(u8::is_ascii_digit)
+        .rev()
+        .enumerate()
+        .map(|(i, b)| {
+            let d = u32::from(b - b'0');
+            match (i % 2 == 1, d * 2) {
+                (false, _) => d,
+                (true, doubled) if doubled > 9 => doubled - 9,
+                (true, doubled) => doubled,
+            }
+        })
+        .sum();
+    sum.is_multiple_of(10)
+}
+
+/// `run` (digits with single space/dash separators, as the card pattern
+/// matches it) with any card number inside replaced by [`CARD_FILTERED`].
+///
+/// The whole run is not necessarily one number: the pattern also swallows a
+/// neighbouring group (`qty 2 4111 1111 1111 1111`, `... 1111 12 units`), and
+/// Luhn over the joined digits then fails, which would let the card through.
+/// So every run of whole groups with 13-19 digits is tried, the longest
+/// Luhn-valid one wins (a real card over an accidental 13-digit prefix), and
+/// what is left on either side is checked the same way.
+fn redact_card_run(run: &str) -> String {
+    let mut groups = Vec::new();
+    let mut start = None;
+    for (i, b) in run.bytes().enumerate() {
+        match (b.is_ascii_digit(), start) {
+            (true, None) => start = Some(i),
+            (false, Some(s)) => {
+                groups.push((s, i));
+                start = None;
+            }
+            _ => {}
+        }
+    }
+    if let Some(s) = start {
+        groups.push((s, run.len()));
+    }
+
+    let mut best: Option<(usize, usize, usize)> = None;
+    for i in 0..groups.len() {
+        let mut digits = 0;
+        for j in i..groups.len() {
+            digits += groups[j].1 - groups[j].0;
+            if digits > 19 {
+                break;
+            }
+            if digits >= 13
+                && best.is_none_or(|(longest, _, _)| digits > longest)
+                && luhn_valid(&run[groups[i].0..groups[j].1])
+            {
+                best = Some((digits, i, j));
+            }
+        }
+    }
+    match best {
+        Some((_, i, j)) => format!(
+            "{}{CARD_FILTERED}{}",
+            redact_card_run(&run[..groups[i].0]),
+            redact_card_run(&run[groups[j].1..])
+        ),
+        None => run.to_string(),
+    }
+}
 
 /// `key` as lowercase segments joined by single `_`s: a word boundary is any
 /// non-alphanumeric character (`.`, `[`, `:`, `/`, ...), a lower/digit to
@@ -198,13 +276,16 @@ static SENSITIVE_PRECHECK: LazyLock<Option<regex::RegexSet>> = LazyLock::new(|| 
 pub(crate) fn is_sensitive_key(key: &str) -> bool {
     static SENSITIVE_KEY: LazyLock<Option<regex::Regex>> = LazyLock::new(|| {
         // Matched against the normalized key, so `_` is the only separator.
-        let substring = "password|passwd|passphrase|pwd|secret|token|api_?key|authorization|\
-                         session|credential|cvv|cvc|private_?key|jwt|signature|cookie|\
-                         code_?verifier|assertion";
-        let segment = "pass|pw|pin|otp|totp|ssn|auth";
+        let substring = "password|passwd|passphrase|passcode|pwd|secret|token|api_?key|\
+                         authorization|session|credential|cvv|cvc|private_?key|jwt|signature|\
+                         cookie|code_?verifier|assertion|card_?number|cc_?num|account_?number";
+        let segment = "pass|pw|pin|otp|totp|ssn|auth|pan|iban";
         let code = "(?:auth|authorization|oauth|otp|totp|mfa|2_?fa|sms|verification|verify|\
                     access|reset|recovery|security|confirmation|one_?time|pin)_?code";
-        let pattern = format!("(?:{substring})|(?:^|_)(?:{segment}|{code})(?:_|$)");
+        // A final `key` segment is key material (`accessKey`, `signingKey`,
+        // `master_key`, a bare `key`); only as a whole segment, so `monkey`
+        // and `keyboard` stay readable.
+        let pattern = format!("(?:{substring})|(?:^|_)(?:{segment}|{code})(?:_|$)|(?:^|_)key$");
         let re = regex::Regex::new(&pattern);
         debug_assert!(re.is_ok(), "bad sensitive-key pattern: {re:?}");
         re.ok()
@@ -223,7 +304,7 @@ pub(crate) fn is_sensitive_key(key: &str) -> bool {
 /// Best-effort: it recognizes `key=value`, `key: value` and JSON
 /// `"key": "value"` shapes for password/secret/token/API-key/authorization/
 /// session/credential/PIN/OTP/CVV/SSN/one-time-code names, bearer and basic
-/// credentials, and card/SSN-like digit runs. It is not a guarantee that arbitrary
+/// credentials, Luhn-valid 13-19 digit card numbers, and SSN-like digit runs. It is not a guarantee that arbitrary
 /// payloads are free of secrets.
 ///
 /// Borrows `s` back when nothing matches, which is the common case: one
@@ -240,7 +321,14 @@ pub(crate) fn redact_sensitive(s: &str) -> Cow<'_, str> {
     }
     let mut result = Cow::Borrowed(s);
     for (regex, replacement) in SENSITIVE_PATTERNS.iter() {
-        if let Cow::Owned(replaced) = regex.replace_all(&result, *replacement) {
+        let replaced = if *replacement == CARD_FILTERED {
+            regex.replace_all(&result, |caps: &regex::Captures<'_>| {
+                redact_card_run(&caps[0])
+            })
+        } else {
+            regex.replace_all(&result, *replacement)
+        };
+        if let Cow::Owned(replaced) = replaced {
             result = Cow::Owned(replaced);
         }
     }
@@ -263,9 +351,9 @@ pub enum ResponseFormat {
     Html,
     /// RFC 7807 Problem Details JSON
     ProblemDetails,
-    /// JSON:API error format (https://jsonapi.org/format/#errors)
+    /// JSON:API error format (<https://jsonapi.org/format/#errors>)
     JsonApi,
-    /// GraphQL error format (https://spec.graphql.org)
+    /// GraphQL error format (<https://spec.graphql.org>)
     GraphQL,
     /// Google/gRPC-style error format
     Google,
@@ -481,7 +569,7 @@ impl ErrorResponse {
     }
 
     /// Convert to JSON:API error format.
-    /// https://jsonapi.org/format/#errors
+    /// <https://jsonapi.org/format/#errors>
     pub fn to_json_api(&self) -> String {
         let error = JsonApiError {
             id: self.request_id.clone(),
@@ -530,7 +618,7 @@ impl ErrorResponse {
     }
 
     /// Convert to GraphQL error format.
-    /// https://spec.graphql.org/October2021/#sec-Errors
+    /// <https://spec.graphql.org/October2021/#sec-Errors>
     pub fn to_graphql(&self) -> String {
         let errors: Vec<GraphQLError> = if self.validation_errors.is_empty() {
             vec![GraphQLError {
@@ -1947,13 +2035,52 @@ mod tests {
             "cookie=s3cr3tv4l pin_code=s3cr3tv4l",
             r#"{"pass":"s3cr3tv4l","pw":"s3cr3tv4l","auth":"s3cr3tv4l","pin_code":"s3cr3tv4l"}"#,
             r#"{"passphrase":"s3cr3tv4l","jwt":"s3cr3tv4l","signature":"s3cr3tv4l"}"#,
+            "card_number=s3cr3tv4l account_number=s3cr3tv4l iban=s3cr3tv4l pan=s3cr3tv4l",
+            "passcode=s3cr3tv4l cc_num=s3cr3tv4l",
+            r#"{"cardNumber":"s3cr3tv4l","iban":"s3cr3tv4l","card_pan":"s3cr3tv4l"}"#,
         ] {
             let out = redact_sensitive(input);
             assert!(!out.contains("s3cr3tv4l"), "{input} -> {out}");
         }
         // `pass` and `pw` are whole-key only.
-        let benign = "bypass=1 compass=n";
+        let benign = "bypass=1 compass=n span=2 expand=y company=x";
         assert_eq!(redact_sensitive(benign), benign);
+    }
+
+    /// Card numbers of every real length (13-19 digits) are redacted,
+    /// grouped or not, when they pass the Luhn check; digit runs that fail it
+    /// (order ids, timestamps) are left readable.
+    #[test]
+    fn test_redact_sensitive_card_lengths_and_luhn() {
+        for (input, card) in [
+            ("amex 378282246310005 declined", "378282246310005"),
+            ("amex 3782 822463 10005 declined", "3782 822463 10005"),
+            ("amex 3782-822463-10005", "3782-822463-10005"),
+            ("visa 4111111111111111", "4111111111111111"),
+            ("visa13 4222222222222", "4222222222222"),
+            ("long 6304000000000000000", "6304000000000000000"),
+            ("long 6304 0000 0000 0000 000", "6304 0000 0000 0000 000"),
+            // A neighbouring number joined by a space must not hide the card.
+            ("qty 2 4111 1111 1111 1111", "4111 1111 1111 1111"),
+            ("4111 1111 1111 1111 12 units", "4111 1111 1111 1111"),
+        ] {
+            let out = redact_sensitive(input);
+            assert!(!out.contains(card), "{input} -> {out}");
+            assert!(out.contains("[CARD FILTERED]"), "{input} -> {out}");
+        }
+        // Fail Luhn: not a card.
+        for benign in [
+            "order 4111111111111112 shipped",
+            "order 1234567890123 shipped",
+            "ts 16983847261234567",
+        ] {
+            assert_eq!(redact_sensitive(benign), benign);
+        }
+        // The surrounding text and a trailing non-card number survive.
+        assert_eq!(
+            redact_sensitive("qty 2 4111 1111 1111 1111 ok"),
+            "qty 2 [CARD FILTERED] ok"
+        );
     }
 
     #[test]
@@ -2005,6 +2132,28 @@ mod tests {
             "APIKey",
             "user_2FACode",
             "user2Pin",
+            // Payment and account identifiers.
+            "card_number",
+            "cardNumber",
+            "cardnumber",
+            "cc_num",
+            "ccNumber",
+            "pan",
+            "card_pan",
+            "account_number",
+            "accountNumber",
+            "iban",
+            "payee_iban",
+            "passcode",
+            "devicePasscode",
+            // Key material named `*_key`.
+            "key",
+            "accessKey",
+            "signingKey",
+            "encryptionKey",
+            "masterKey",
+            "clientKey",
+            "secret_access_key",
         ] {
             assert!(is_sensitive_key(key), "{key}");
         }
@@ -2030,6 +2179,16 @@ mod tests {
             "authority",
             "errorCode",
             "statusCode",
+            "monkey",
+            "keyboard",
+            "turkey",
+            "keys",
+            "company",
+            "panel",
+            "span",
+            "expand",
+            "account",
+            "card",
         ] {
             assert!(!is_sensitive_key(key), "{key}");
         }

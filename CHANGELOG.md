@@ -64,6 +64,11 @@ Changes at or before `0.6.0` are recorded in the workspace
 - **Routing and caches.** Route segments whose name holds pattern syntax (`:*x`, `*{a}`) are literal text in every reading, so `Router`'s `matchit` index and the segment matchers agree; cache keys order raw query segments by their decoded name, so `a=1&%61=2` and `%61=2&a=1` (which first-wins reads differently) are separate entries.
 - **Smaller fixes.** `CorrelationContext`'s `Debug` redacts session/user ids and baggage values, and `CorrelatedError::to_json` omits the session id; `micro` logs client-triggered rejections at `debug`; Dependabot updates the crate and fuzz lockfiles together.
 
+- **`micro` holds slow readers to the minimum response rate**, as every `Application` hyper listener already did; a client draining a few bytes per write timeout could keep a micro connection slot for days.
+- **Correlation exports.** `CorrelationContext`'s own serialization skips `session_id` and `user_id` and redacts baggage values, so registry records and `ErrorTree`s exported through serde are redacted too (new `ErrorTree::to_json`); `CorrelatedError::to_json` omits the user id.
+- **Card numbers in redaction.** Luhn-valid card numbers of 13–19 digits (Amex, 19-digit, any space/dash grouping) are filtered and Luhn-failing ids left alone; card/account number, PAN, IBAN, passcode and `*_key` names are sensitive keys.
+- **Smaller fixes.** `safe_filename` checks reserved device names after truncation (a padded `CON` gets its `_`); `ParsedRequest::content_length` reports the same strict length framing uses; client-caused WebSocket protocol errors log at `debug`; `ResponseCacheConfig::require_explicit_public` (default `false`) stores only `public`/`s-maxage` responses, for apps whose identity travels in headers the cache does not recognise.
+
 ### Added
 
 - `HeaderMap::host_strict`, `HeaderMap::get_all_bytes`, `BodyReadPolicy::rate_budget`, `MAX_PRESERVED_EXTENSION_LEN`, `Error::log_display`, `Http3Server::with_write_timeout`, `SseBroadcaster::with_max_clients`/`try_register`, `CacheInterceptor::with_max_body_bytes`/`with_max_total_bytes`, `HealthService::check_liveness_summary`/`check_readiness_summary`.
@@ -72,6 +77,7 @@ Changes at or before `0.6.0` are recorded in the workspace
 ### Changed
 
 - **Breaking:** new public fields on `StaticAssetsConfig`, `CompressionConfig`, `CacheKey`, `Http2Config` and `Http3Config` break struct-literal construction; `Http3Server::from_state` takes `max_connections`. `serve()` answers `500` for files above `max_serve_size` — use `serve_streaming()` or raise the limit. Multipart bodies must use CRLF line endings.
+- **Breaking:** optional dependencies are no longer features of their own (`rcgen`, `quinn`, `h3`, `h3-quinn`); enable `self-signed-certs` / `http3`. `ResponseCacheConfig` gains a public field.
 - **Breaking:** `FormFile::extension()` returns `Option<String>` (it reads the sanitized name); `batch::ParsedRequest::to_http_request` / `OwnedParsedRequest::to_http_request` return `Result`.
 - **Behaviour (round 4):** `CacheInterceptor` stores only responses marked `public`/`s-maxage`; `SecurityHeadersMiddleware` sends `X-XSS-Protection: 0`.
 - **Behaviour:** `handle_websocket` closes connections idle for 300 s; a layered route's `Route::constraints` is `None` (they are enforced inside its handler); hyper HTTP/1.1 requests without `Host` are `400`.

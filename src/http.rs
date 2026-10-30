@@ -53,7 +53,7 @@ impl RouteParamsExt for RouteParams {
 /// `&T: Send` requires `T: Sync`.
 ///
 /// `Debug` prints key names and value lengths only (see
-/// [`QueryView`](crate::query::QueryView)).
+/// [`QueryView`]).
 #[derive(Default)]
 pub struct QueryCache(OnceLock<QueryPairs>);
 

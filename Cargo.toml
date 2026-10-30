@@ -119,12 +119,12 @@ default = ["h1-backend"]
 # the protocol strictness this opts into.
 h1-backend = []
 
-self-signed-certs = ["rcgen"]
+self-signed-certs = ["dep:rcgen"]
 simd-json = ["dep:simd-json"]
 
 # HTTP/3 (QUIC) support - next-gen protocol with multiplexing over UDP
 # Requires: quinn, h3, h3-quinn
-http3 = ["quinn", "h3", "h3-quinn"]
+http3 = ["dep:quinn", "dep:h3", "dep:h3-quinn"]
 
 # io_uring support for Linux (kernel 5.1+)
 # Enables the standalone `IoUringRuntime` ring utility in `armature_core::io_uring`

@@ -876,6 +876,28 @@ fn response_header<'a>(response: &'a HttpResponse, name: &str) -> Option<&'a Str
 /// that authenticates the request (especially one that authenticates from
 /// mTLS or strips the header it authenticated from).
 ///
+/// # Per-user responses without a recognised credential
+///
+/// By default this cache follows RFC 9111: an *anonymous-looking* request's
+/// response is stored when it carries any explicit freshness (`max-age` or
+/// `Expires` included), not only when it is `public`/`s-maxage`. That differs
+/// from [`CacheInterceptor`](crate::interceptor::CacheInterceptor), which
+/// stores only explicitly shared responses.
+/// If a request's identity can arrive in a header this cache does not treat
+/// as a credential (an `X-User-Id` set by a gateway, a custom tenant header),
+/// a per-user `max-age` response is then served to every caller of the same
+/// URL. Either add that header to the response's `Vary`, mark per-user
+/// responses `private`, or set
+/// [`ResponseCacheConfig::require_explicit_public()`] so only
+/// `public`/`s-maxage` responses are stored:
+///
+/// ```
+/// use armature_core::response_cache::{ResponseCache, ResponseCacheConfig};
+///
+/// let cache =
+///     ResponseCache::with_config(ResponseCacheConfig::new().require_explicit_public(true));
+/// ```
+///
 /// # Examples
 ///
 /// ```
@@ -1076,6 +1098,12 @@ pub struct ResponseCacheConfig {
     pub cacheable_status_codes: Vec<u16>,
     /// Only cache these HTTP methods
     pub cacheable_methods: Vec<String>,
+    /// Store only responses that say they are fit for a shared cache
+    /// (`Cache-Control: public` or `s-maxage`), refusing ones whose only
+    /// freshness is `max-age` or `Expires`. Default `false` (RFC 9111). Turn
+    /// it on when identity can arrive in a header the cache does not
+    /// recognise as a credential (see [`ResponseCache`]).
+    pub require_explicit_public: bool,
 }
 
 impl Default for ResponseCacheConfig {
@@ -1095,6 +1123,9 @@ impl Default for ResponseCacheConfig {
                 // the cache key (draft-ietf-httpbis-safe-method-w-body §4).
                 "QUERY".to_string(),
             ],
+            // RFC 9111 behaviour; `max-age`-only caching is this cache's
+            // documented core use. See `ResponseCache` for when to opt in.
+            require_explicit_public: false,
         }
     }
 }
@@ -1120,6 +1151,20 @@ impl ResponseCacheConfig {
     /// Set the maximum body size to cache.
     pub fn max_body_size(mut self, size: usize) -> Self {
         self.max_body_size = size;
+        self
+    }
+
+    /// Store only responses marked `public` or `s-maxage` (see the
+    /// `require_explicit_public` field).
+    ///
+    /// ```
+    /// use armature_core::response_cache::ResponseCacheConfig;
+    ///
+    /// let config = ResponseCacheConfig::new().require_explicit_public(true);
+    /// assert!(config.require_explicit_public);
+    /// ```
+    pub fn require_explicit_public(mut self, require: bool) -> Self {
+        self.require_explicit_public = require;
         self
     }
 }
@@ -1362,6 +1407,15 @@ impl ResponseCache {
         // as surely, and so does a `VerifiedIdentity`/`RequestRoles` an auth
         // middleware attached (see `is_credentialed_request`).
         if crate::guard::is_credentialed_request(request)
+            && !cache_control.as_ref().is_some_and(is_explicitly_shared)
+        {
+            return false;
+        }
+
+        // Opt-in: identity may live in a header `is_credentialed_request`
+        // does not know (`X-User-Id` set by a gateway), and nothing in a
+        // `max-age`-only response says it is the same for everyone.
+        if self.config.require_explicit_public
             && !cache_control.as_ref().is_some_and(is_explicitly_shared)
         {
             return false;
@@ -2016,6 +2070,52 @@ mod tests {
         let request = HttpRequest::new("GET", "/api/me".to_string());
         cache.store(&request, &HttpResponse::ok()).await;
         assert!(cache.get(&request).await.is_none());
+    }
+
+    /// By default a `max-age`-only response to an anonymous-looking request
+    /// is stored (RFC 9111), so a per-user page keyed by a header the cache
+    /// does not know is identity (`X-User-Id`) is shared. With
+    /// `require_explicit_public`, only `public`/`s-maxage` responses are.
+    #[tokio::test]
+    async fn test_require_explicit_public_refuses_unmarked_responses() {
+        let as_user = |user: &str| {
+            let mut req = HttpRequest::new("GET", "/api/me".to_string());
+            req.headers.insert("X-User-Id", user.to_string());
+            req
+        };
+        let max_age_only = || {
+            HttpResponse::ok()
+                .with_cache_control(CacheControl::new().max_age(Duration::from_secs(60)))
+        };
+
+        // The RFC default: user b is answered from user a's entry.
+        let cache = ResponseCache::new();
+        assert!(!cache.config.require_explicit_public);
+        cache.store(&as_user("a"), &max_age_only()).await;
+        assert!(cache.get(&as_user("b")).await.is_some());
+
+        let cache =
+            ResponseCache::with_config(ResponseCacheConfig::new().require_explicit_public(true));
+        cache.store(&as_user("a"), &max_age_only()).await;
+        cache
+            .store_with_ttl(&as_user("a"), &max_age_only(), Duration::from_secs(60))
+            .await;
+        let mut expires = HttpResponse::ok();
+        expires.headers.insert(
+            "Expires".to_string(),
+            httpdate::fmt_http_date(SystemTime::now() + Duration::from_secs(120)),
+        );
+        cache.store(&as_user("a"), &expires).await;
+        assert!(cache.get(&as_user("b")).await.is_none());
+
+        // Explicitly shared responses are still stored.
+        cache.store(&as_user("a"), &fresh()).await;
+        assert!(cache.get(&as_user("b")).await.is_some());
+        let req = HttpRequest::new("GET", "/s-maxage".to_string());
+        let s_maxage = HttpResponse::ok()
+            .with_cache_control(CacheControl::new().s_maxage(Duration::from_secs(60)));
+        cache.store(&req, &s_maxage).await;
+        assert!(cache.get(&req).await.is_some());
     }
 
     #[tokio::test]

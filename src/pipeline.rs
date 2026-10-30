@@ -381,6 +381,13 @@ impl<T> WriteDeadline<T> {
     /// Also hold writes the peer is slow to take to `rate`'s minimum (after
     /// its `idle_timeout` grace); a policy with the rate rule disabled adds
     /// nothing.
+    /// Whether the minimum-rate rule is armed (for tests of the listeners
+    /// that wrap their sockets).
+    #[cfg(test)]
+    pub(crate) fn enforces_min_rate(&self) -> bool {
+        self.rate.is_some()
+    }
+
     pub(crate) fn with_min_rate(mut self, rate: crate::BodyReadPolicy) -> Self {
         self.rate = rate.rate_budget(0).is_some().then_some(rate);
         self

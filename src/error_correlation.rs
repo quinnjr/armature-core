@@ -230,9 +230,12 @@ pub mod headers {
 ///
 /// `Debug` redacts `session_id`, `user_id` and baggage values (baggage keys
 /// are kept): contexts end up in `{:?}` log lines and panic messages, and a
-/// session id there is a live credential. Header propagation
-/// ([`inject_into_request`](Self::inject_into_request)) sends them unchanged,
-/// and [`CorrelatedError::to_json`] drops the session id and baggage values.
+/// session id there is a live credential. `Serialize` is an export for the
+/// same reason (registry records, [`ErrorTree`]s and
+/// [`CorrelatedError::to_json`] all go through it): it omits `session_id` and
+/// `user_id` and redacts baggage values. Propagation does not use serde;
+/// header propagation ([`inject_into_request`](Self::inject_into_request))
+/// sends the session id unchanged. `Deserialize` still reads every field.
 #[derive(Clone, Serialize, Deserialize)]
 pub struct CorrelationContext {
     /// Correlation ID - groups related requests/errors
@@ -251,8 +254,8 @@ pub struct CorrelationContext {
     /// Causation ID (what caused this request)
     #[serde(skip_serializing_if = "Option::is_none")]
     pub causation_id: Option<String>,
-    /// Session ID
-    #[serde(skip_serializing_if = "Option::is_none")]
+    /// Session ID (never serialized: a live credential)
+    #[serde(skip_serializing)]
     pub session_id: Option<String>,
     /// Service name
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -260,14 +263,20 @@ pub struct CorrelationContext {
     /// Service version
     #[serde(skip_serializing_if = "Option::is_none")]
     pub service_version: Option<String>,
-    /// User ID (if authenticated)
-    #[serde(skip_serializing_if = "Option::is_none")]
+    /// User ID (if authenticated; never serialized: personal data that
+    /// `Debug` redacts too)
+    #[serde(skip_serializing)]
     pub user_id: Option<String>,
     /// Tenant ID (for multi-tenant systems)
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tenant_id: Option<String>,
-    /// Custom baggage items
-    #[serde(skip_serializing_if = "HashMap::is_empty", default)]
+    /// Custom baggage items (values serialize as `[REDACTED]`: baggage is
+    /// free-form and often carries user data)
+    #[serde(
+        skip_serializing_if = "HashMap::is_empty",
+        default,
+        serialize_with = "serialize_redacted_baggage"
+    )]
     pub baggage: HashMap<String, String>,
     /// Sampling decision for traces
     pub sampled: bool,
@@ -283,6 +292,15 @@ impl Default for CorrelationContext {
 
 /// Stand-in for a value [`CorrelationContext`]'s `Debug` keeps out of logs.
 const REDACTED: &str = "[REDACTED]";
+
+/// Baggage keys with every value replaced by [`REDACTED`], so an exported
+/// context still shows which items were present.
+fn serialize_redacted_baggage<S: serde::Serializer>(
+    baggage: &HashMap<String, String>,
+    serializer: S,
+) -> Result<S::Ok, S::Error> {
+    serializer.collect_map(baggage.keys().map(|key| (key, REDACTED)))
+}
 
 impl fmt::Debug for CorrelationContext {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -807,39 +825,21 @@ impl CorrelatedError {
     /// Convert to JSON.
     ///
     /// This is an export (to logs, error stores, other services), so the
-    /// context's session id is omitted and its baggage values are redacted;
-    /// the `Serialize` impl itself is unchanged for callers that propagate a
-    /// context on purpose.
+    /// context's session id and user id are omitted and its baggage values
+    /// are redacted. That redaction lives in [`CorrelationContext`]'s
+    /// `Serialize`, so serializing a `CorrelatedError` (or an [`ErrorTree`])
+    /// any other way exports the same thing.
     pub fn to_json(&self) -> String {
-        let exported = serde_json::to_value(self).map(|mut value| {
-            if let Some(context) = value
-                .get_mut("context")
-                .and_then(serde_json::Value::as_object_mut)
-            {
-                context.remove("session_id");
-                if let Some(baggage) = context
-                    .get_mut("baggage")
-                    .and_then(serde_json::Value::as_object_mut)
-                {
-                    for item in baggage.values_mut() {
-                        *item = serde_json::Value::String(REDACTED.to_owned());
-                    }
-                }
-            }
-            value
-        });
-        exported
-            .and_then(|value| serde_json::to_string_pretty(&value))
-            .unwrap_or_else(|_| {
-                // Built with `json!` so a quote or backslash in the message cannot
-                // break out of its string and forge fields.
-                serde_json::json!({
-                    "error_id": self.error_id,
-                    "message": self.message,
-                    "status": self.status,
-                })
-                .to_string()
+        serde_json::to_string_pretty(self).unwrap_or_else(|_| {
+            // Built with `json!` so a quote or backslash in the message cannot
+            // break out of its string and forge fields.
+            serde_json::json!({
+                "error_id": self.error_id,
+                "message": self.message,
+                "status": self.status,
             })
+            .to_string()
+        })
     }
 }
 
@@ -1008,12 +1008,31 @@ impl Default for ErrorRegistry {
 }
 
 /// Tree structure for error causation.
+///
+/// Serializing it redacts every node's context as
+/// [`CorrelatedError::to_json`] does (see [`CorrelationContext`]).
 #[derive(Debug, Clone, Serialize)]
 pub struct ErrorTree {
     /// The error at this node
     pub error: CorrelatedError,
     /// Child errors (caused by this error)
     pub children: Vec<ErrorTree>,
+}
+
+impl ErrorTree {
+    /// Convert the whole tree to JSON, with every node's context redacted.
+    pub fn to_json(&self) -> String {
+        serde_json::to_string_pretty(self).unwrap_or_else(|_| {
+            // Same shape-safe fallback as `CorrelatedError::to_json`, for the
+            // root only.
+            serde_json::json!({
+                "error_id": self.error.error_id,
+                "message": self.error.message,
+                "status": self.error.status,
+            })
+            .to_string()
+        })
+    }
 }
 
 // ============================================================================
@@ -1558,14 +1577,49 @@ mod tests {
         let debug = format!("{error:?}");
         assert!(!debug.contains("s3cr3t"), "{debug}");
         let json = error.to_json();
-        assert!(!json.contains("sess-s3cr3t"), "{json}");
-        assert!(!json.contains("bag-s3cr3t"), "{json}");
+        assert!(!json.contains("s3cr3t"), "{json}");
         assert!(json.contains("tenant_hint"), "{json}");
         assert!(json.contains(&ctx.correlation_id), "{json}");
+
+        // The derived `Serialize` is an export too: a caller serializing a
+        // registry record directly gets the same redaction.
+        let json = serde_json::to_string(&error).unwrap();
+        assert!(!json.contains("s3cr3t"), "{json}");
+        assert!(json.contains("tenant_hint"), "{json}");
+        let json = serde_json::to_string(&ctx).unwrap();
+        assert!(!json.contains("s3cr3t"), "{json}");
 
         let mut req = HttpRequest::new("GET", "/".to_string());
         ctx.inject_into_request(&mut req);
         assert_eq!(req.headers.get(headers::SESSION_ID), Some("sess-s3cr3t"));
+    }
+
+    /// A causation tree is built from registry records, and every node's
+    /// context is redacted on export, not just the root's.
+    #[tokio::test]
+    async fn test_causation_tree_export_is_redacted() {
+        let registry = ErrorRegistry::new(10);
+        let secret_ctx = || {
+            CorrelationContext::new()
+                .with_session("sess-s3cr3t")
+                .with_user_id("user-s3cr3t")
+                .with_baggage("hint", "bag-s3cr3t")
+        };
+        let child = CorrelatedError::new("child").with_context(secret_ctx());
+        let root = CorrelatedError::new("root")
+            .with_context(secret_ctx())
+            .related_to(child.error_id.clone());
+        let root_id = root.error_id.clone();
+        registry.register(child).await;
+        registry.register(root).await;
+
+        let tree = registry.build_causation_tree(&root_id).await.unwrap();
+        assert_eq!(tree.children.len(), 1);
+        for json in [tree.to_json(), serde_json::to_string(&tree).unwrap()] {
+            assert!(!json.contains("s3cr3t"), "{json}");
+            assert!(json.contains("child"), "{json}");
+            assert!(json.contains("hint"), "{json}");
+        }
     }
 
     #[test]

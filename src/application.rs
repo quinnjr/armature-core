@@ -556,8 +556,8 @@ impl Application {
     /// Filters run in priority order (highest first); the first filter
     /// whose `catch()` returns `Some(response)` wins and its response is
     /// returned to the client. Wired into every request path — HTTP/1.1,
-    /// HTTP/2 and HTTP/3 ([`Application::listen_h3`] /
-    /// [`Application::listen_dual_stack`]'s QUIC side) all funnel through the
+    /// HTTP/2 and HTTP/3 (`Application::listen_h3` /
+    /// `Application::listen_dual_stack`'s QUIC side) all funnel through the
     /// same shared dispatch, so both the guard-rejection error path and the
     /// routing/handler error path try the filter chain before falling back to
     /// [`Error::to_client_response`].

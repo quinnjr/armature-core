@@ -22,7 +22,7 @@ use std::sync::{Arc, OnceLock};
 /// A route handler function type (legacy - for backwards compatibility)
 ///
 /// **Deprecated**: Use `BoxedHandler` for better performance via monomorphization.
-/// This type uses double dynamic dispatch (dyn Fn + Box<dyn Future>) which
+/// This type uses double dynamic dispatch (`dyn Fn` + `Box<dyn Future>`) which
 /// prevents the compiler from inlining handler code.
 ///
 /// Prefer using the optimized handler system:

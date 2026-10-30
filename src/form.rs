@@ -181,12 +181,17 @@ impl FormFile {
             .trim_end_matches(|c: char| c == '.' || c.is_whitespace());
 
         if name.is_empty() {
-            "file".to_string()
-        } else if is_windows_reserved(name) {
-            // One byte for the prefix keeps the result within the cap.
+            return "file".to_string();
+        }
+        // Checked on the fitted name, not the raw one: the cut trims trailing
+        // spaces, so `CON` + 300 spaces + `x` only becomes `CON` after it. A
+        // `_`-prefixed name is never reserved, so one re-fit (one byte
+        // shorter, to keep the prefix within the cap) settles it.
+        let fitted = fit_filename(name, MAX_SAFE_FILENAME_LEN);
+        if is_windows_reserved(&fitted) {
             format!("_{}", fit_filename(name, MAX_SAFE_FILENAME_LEN - 1))
         } else {
-            fit_filename(name, MAX_SAFE_FILENAME_LEN)
+            fitted
         }
     }
 
@@ -1298,6 +1303,23 @@ mod tests {
         }
         for ok in ["CONSOLE.txt", "COM10", "LPT10", "nullable", "com"] {
             assert_eq!(f(ok), ok);
+        }
+    }
+
+    /// Truncation can expose a device name the untruncated name hid (the
+    /// cut trims trailing spaces), so the reserved check runs on the result.
+    #[test]
+    fn safe_filename_rechecks_reserved_names_after_truncation() {
+        let f = |name: String| FormFile::new(name, String::new(), vec![]).safe_filename();
+        let pad = " ".repeat(300);
+        for (input, want) in [
+            (format!("CON{pad}x"), "_CON"),
+            (format!("NUL{pad}x.txt"), "_NUL.txt"),
+            (format!("com1{pad}x.log"), "_com1.log"),
+        ] {
+            let got = f(input);
+            assert_eq!(got, want);
+            assert!(got.len() <= MAX_SAFE_FILENAME_LEN);
         }
     }
 

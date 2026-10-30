@@ -1462,6 +1462,18 @@ async fn handle_micro_request(
 /// Every connection is served with a header-read deadline (see
 /// [`crate::pipeline::HEADER_READ_TIMEOUT`]) and the loop serves at most
 /// [`crate::pipeline::DEFAULT_MAX_CONNECTIONS`] connections at once.
+/// One accepted socket, wrapped in the same slow-reader bounds as
+/// `Application`'s hyper listeners, at the defaults: a stalled write times
+/// out, and a peer draining a few bytes per timeout is held to the minimum
+/// rate rather than keeping its connection slot for days.
+fn connection_io<T>(stream: T) -> crate::pipeline::WriteDeadline<T> {
+    crate::pipeline::WriteDeadline::new(
+        stream,
+        crate::pipeline::PipelineConfig::default().write_timeout,
+    )
+    .with_min_rate(crate::BodyReadPolicy::default())
+}
+
 async fn serve(listener: tokio::net::TcpListener, app: Arc<BuiltApp>) -> std::io::Result<()> {
     use hyper::service::service_fn;
     use hyper_util::rt::TokioIo;
@@ -1478,12 +1490,7 @@ async fn serve(listener: tokio::net::TcpListener, app: Arc<BuiltApp>) -> std::io
             .await
             .expect("connection-limit semaphore is never closed");
         let (stream, client_addr) = crate::application::accept_tcp(&listener).await;
-        // The same stalled-reader bound as `Application`'s hyper listeners,
-        // at `PipelineConfig`'s default.
-        let io = TokioIo::new(crate::pipeline::WriteDeadline::new(
-            stream,
-            crate::pipeline::PipelineConfig::default().write_timeout,
-        ));
+        let io = TokioIo::new(connection_io(stream));
         let app = app.clone();
 
         tokio::spawn(async move {
@@ -2390,5 +2397,12 @@ mod tests {
         .await;
         let status_line = response.lines().next().unwrap_or_default();
         assert!(status_line.contains("400"), "{response:?}");
+    }
+
+    /// The micro listener holds slow readers to the minimum response rate,
+    /// as every `Application` hyper listener does.
+    #[test]
+    fn micro_connections_enforce_the_minimum_response_rate() {
+        assert!(super::connection_io(tokio::io::sink()).enforces_min_rate());
     }
 }

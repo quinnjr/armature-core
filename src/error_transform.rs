@@ -86,9 +86,10 @@ static SENSITIVE_PATTERNS: LazyLock<Vec<(regex::Regex, &'static str)>> = LazyLoc
     const FORM_SUBSTRING_KEYS: &str = "passwd|passphrase|session|credential|cvv|cvc|jwt|\
                                        signature|cookie|passcode|card[_-]?number|cc[_-]?num|\
                                        account[_-]?number";
-    let form_substring = format!(r"\b([a-z0-9_-]*(?:{FORM_SUBSTRING_KEYS})[a-z0-9_-]*){SEP}\s*\S+");
+    let form_substring =
+        format!(r"(?-u:\b)([a-z0-9_-]*(?:{FORM_SUBSTRING_KEYS})[a-z0-9_-]*){SEP}\s*\S+");
     let form_delimited = format!(
-        r"\b((?:[a-z0-9]+(?:[_-]|\[|%5b))*(?:{DELIMITED_KEYS}|{CODE_KEYS}|code)){SEP}\s*\S+"
+        r"(?-u:\b)((?:[a-z0-9]+(?:[_-]|\[|%5b))*(?:{DELIMITED_KEYS}|{CODE_KEYS}|code)){SEP}\s*\S+"
     );
 
     let patterns: Vec<(String, &str)> = vec![
@@ -115,7 +116,7 @@ static SENSITIVE_PATTERNS: LazyLock<Vec<(regex::Regex, &'static str)>> = LazyLoc
         (r"bearer\s+\S+".into(), "Bearer [FILTERED]"),
         // Basic credentials are base64 `user:pass`; the length floor keeps
         // prose such as "basic auth failed" intact.
-        (r"\bbasic\s+[a-z0-9+/]{6,}=*".into(), "Basic [FILTERED]"),
+        (r"(?-u:\b)basic\s+[a-z0-9+/]{6,}=*".into(), "Basic [FILTERED]"),
         // Secrets
         (format!(r"secret{SEP}\s*\S+"), "secret=[FILTERED]"),
         // Session ids, passwd, card security codes, PINs, OTPs, SSNs and
@@ -131,18 +132,36 @@ static SENSITIVE_PATTERNS: LazyLock<Vec<(regex::Regex, &'static str)>> = LazyLoc
         // Cards are Luhn-checked, so order ids and timestamps survive.
         // Digits are ASCII or fullwidth (`card_digit`), the forms a person
         // types a card in; this class and `redact_card_run` agree on them.
-        // Groups may be split by one or two spaces, dashes, dots or
-        // non-breaking spaces.
+        // Groups may be split by up to three spaces, tabs, dashes (ASCII,
+        // en, fullwidth), dots, slashes, underscores or non-breaking /
+        // ideographic spaces
+        // (`4111 - 1111 - ...` included).
         // No `\b` at the start, so a card glued to a letter or `_`
         // (`ref4111...`, `cc_4111...`) is still a run; the one preceding
         // non-digit is consumed and copied back untouched.
         (
-            r"(?:^|[^0-9\x{FF10}-\x{FF19}])[0-9\x{FF10}-\x{FF19}]+(?:[ \-.\x{A0}]{1,2}[0-9\x{FF10}-\x{FF19}]+)*"
+            r"(?:^|[^0-9\x{FF10}-\x{FF19}])[0-9\x{FF10}-\x{FF19}]+(?:[ \t\-./_\x{A0}\x{2013}\x{202F}\x{3000}\x{FF0D}]{1,3}[0-9\x{FF10}-\x{FF19}]+)*"
                 .into(),
             CARD_FILTERED,
         ),
         // SSN
-        (r"\b(?-u:\d){3}[- ]?(?-u:\d){2}[- ]?(?-u:\d){4}\b".into(), "[SSN FILTERED]"),
+        // Same digits as the card pattern: ASCII or fullwidth. Bounded by
+        // explicit guards (captured and put back) rather than `\b`: a
+        // Unicode word boundary forces the slow regex engine on non-ASCII
+        // text, which made redacting a 64 KiB non-ASCII body ~150x slower.
+        (
+            r"(^|[^0-9\x{FF10}-\x{FF19}A-Za-z_])([0-9\x{FF10}-\x{FF19}]{3}[- ]?[0-9\x{FF10}-\x{FF19}]{2}[- ]?[0-9\x{FF10}-\x{FF19}]{4})($|[^0-9\x{FF10}-\x{FF19}A-Za-z_])"
+                .into(),
+            "${1}[SSN FILTERED]${3}",
+        ),
+        // The trailing guard consumes the separator a following SSN needs as
+        // its leading guard, so one pass catches every other SSN in a run of
+        // them; a second pass catches the rest.
+        (
+            r"(^|[^0-9\x{FF10}-\x{FF19}A-Za-z_])([0-9\x{FF10}-\x{FF19}]{3}[- ]?[0-9\x{FF10}-\x{FF19}]{2}[- ]?[0-9\x{FF10}-\x{FF19}]{4})($|[^0-9\x{FF10}-\x{FF19}A-Za-z_])"
+                .into(),
+            "${1}[SSN FILTERED]${3}",
+        ),
     ];
 
     patterns
@@ -174,9 +193,12 @@ fn card_digit(c: char) -> Option<u32> {
 
 /// Luhn checksum over the card digits of `digits` (anything else skipped).
 fn luhn_valid(digits: &str) -> bool {
-    let sum: u32 = digits
-        .chars()
-        .filter_map(card_digit)
+    luhn_sum(digits.chars().filter_map(card_digit)).is_multiple_of(10)
+}
+
+/// The Luhn sum of a digit sequence (valid when a multiple of 10).
+fn luhn_sum(digits: impl DoubleEndedIterator<Item = u32>) -> u32 {
+    digits
         .rev()
         .enumerate()
         .map(|(i, d)| match (i % 2 == 1, d * 2) {
@@ -184,12 +206,11 @@ fn luhn_valid(digits: &str) -> bool {
             (true, doubled) if doubled > 9 => doubled - 9,
             (true, doubled) => doubled,
         })
-        .sum();
-    sum.is_multiple_of(10)
+        .sum()
 }
 
-/// `run` (digit groups joined by single spaces or dashes, as the card
-/// pattern matches it) with every card number inside replaced by
+/// `run` (digit groups joined by the separators the card pattern allows,
+/// as it matches them) with every card number inside replaced by
 /// [`CARD_FILTERED`].
 ///
 /// The run is not necessarily one number: dates, phone numbers, quantities
@@ -228,6 +249,20 @@ fn redact_card_run(run: &str) -> String {
             if digits >= 13 && luhn_valid(&run[groups[i].0..groups[j].1]) {
                 covered[i..=j].iter_mut().for_each(|c| *c = true);
             }
+        }
+        // A card glued to its expiry or CVV (`4111111111111111` + `1226`, or
+        // + `123`) is one group of 17-23 digits whose whole is not
+        // Luhn-valid. The card comes first, so check the group's 13-19 digit
+        // prefixes. This over-redacts some long numeric ids (one of up to
+        // seven prefixes passes Luhn by chance), which is the right way to be
+        // wrong in a log; groups of 16 or fewer digits are judged whole, so
+        // ordinary ids and 13-digit millisecond timestamps are left alone.
+        let (start, end, count) = groups[i];
+        if !covered[i] && (17..=23).contains(&count) {
+            let digits: Vec<u32> = run[start..end].chars().filter_map(card_digit).collect();
+            covered[i] = (13..=19)
+                .filter(|&len| len < digits.len())
+                .any(|len| luhn_sum(digits[..len].iter().copied()).is_multiple_of(10));
         }
     }
     if !covered.contains(&true) {
@@ -2148,6 +2183,15 @@ mod tests {
             "4111.1111.1111.1111",
             "4111  1111  1111  1111",
             "4111\u{A0}1111\u{A0}1111\u{A0}1111",
+            "4111\t1111\t1111\t1111",
+            "4111/1111/1111/1111",
+            "4111 - 1111 - 1111 - 1111",
+            "4111\u{2013}1111\u{2013}1111\u{2013}1111",
+            "4111\u{3000}1111\u{3000}1111\u{3000}1111",
+            "4111_1111_1111_1111",
+            // Glued to its expiry, or to its CVV.
+            "41111111111111111226",
+            "4111111111111111123",
         ] {
             assert!(!redact_sensitive(input).contains("1111"), "{input:?}");
         }

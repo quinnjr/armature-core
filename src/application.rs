@@ -2471,6 +2471,43 @@ where
     }
 }
 
+/// How often [`note_auth_rejection`] reports at `warn`.
+const AUTH_REJECTION_REPORT_INTERVAL: Duration = Duration::from_secs(60);
+
+/// Count a 401/403 and, at most once per [`AUTH_REJECTION_REPORT_INTERVAL`],
+/// report the count at `warn`.
+///
+/// Each rejection is logged at `debug` (any client can cause one at will, so
+/// one `warn` per request lets a peer flood the log), but a credential-
+/// stuffing run must still be visible at the default level: this keeps it to
+/// one summary line a minute, process-wide.
+pub(crate) fn note_auth_rejection() {
+    use std::sync::OnceLock;
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::time::Instant;
+
+    static EPOCH: OnceLock<Instant> = OnceLock::new();
+    static SINCE_REPORT: AtomicU64 = AtomicU64::new(0);
+    // `u64::MAX`: never reported, so the first rejection reports at once.
+    static LAST_REPORT_MS: AtomicU64 = AtomicU64::new(u64::MAX);
+
+    SINCE_REPORT.fetch_add(1, Ordering::Relaxed);
+    let now = EPOCH.get_or_init(Instant::now).elapsed().as_millis() as u64;
+    let last = LAST_REPORT_MS.load(Ordering::Relaxed);
+    if (last == u64::MAX
+        || now.saturating_sub(last) >= AUTH_REJECTION_REPORT_INTERVAL.as_millis() as u64)
+        && LAST_REPORT_MS
+            .compare_exchange(last, now, Ordering::Relaxed, Ordering::Relaxed)
+            .is_ok()
+    {
+        let count = SINCE_REPORT.swap(0, Ordering::Relaxed);
+        warn!(
+            rejected = count,
+            "Requests rejected as unauthorized or forbidden since the last report"
+        );
+    }
+}
+
 /// [`accept_retrying`] over a TCP listener.
 pub(crate) async fn accept_tcp(listener: &TcpListener) -> (tokio::net::TcpStream, SocketAddr) {
     accept_retrying(|| listener.accept()).await
@@ -3514,6 +3551,9 @@ async fn dispatch_request(
                 warn!(method = %method, path = %path, error = %err.log_display(), "Request handling failed");
             } else {
                 debug!(method = %method, path = %path, error = %err.log_display(), "Request rejected");
+                if matches!(err.status_code(), 401 | 403) {
+                    note_auth_rejection();
+                }
             }
             respond_to_error(err, filter_ctx_request, state.filter_chain.clone()).await
         }
@@ -3543,6 +3583,7 @@ async fn guarded_route(
         Ok(request) => request,
         Err(forbidden) => {
             debug!("Request rejected by a global guard");
+            note_auth_rejection();
             return Ok(forbidden);
         }
     };

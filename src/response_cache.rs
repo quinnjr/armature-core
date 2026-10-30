@@ -2765,6 +2765,13 @@ mod tests {
                 r.extensions.insert(crate::RequestRoles::new(["admin"]));
                 r
             },
+            // An authenticated caller with no roles (no `VerifiedIdentity`):
+            // not enough to pass `AuthenticationGuard`, still per-user.
+            || {
+                let mut r = HttpRequest::new("GET", "/api/me".to_string());
+                r.extensions.insert(crate::RequestRoles::default());
+                r
+            },
         ];
         // Fresh, but not declared shareable.
         let unshared = || {

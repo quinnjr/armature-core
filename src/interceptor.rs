@@ -1273,6 +1273,12 @@ mod tests {
                 r.extensions.insert(crate::RequestRoles::new(["admin"]));
                 r
             }),
+            // Authenticated, no roles, no `VerifiedIdentity`: still per-user.
+            Box::new(|| {
+                let mut r = HttpRequest::new("GET", "/me");
+                r.extensions.insert(crate::RequestRoles::default());
+                r
+            }),
         ];
         for make in credentialed {
             let interceptor = CacheInterceptor::new(60);

@@ -65,8 +65,9 @@ impl VerifiedIdentity {
 /// Whether an authentication layer has attached verified credentials to this
 /// request: a [`VerifiedIdentity`], or a non-empty [`RequestRoles`].
 ///
-/// An empty `RequestRoles` (`RequestRoles::default()`) is not evidence of
-/// anything: a layer that attaches roles to every request, with none for an
+/// An empty `RequestRoles` (`RequestRoles::default()`, or only blank role
+/// names, as a layer that maps a missing claim to `[""]` produces) is not
+/// evidence of anything: a layer that attaches roles to every request, with none for an
 /// anonymous caller, would otherwise make every anonymous request look
 /// authenticated. `armature-auth`'s `JwtAuthMiddleware` attaches a
 /// `VerifiedIdentity` alongside the roles, so a verified caller with no
@@ -76,7 +77,7 @@ fn is_verified(request: &HttpRequest) -> bool {
         || request
             .extensions
             .get::<RequestRoles>()
-            .is_some_and(|roles| !roles.0.is_empty())
+            .is_some_and(|roles| roles.0.iter().any(|role| !role.trim().is_empty()))
 }
 
 /// Whether the response to `request` may be specific to the caller, so a
@@ -90,8 +91,15 @@ fn is_verified(request: &HttpRequest) -> bool {
 /// matters because middleware may authenticate from something the header
 /// check can't see (mTLS, a header it then strips), and once it has, the
 /// handler answers *this* caller.
+///
+/// Deliberately looser than [`is_verified`]: *any* `RequestRoles`, empty or
+/// not, marks the request as per-user here. An empty one is not enough to
+/// authenticate (that check fails closed by refusing it), but a layer that
+/// attached it has still identified *this* caller, and a cache that ignored
+/// it would fail open by sharing that caller's response.
 pub(crate) fn is_credentialed_request(request: &HttpRequest) -> bool {
-    is_verified(request)
+    request.extensions.get::<VerifiedIdentity>().is_some()
+        || request.extensions.get::<RequestRoles>().is_some()
         || request
             .headers
             .names()
@@ -102,8 +110,8 @@ pub(crate) fn is_credentialed_request(request: &HttpRequest) -> bool {
 /// identity.
 ///
 /// Fails closed. The request must carry a [`VerifiedIdentity`] (or a
-/// [`RequestRoles`]) extension, which only an authentication layer that has
-/// actually validated a credential inserts. The presence or shape of an
+/// non-empty [`RequestRoles`]) extension, which only an authentication layer
+/// that has actually validated a credential inserts. The presence or shape of an
 /// `Authorization` header proves nothing — `Bearer x` is as easy to send as
 /// any other string — and is not consulted.
 ///
@@ -165,7 +173,8 @@ impl RequestRoles {
 /// roles. Fails closed: requests without verified roles are rejected.
 ///
 /// An **empty** role list means "any authenticated caller": the request must
-/// still carry a [`VerifiedIdentity`] or [`RequestRoles`] extension. It never
+/// still carry a [`VerifiedIdentity`] or a non-empty [`RequestRoles`]
+/// extension. It never
 /// means "allow everyone".
 pub struct RolesGuard {
     /// Built once at construction so authorizing a request is a hash probe per
@@ -282,8 +291,15 @@ impl ApiKeyGuard {
 #[async_trait]
 impl Guard for ApiKeyGuard {
     async fn can_activate(&self, context: &GuardContext) -> Result<bool, Error> {
+        // Exactly one key: with two, a proxy that appended its own key would
+        // have the client's checked instead, depending on which one `get`
+        // happened to return.
         let api_key = context
-            .get_header("x-api-key")
+            .request
+            .headers
+            .get_unique("x-api-key")
+            .map_err(|_| Error::Forbidden("More than one API key".to_string()))?
+            .and_then(|k| std::str::from_utf8(k).ok())
             .filter(|k| !k.is_empty())
             .ok_or_else(|| Error::Forbidden("Missing API key".to_string()))?;
 
@@ -306,6 +322,31 @@ mod tests {
     use super::*;
     use bytes::Bytes;
     use std::collections::HashMap;
+
+    #[tokio::test]
+    async fn api_key_guard_refuses_repeated_keys() {
+        let guard = ApiKeyGuard::new(vec!["good".to_string()]);
+        let mut request = HttpRequest::new("GET", "/test".to_string());
+        request.headers.append("x-api-key", "good");
+        request.headers.append("x-api-key", "other");
+        assert!(
+            guard
+                .can_activate(&GuardContext::new(request))
+                .await
+                .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn blank_role_names_are_not_authentication() {
+        let mut request = HttpRequest::new("GET", "/test".to_string());
+        request.extensions.insert(RequestRoles::new([""]));
+        let context = GuardContext::new(request);
+        assert!(!matches!(
+            AuthenticationGuard.can_activate(&context).await,
+            Ok(true)
+        ));
+    }
 
     #[tokio::test]
     async fn empty_request_roles_are_not_authentication() {

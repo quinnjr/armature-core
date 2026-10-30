@@ -73,6 +73,11 @@ Changes at or before `0.6.0` are recorded in the workspace
 - **`RequestRoles` alone must be non-empty to authenticate.** `AuthenticationGuard` (and `RolesGuard` with no required roles) treated an empty `RequestRoles` as a verified identity, so a layer that attaches roles to every request (none for anonymous callers) let every anonymous request through; `VerifiedIdentity`, or at least one role, is now required.
 - **Smaller fixes.** Client-caused 4xx results and global-guard rejections log at `debug` (server errors stay at `warn`); `key` is a sensitive key segment anywhere (`signing_key_pem`, `key_material`).
 
+- **Cache privacy for role-only authentication.** Round 7's stricter `AuthenticationGuard` check had also become the caches' test for a per-user request, so a caller authenticated with an empty `RequestRoles` (no `VerifiedIdentity`) looked anonymous to `ResponseCache`/`CacheInterceptor` and its `max-age` response could be served to others. The caches again treat any `RequestRoles` as per-user; only authentication requires a non-empty one (blank role names no longer count either).
+- **Card and SSN redaction.** Cards split by tabs, slashes, underscores, en or fullwidth dashes, U+202F or ideographic spaces, or `" - "` are caught, as is a card glued to its expiry or CVV; SSNs in fullwidth digits are caught. The SSN pattern no longer uses a Unicode word boundary, which made redacting non-ASCII text ~30x slower.
+- **`ApiKeyGuard` refuses more than one `X-Api-Key`**, so a proxy that appends its own key cannot have the client's checked instead.
+- **401/403 stay visible.** Client-caused rejections log at `debug` per request, plus one `warn` summary of the count at most once a minute.
+
 ### Added
 
 - `HeaderMap::host_strict`, `HeaderMap::get_all_bytes`, `BodyReadPolicy::rate_budget`, `MAX_PRESERVED_EXTENSION_LEN`, `Error::log_display`, `Http3Server::with_write_timeout`, `SseBroadcaster::with_max_clients`/`try_register`, `CacheInterceptor::with_max_body_bytes`/`with_max_total_bytes`, `HealthService::check_liveness_summary`/`check_readiness_summary`.

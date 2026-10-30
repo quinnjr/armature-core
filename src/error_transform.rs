@@ -40,6 +40,7 @@
 
 use crate::{Error, HttpRequest, HttpResponse};
 use serde::{Deserialize, Serialize};
+use std::borrow::Cow;
 use std::collections::HashMap;
 use std::sync::{Arc, LazyLock};
 
@@ -140,14 +141,55 @@ static SENSITIVE_PATTERNS: LazyLock<Vec<(regex::Regex, &'static str)>> = LazyLoc
         .collect()
 });
 
+/// `key` as lowercase segments joined by single `_`s: a word boundary is any
+/// non-alphanumeric character (`.`, `[`, `:`, `/`, ...), a lower/digit to
+/// upper step (`newPin` -> `new_pin`), or the end of an acronym
+/// (`XMLToken` -> `xml_token`). The segment-only key names (`pin`, `pw`,
+/// `ssn`) match only on these boundaries, so a boundary missed here is a
+/// credential logged.
+fn normalize_key(key: &str) -> String {
+    let chars: Vec<char> = key.chars().collect();
+    let mut out = String::with_capacity(key.len() + 4);
+    for (i, &c) in chars.iter().enumerate() {
+        if !c.is_alphanumeric() {
+            if !out.is_empty() && !out.ends_with('_') {
+                out.push('_');
+            }
+            continue;
+        }
+        if c.is_uppercase() && i > 0 {
+            let prev = chars[i - 1];
+            let next_lower = chars.get(i + 1).is_some_and(|n| n.is_lowercase());
+            let boundary =
+                prev.is_lowercase() || prev.is_ascii_digit() || (prev.is_uppercase() && next_lower);
+            if boundary && !out.is_empty() && !out.ends_with('_') {
+                out.push('_');
+            }
+        }
+        out.extend(c.to_lowercase());
+    }
+    out
+}
+
+/// All of [`SENSITIVE_PATTERNS`] as one set, so [`redact_sensitive`] can tell
+/// in a single scan whether any replacement pass would change its input. Only
+/// a hit on the original input matters: a pass that changes nothing cannot
+/// create a match for a later one.
+static SENSITIVE_PRECHECK: LazyLock<Option<regex::RegexSet>> = LazyLock::new(|| {
+    let set = regex::RegexSet::new(SENSITIVE_PATTERNS.iter().map(|(re, _)| re.as_str()));
+    debug_assert!(set.is_ok(), "bad redaction precheck: {set:?}");
+    set.ok()
+});
+
 /// Whether a structured field name — a JSON member key or a form field
 /// name — names a credential or PII whose value must not be logged.
 ///
 /// The one key test behind structural body redaction (see
 /// `LoggingMiddleware`), so JSON and form bodies agree on what is secret.
-/// The key is lowercased and `.`, `[`, `]`, `-` and spaces become `_`, so
-/// dotted and bracketed paths (`user.password`, `user[password]`) and
-/// camelCase (`authToken`) are tested on every segment. Broad on purpose:
+/// The key is normalized to lowercase `_`-separated segments before
+/// matching (see [`normalize_key`]), so dotted, bracketed, slashed and
+/// camelCase names (`user.password`, `user[pin]`, `user/pin`, `newPin`,
+/// `XMLToken`) are tested on every segment. Broad on purpose:
 /// a false positive costs a `[FILTERED]` in a log line, a false negative
 /// leaks a credential.
 ///
@@ -160,20 +202,14 @@ pub(crate) fn is_sensitive_key(key: &str) -> bool {
                          session|credential|cvv|cvc|private_?key|jwt|signature|cookie|\
                          code_?verifier|assertion";
         let segment = "pass|pw|pin|otp|totp|ssn|auth";
-        let code = "(?:auth|authorization|oauth|otp|totp|mfa|2fa|sms|verification|verify|\
+        let code = "(?:auth|authorization|oauth|otp|totp|mfa|2_?fa|sms|verification|verify|\
                     access|reset|recovery|security|confirmation|one_?time|pin)_?code";
         let pattern = format!("(?:{substring})|(?:^|_)(?:{segment}|{code})(?:_|$)");
         let re = regex::Regex::new(&pattern);
         debug_assert!(re.is_ok(), "bad sensitive-key pattern: {re:?}");
         re.ok()
     });
-    let normalized: String = key
-        .chars()
-        .map(|c| match c {
-            '.' | '[' | ']' | '-' | ' ' => '_',
-            c => c.to_ascii_lowercase(),
-        })
-        .collect();
+    let normalized = normalize_key(key);
     // A pattern that failed to compile treats every key as sensitive: fail
     // closed rather than log secrets.
     SENSITIVE_KEY
@@ -189,10 +225,24 @@ pub(crate) fn is_sensitive_key(key: &str) -> bool {
 /// session/credential/PIN/OTP/CVV/SSN/one-time-code names, bearer and basic
 /// credentials, and card/SSN-like digit runs. It is not a guarantee that arbitrary
 /// payloads are free of secrets.
-pub(crate) fn redact_sensitive(s: &str) -> String {
-    let mut result = s.to_string();
+///
+/// Borrows `s` back when nothing matches, which is the common case: one
+/// [`SENSITIVE_PRECHECK`] scan decides that, so a body of many small strings
+/// costs one pass per string rather than one per pattern plus a copy.
+pub(crate) fn redact_sensitive(s: &str) -> Cow<'_, str> {
+    // A set that failed to build says "maybe" to everything: fall through to
+    // the full passes rather than skip redaction.
+    if SENSITIVE_PRECHECK
+        .as_ref()
+        .is_some_and(|set| !set.is_match(s))
+    {
+        return Cow::Borrowed(s);
+    }
+    let mut result = Cow::Borrowed(s);
     for (regex, replacement) in SENSITIVE_PATTERNS.iter() {
-        result = regex.replace_all(&result, *replacement).to_string();
+        if let Cow::Owned(replaced) = regex.replace_all(&result, *replacement) {
+            result = Cow::Owned(replaced);
+        }
     }
     result
 }
@@ -1175,7 +1225,7 @@ impl ErrorTransformer {
     /// Uses the module-level [`SENSITIVE_PATTERNS`] regexes, which are compiled
     /// once on first use rather than on every call.
     fn filter_sensitive_string(&self, s: &str) -> String {
-        redact_sensitive(s)
+        redact_sensitive(s).into_owned()
     }
 
     /// Default error transformation.
@@ -1935,6 +1985,26 @@ mod tests {
             "code_verifier",
             "client_secret",
             "session.id",
+            // Segment-only names after a camelCase or other boundary.
+            "newPin",
+            "userPin",
+            "smsOtp",
+            "userSsn",
+            "ssnLast4",
+            "oldPw",
+            "currentPass",
+            "otpValue",
+            "userMfaCode",
+            "emailVerificationCode",
+            "user:pin",
+            "user/pin",
+            "user__pin",
+            "XMLToken",
+            "OAuthCode",
+            "TOTPCode",
+            "APIKey",
+            "user_2FACode",
+            "user2Pin",
         ] {
             assert!(is_sensitive_key(key), "{key}");
         }
@@ -1950,9 +2020,35 @@ mod tests {
             "shipping",
             "spinner",
             "mapping",
+            "opinion",
+            "happiness",
+            "Shipping",
+            "pinned",
+            "passenger",
+            "compassion",
+            "topology",
+            "authority",
+            "errorCode",
+            "statusCode",
         ] {
             assert!(!is_sensitive_key(key), "{key}");
         }
+    }
+
+    /// The common case (nothing to redact) neither allocates nor runs the
+    /// replacement passes.
+    #[test]
+    fn test_redact_sensitive_borrows_benign_input() {
+        for benign in ["", "ab", "hello world", r#"{"user":"alice"}"#] {
+            assert!(
+                matches!(redact_sensitive(benign), Cow::Borrowed(_)),
+                "{benign}"
+            );
+        }
+        assert!(matches!(
+            redact_sensitive("password=x"),
+            Cow::Owned(ref s) if s == "password=[FILTERED]"
+        ));
     }
 
     #[test]

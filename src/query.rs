@@ -203,10 +203,13 @@ pub(crate) fn parse(query: &str) -> QueryPairs {
 /// Empty segments (`a=1&&b=2`) carry nothing for any reader and are dropped.
 pub(crate) fn raw_segments_sorted(query: &str) -> Vec<&str> {
     let mut segments: Vec<&str> = query.split('&').filter(|s| !s.is_empty()).collect();
-    fn name(segment: &str) -> &str {
-        segment.split_once('=').map_or(segment, |(k, _)| k)
-    }
-    segments.sort_by(|a, b| name(a).cmp(name(b)));
+    // Ordered by the *decoded* name, as readers see it: sorting raw names
+    // would put `a=1&%61=2` and `%61=2&a=1` in the same order although
+    // first-wins reads `a` as 1 in one and 2 in the other. Ties (the same
+    // decoded name) keep their order, since the sort is stable.
+    segments.sort_by_cached_key(|segment| {
+        decode(segment.split_once('=').map_or(segment, |(k, _)| k)).into_owned()
+    });
     segments
 }
 
@@ -303,6 +306,12 @@ mod tests {
         assert_ne!(raw_segments_sorted("a=%FF"), raw_segments_sorted("a=%FE"));
         assert_ne!(raw_segments_sorted("a=+"), raw_segments_sorted("a=%20"));
         assert!(raw_segments_sorted("").is_empty());
+        // Differently spelled but equal names stay in request order, so the
+        // two orders below (which first-wins reads differently) differ.
+        assert_ne!(
+            raw_segments_sorted("a=1&%61=2"),
+            raw_segments_sorted("%61=2&a=1")
+        );
     }
 
     /// Distinct raw keys that decode to the same lossy string are one key to

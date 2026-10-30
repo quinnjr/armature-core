@@ -482,6 +482,7 @@ impl Http2Builder {
         H2ConnectionServer {
             builder: self.configure_hyper_builder(),
             stats: Arc::clone(&self.stats),
+            max_streams: self.config.max_concurrent_streams,
             limits: H2ConnectionLimits {
                 handshake_timeout: crate::pipeline::HEADER_READ_TIMEOUT,
                 idle_timeout: pipeline.keep_alive_timeout,
@@ -541,6 +542,9 @@ pub(crate) struct H2ConnectionServer {
     builder: hyper::server::conn::http2::Builder<hyper_util::rt::TokioExecutor>,
     stats: Arc<Http2Stats>,
     limits: H2ConnectionLimits,
+    /// The `max_concurrent_streams` the connection advertises, which bounds
+    /// its [`WireStreams`] bookkeeping.
+    max_streams: u32,
 }
 
 impl H2ConnectionServer {
@@ -578,7 +582,7 @@ impl H2ConnectionServer {
 
         let limits = self.limits;
         let tracker = Arc::new(StreamTracker::new());
-        let wire = Arc::new(WireStreams::default());
+        let wire = Arc::new(WireStreams::new(self.max_streams));
         let rate = state.body_read();
         // One budget per connection, shared by its streams through the state
         // every one of them is served with.
@@ -693,9 +697,24 @@ impl H2ConnectionServer {
 /// deadline", and `Instant + Duration` panics past the platform's range — in
 /// a connection watcher, that panic ends the watcher and with it every bound
 /// it enforced. Thirty years is what tokio itself uses for "far future".
+///
+/// Should even that not fit (an `at` already near the end of the clock's
+/// range), the step is halved until it does, so the result is the furthest
+/// representable moment rather than `at` itself — which would turn "never"
+/// into "already expired". Only an `at` at the very end of the range, with
+/// no room left at all, comes back unchanged.
 pub(crate) fn deadline_after(at: tokio::time::Instant, after: Duration) -> tokio::time::Instant {
     const FAR_FUTURE: Duration = Duration::from_secs(30 * 365 * 24 * 60 * 60);
-    at.checked_add(after.min(FAR_FUTURE)).unwrap_or(at)
+    let mut step = after.min(FAR_FUTURE);
+    loop {
+        if let Some(deadline) = at.checked_add(step) {
+            return deadline;
+        }
+        if step.is_zero() {
+            return at;
+        }
+        step /= 2;
+    }
 }
 
 /// Counts a connection's in-flight streams and remembers when it last went
@@ -720,7 +739,36 @@ pub(crate) struct StreamTracker {
     /// The response bodies still being sent, each as the moment (nanoseconds
     /// since `started`) by which it must next make progress. Weak, so a
     /// finished body drops out by itself; the watcher sweeps the dead entries.
-    responses: std::sync::Mutex<Vec<std::sync::Weak<AtomicU64>>>,
+    responses: std::sync::Mutex<Responses>,
+}
+
+/// [`StreamTracker`]'s watched response bodies.
+struct Responses {
+    list: Vec<std::sync::Weak<AtomicU64>>,
+    /// Sweep on push once the list is this long: twice what was live at the
+    /// last sweep, so each sweep is paid for by as many pushes as it scans.
+    sweep_at: usize,
+    #[cfg(test)]
+    sweeps: usize,
+}
+
+impl Responses {
+    /// The fewest entries worth sweeping for.
+    const MIN_SWEEP: usize = 64;
+
+    fn sweep(&mut self) {
+        self.list.retain(|r| r.strong_count() > 0);
+        self.swept();
+    }
+
+    /// Set the next sweep point from what is live now.
+    fn swept(&mut self) {
+        self.sweep_at = self.list.len().saturating_mul(2).max(Self::MIN_SWEEP);
+        #[cfg(test)]
+        {
+            self.sweeps += 1;
+        }
+    }
 }
 
 /// A response body missed its progress deadline: no progress within the write
@@ -735,7 +783,12 @@ impl StreamTracker {
             active: AtomicUsize::new(0),
             begun: AtomicU64::new(0),
             idle_since_nanos: AtomicU64::new(0),
-            responses: std::sync::Mutex::new(Vec::new()),
+            responses: std::sync::Mutex::new(Responses {
+                list: Vec::new(),
+                sweep_at: Responses::MIN_SWEEP,
+                #[cfg(test)]
+                sweeps: 0,
+            }),
         }
     }
 
@@ -751,11 +804,15 @@ impl StreamTracker {
         let clock = Arc::new(AtomicU64::new(self.nanos_at(deadline)));
         if let Ok(mut responses) = self.responses.lock() {
             // Sweep here as well as in the watcher, so a busy connection whose
-            // watcher rarely runs does not accumulate finished entries.
-            if responses.len() >= 64 {
-                responses.retain(|r| r.strong_count() > 0);
+            // watcher rarely runs does not accumulate finished entries — but
+            // only once the list has doubled since the last sweep: sweeping
+            // at a fixed length scanned every live entry on every push once
+            // that many were in flight, O(n²) at a large
+            // `max_concurrent_streams`.
+            if responses.list.len() >= responses.sweep_at {
+                responses.sweep();
             }
-            responses.push(Arc::downgrade(&clock));
+            responses.list.push(Arc::downgrade(&clock));
         }
         clock
     }
@@ -770,7 +827,7 @@ impl StreamTracker {
             return Ok(None);
         };
         let mut oldest: Option<u64> = None;
-        responses.retain(|r| match r.upgrade() {
+        responses.list.retain(|r| match r.upgrade() {
             Some(clock) => {
                 let at = clock.load(Ordering::Acquire);
                 oldest = Some(oldest.map_or(at, |o| o.min(at)));
@@ -778,6 +835,7 @@ impl StreamTracker {
             }
             None => false,
         });
+        responses.swept();
         let Some(oldest) = oldest else {
             return Ok(None);
         };
@@ -983,9 +1041,34 @@ impl hyper::body::Body for TrackedBody {
 /// `h2` nothing more to send, which must not read as a stall. Every open one
 /// must meet the same rules as [`TrackedBody`]: progress within the write
 /// timeout, and the minimum rate counted from its headers.
-#[derive(Default)]
 pub(crate) struct WireStreams {
-    open: std::sync::Mutex<std::collections::HashMap<u32, WireStream>>,
+    state: std::sync::Mutex<WireState>,
+}
+
+/// What [`WireStreams`] knows, under one lock.
+struct WireState {
+    open: std::collections::HashMap<u32, WireStream>,
+    /// Streams the peer has reset, so `HEADERS` for one that reach the
+    /// socket only afterwards do not open it. Under write backpressure `h2`
+    /// can have a response's `HEADERS` encoded but unflushed when the peer's
+    /// `RST_STREAM` for it is read; recorded in the order the bytes moved,
+    /// the reset found nothing to remove and the late `HEADERS` then opened a
+    /// stream nothing would ever close — judged stalled a write timeout
+    /// later, closing the connection and every other stream on it. Stream
+    /// ids are never reused on a connection, so remembering one cannot
+    /// mistake a later stream for it.
+    reset: std::collections::HashSet<u32>,
+    /// `reset`'s ids oldest first, so the oldest is forgotten once
+    /// `reset_cap` are remembered. Ids the server has since closed stay here
+    /// until they age out; they only make the memory a little shorter.
+    reset_order: std::collections::VecDeque<u32>,
+    reset_cap: usize,
+    /// More open streams than this is not something a peer kept to
+    /// `max_concurrent_streams` can cause.
+    open_cap: usize,
+    /// A stream was refused for `open_cap`: the connection is closed at the
+    /// watcher's next look.
+    overflowed: bool,
 }
 
 /// One response stream open on the wire.
@@ -1000,6 +1083,30 @@ struct WireStream {
 }
 
 impl WireStreams {
+    /// Bookkeeping for a connection that allows `max_concurrent_streams`
+    /// peer-initiated streams at once.
+    ///
+    /// Both bounds are twice that (with a floor, for tiny settings): the
+    /// wire view lags `h2`'s by whatever is buffered, so a few more open or
+    /// reset streams than the setting allows are legitimate, but not twice
+    /// as many.
+    pub(crate) fn new(max_concurrent_streams: u32) -> Self {
+        let cap = usize::try_from(max_concurrent_streams)
+            .unwrap_or(usize::MAX)
+            .saturating_mul(2)
+            .max(32);
+        Self {
+            state: std::sync::Mutex::new(WireState {
+                open: std::collections::HashMap::new(),
+                reset: std::collections::HashSet::new(),
+                reset_order: std::collections::VecDeque::new(),
+                reset_cap: cap,
+                open_cap: cap,
+                overflowed: false,
+            }),
+        }
+    }
+
     /// The earliest moment an open response stream must next make progress,
     /// `Ok(None)` if none is open (or no rule applies), or [`Stalled`] if one
     /// is already past it.
@@ -1009,11 +1116,17 @@ impl WireStreams {
         write_timeout: Option<Duration>,
         rate: crate::BodyReadPolicy,
     ) -> Result<Option<tokio::time::Instant>, Stalled> {
-        let Ok(open) = self.open.lock() else {
+        let Ok(state) = self.state.lock() else {
             return Ok(None);
         };
+        // Past `open_cap` streams stopped being watched, so the connection
+        // cannot be vouched for; it closes rather than run unwatched (or grow
+        // the map without bound, as it could with no rule to judge by).
+        if state.overflowed {
+            return Err(Stalled);
+        }
         let mut earliest: Option<tokio::time::Instant> = None;
-        for stream in open.values() {
+        for stream in state.open.values() {
             let stall = write_timeout.map(|limit| deadline_after(stream.progressed, limit));
             let slow = rate
                 .rate_budget(usize::try_from(stream.sent).unwrap_or(usize::MAX))
@@ -1033,30 +1146,41 @@ impl WireStreams {
 
     /// Apply the frames one side of the connection has just carried.
     fn record(&self, frames: &[FrameHead], outbound: bool) {
-        let Ok(mut open) = self.open.lock() else {
+        let Ok(mut state) = self.state.lock() else {
             return;
         };
         let now = tokio::time::Instant::now();
         for frame in frames {
             let end_stream = frame.flags & FLAG_END_STREAM != 0;
             match (frame.kind, outbound) {
-                (FRAME_RST_STREAM, _) => {
-                    open.remove(&frame.stream);
+                // The peer cancelled: the stream is over, and whatever `h2`
+                // already had queued for it must not reopen it. Remembered
+                // even for an open stream — an informational response may be
+                // out with the final one still queued.
+                (FRAME_RST_STREAM, false) => {
+                    state.open.remove(&frame.stream);
+                    state.remember_reset(frame.stream);
                 }
-                (FRAME_HEADERS, true) if end_stream => {
-                    open.remove(&frame.stream);
-                }
+                // Nothing more goes out for this stream after either.
+                (FRAME_RST_STREAM, true) => state.close(frame.stream),
+                (FRAME_HEADERS | FRAME_DATA, true) if end_stream => state.close(frame.stream),
                 (FRAME_HEADERS, true) => {
-                    open.entry(frame.stream).or_insert(WireStream {
+                    if state.reset.contains(&frame.stream) {
+                        continue;
+                    }
+                    if state.open.len() >= state.open_cap && !state.open.contains_key(&frame.stream)
+                    {
+                        state.overflowed = true;
+                        continue;
+                    }
+                    state.open.entry(frame.stream).or_insert(WireStream {
                         opened: now,
                         progressed: now,
                         sent: 0,
                     });
                 }
                 (FRAME_DATA, true) => {
-                    if end_stream {
-                        open.remove(&frame.stream);
-                    } else if let Some(stream) = open.get_mut(&frame.stream)
+                    if let Some(stream) = state.open.get_mut(&frame.stream)
                         && frame.len > 0
                     {
                         stream.sent = stream.sent.saturating_add(u64::from(frame.len));
@@ -1066,6 +1190,28 @@ impl WireStreams {
                 _ => {}
             }
         }
+    }
+}
+
+impl WireState {
+    /// The server is done sending on `stream`.
+    fn close(&mut self, stream: u32) {
+        self.open.remove(&stream);
+        self.reset.remove(&stream);
+    }
+
+    /// Remember that the peer reset `stream`, forgetting the oldest reset
+    /// once `reset_cap` are remembered.
+    fn remember_reset(&mut self, stream: u32) {
+        if !self.reset.insert(stream) {
+            return;
+        }
+        while self.reset_order.len() >= self.reset_cap {
+            if let Some(oldest) = self.reset_order.pop_front() {
+                self.reset.remove(&oldest);
+            }
+        }
+        self.reset_order.push_back(stream);
     }
 }
 
@@ -1934,7 +2080,7 @@ mod tests {
     /// peer resets is let go rather than counted as stalled.
     #[tokio::test]
     async fn wire_streams_follow_a_response_to_its_end() {
-        let wire = WireStreams::default();
+        let wire = WireStreams::new(100);
         let timeout = Some(Duration::from_millis(100));
         let rate = crate::BodyReadPolicy {
             idle_timeout: Duration::from_secs(60),
@@ -1963,6 +2109,136 @@ mod tests {
         wire.record(&[head(FRAME_DATA, FLAG_END_STREAM, 1)], true);
         wire.record(&[head(FRAME_RST_STREAM, 0, 3)], false);
         assert_eq!(wire.next_stall_deadline(due, timeout, rate), Ok(None));
+    }
+
+    fn rst_test_head(kind: u8, flags: u8, stream: u32) -> FrameHead {
+        FrameHead {
+            len: 4,
+            kind,
+            flags,
+            stream,
+        }
+    }
+
+    /// The finding: under write backpressure `h2` can have a stream's
+    /// `HEADERS` encoded but not yet on the socket when the peer's
+    /// `RST_STREAM` for it is read. The reset found nothing to remove, the
+    /// late `HEADERS` then opened the stream, and nothing ever closed it: the
+    /// connection was judged stalled a write timeout later and closed, taking
+    /// every other stream on it along.
+    #[tokio::test]
+    async fn a_reset_read_before_its_headers_are_written_still_ends_the_stream() {
+        let wire = WireStreams::new(100);
+        let timeout = Some(Duration::from_millis(100));
+        let rate = crate::BodyReadPolicy {
+            idle_timeout: Duration::from_secs(60),
+            min_bytes_per_sec: 0,
+        };
+        let later = tokio::time::Instant::now() + Duration::from_secs(10);
+
+        wire.record(&[rst_test_head(FRAME_RST_STREAM, 0, 1)], false);
+        wire.record(&[rst_test_head(FRAME_HEADERS, 0x4, 1)], true);
+        assert_eq!(wire.next_stall_deadline(later, timeout, rate), Ok(None));
+
+        // An informational response already out, the reset, then the final
+        // response's headers that were queued behind it.
+        wire.record(&[rst_test_head(FRAME_HEADERS, 0x4, 3)], true);
+        wire.record(&[rst_test_head(FRAME_RST_STREAM, 0, 3)], false);
+        wire.record(&[rst_test_head(FRAME_HEADERS, 0x4, 3)], true);
+        assert_eq!(wire.next_stall_deadline(later, timeout, rate), Ok(None));
+
+        // Other streams are still watched.
+        wire.record(&[rst_test_head(FRAME_HEADERS, 0x4, 5)], true);
+        assert_eq!(wire.next_stall_deadline(later, timeout, rate), Err(Stalled));
+    }
+
+    /// Neither the remembered resets nor the open streams grow without bound:
+    /// resets age out oldest first, and more open streams than the
+    /// connection could legitimately have closes it — even with no write
+    /// timeout or rate rule to otherwise judge them by.
+    #[tokio::test]
+    async fn wire_stream_bookkeeping_is_bounded() {
+        let wire = WireStreams::new(10);
+        let no_rules = crate::BodyReadPolicy {
+            idle_timeout: Duration::from_secs(60),
+            min_bytes_per_sec: 0,
+        };
+        let now = tokio::time::Instant::now();
+        for id in (1..10_000u32).step_by(2) {
+            wire.record(&[rst_test_head(FRAME_RST_STREAM, 0, id)], false);
+        }
+        {
+            let state = wire.state.lock().unwrap();
+            assert!(
+                state.reset.len() <= state.reset_cap,
+                "{}",
+                state.reset.len()
+            );
+            assert!(state.reset_order.len() <= state.reset_cap);
+        }
+        assert_eq!(wire.next_stall_deadline(now, None, no_rules), Ok(None));
+
+        let cap = wire.state.lock().unwrap().open_cap;
+        let fresh = 20_001u32;
+        for i in 0..u32::try_from(cap).unwrap() {
+            wire.record(&[rst_test_head(FRAME_HEADERS, 0x4, fresh + 2 * i)], true);
+        }
+        assert_eq!(wire.next_stall_deadline(now, None, no_rules), Ok(None));
+        wire.record(
+            &[rst_test_head(
+                FRAME_HEADERS,
+                0x4,
+                fresh + 2 * u32::try_from(cap).unwrap(),
+            )],
+            true,
+        );
+        assert_eq!(wire.state.lock().unwrap().open.len(), cap);
+        assert_eq!(wire.next_stall_deadline(now, None, no_rules), Err(Stalled));
+    }
+
+    /// `deadline_after` promised "never" on overflow but returned `at` —
+    /// now — which turns "no deadline" into "already expired".
+    #[tokio::test]
+    async fn a_deadline_near_the_end_of_the_clock_is_still_in_the_future() {
+        // Walk an instant out to within a couple of hours of the clock's end.
+        let mut edge = tokio::time::Instant::now();
+        let mut step = Duration::from_secs(u64::MAX >> 1);
+        while step >= Duration::from_secs(3600) {
+            match edge.checked_add(step) {
+                Some(next) => edge = next,
+                None => step /= 2,
+            }
+        }
+        let near = edge.checked_sub(Duration::from_secs(3600)).unwrap();
+        assert!(
+            near.checked_add(Duration::from_secs(30 * 365 * 24 * 3600))
+                .is_none()
+        );
+        assert!(deadline_after(near, Duration::MAX) > near);
+    }
+
+    /// Every push used to sweep the whole list once it held 64 entries, so a
+    /// connection with many long responses in flight paid O(n) per response.
+    /// The sweep is amortized now, and finished entries still do not pile up.
+    #[tokio::test]
+    async fn the_response_list_is_swept_amortized() {
+        let tracker = StreamTracker::new();
+        let far = tokio::time::Instant::now() + Duration::from_secs(60);
+        let live: Vec<_> = (0..500).map(|_| tracker.watch_response(far)).collect();
+        let sweeps_before = tracker.responses.lock().unwrap().sweeps;
+        let more: Vec<_> = (0..500).map(|_| tracker.watch_response(far)).collect();
+        let sweeps = tracker.responses.lock().unwrap().sweeps - sweeps_before;
+        assert!(sweeps <= 2, "{sweeps} sweeps for 500 live pushes");
+        drop(more);
+        for _ in 0..10_000 {
+            drop(tracker.watch_response(far));
+        }
+        let len = tracker.responses.lock().unwrap().list.len();
+        assert!(
+            len <= 2 * live.len() + 64,
+            "{len} entries for {} live",
+            live.len()
+        );
     }
 
     #[tokio::test]

@@ -1306,11 +1306,22 @@ async fn handle_micro_request(
     let method = crate::Method::from(req.method().as_str());
     let query = req.uri().query().map(str::to_owned);
 
+    // Asterisk-form is only meaningful for OPTIONS (RFC 9112 §3.2.4); for any
+    // other method a `/:param` or catch-all route would match `*`. Same rule
+    // as `admit` on the application serve paths.
+    if req.uri().path() == "*" && !matches!(method, crate::Method::Options) {
+        tracing::debug!(method = %method, "Rejected asterisk-form on a method other than OPTIONS");
+        return Ok(to_hyper_response(
+            Error::BadRequest("asterisk-form request target is only valid for OPTIONS".to_string())
+                .to_client_response(),
+        ));
+    }
+
     // One spelling of the path for middleware, routing and handlers.
     let path = match crate::routing::canonicalize_path(req.uri().path()) {
         Ok(path) => path.into_owned(),
         Err(rejection) => {
-            tracing::warn!(method = %method, reason = %rejection, "Rejected a non-canonical request path");
+            tracing::debug!(method = %method, reason = %rejection, "Rejected a non-canonical request path");
             return Ok(to_hyper_response(
                 Error::BadRequest(rejection.to_string()).to_client_response(),
             ));
@@ -1335,7 +1346,7 @@ async fn handle_micro_request(
     ) {
         Ok(host) => host.map(str::to_owned),
         Err(rejection) => {
-            tracing::warn!(method = %method, reason = rejection, "Rejected a request authority");
+            tracing::debug!(method = %method, reason = rejection, "Rejected a request authority");
             return Ok(to_hyper_response(
                 Error::BadRequest(rejection.to_string()).to_client_response(),
             ));
@@ -1364,7 +1375,7 @@ async fn handle_micro_request(
         .and_then(|v| v.trim().parse::<usize>().ok())
         && declared_len > app.max_body_size
     {
-        tracing::warn!(
+        tracing::debug!(
             method = %method,
             path = %path,
             limit = app.max_body_size,
@@ -1394,7 +1405,7 @@ async fn handle_micro_request(
     match read {
         Ok(body_bytes) => http_req.body = body_bytes,
         Err(BodyReadError::TooLarge) => {
-            tracing::warn!(
+            tracing::debug!(
                 method = %method,
                 path = %path,
                 limit = app.max_body_size,
@@ -1403,7 +1414,7 @@ async fn handle_micro_request(
             return Ok(to_hyper_response(payload_too_large_response()));
         }
         Err(BodyReadError::TimedOut) => {
-            tracing::warn!(method = %method, path = %path, "Request body not received in time");
+            tracing::debug!(method = %method, path = %path, "Request body not received in time");
             return Ok(to_hyper_response(
                 Error::RequestTimeout("request body was not received in time".to_string())
                     .to_client_response(),
@@ -1419,7 +1430,7 @@ async fn handle_micro_request(
         // sent; substituting an empty body would let the handler act on a body
         // that never arrived intact.
         Err(BodyReadError::Source(err)) => {
-            tracing::warn!(method = %method, path = %path, error = %err, "Failed to read request body");
+            tracing::debug!(method = %method, path = %path, error = %err, "Failed to read request body");
             return Ok(to_hyper_response(HttpResponse::new(400)));
         }
     }
@@ -2349,6 +2360,28 @@ mod tests {
         let response = send_raw_request(
             addr,
             b"POST http://other.example/ HTTP/1.1\r\n\
+              Host: test\r\n\
+              Content-Length: 0\r\n\
+              Connection: close\r\n\
+              \r\n",
+        )
+        .await;
+        let status_line = response.lines().next().unwrap_or_default();
+        assert!(status_line.contains("400"), "{response:?}");
+    }
+
+    /// `GET *` would otherwise reach the catch-all route below.
+    #[tokio::test]
+    async fn test_serve_rejects_asterisk_form_except_for_options() {
+        let app = App::new()
+            .with_max_body_size(1024)
+            .route("/*rest", post(body_len_handler))
+            .build();
+        let addr = spawn_test_server(app).await;
+
+        let response = send_raw_request(
+            addr,
+            b"POST * HTTP/1.1\r\n\
               Host: test\r\n\
               Content-Length: 0\r\n\
               Connection: close\r\n\

@@ -2,8 +2,14 @@
 
 version: 2
 updates:
+  # The crate and the fuzz harnesses (a separate workspace with its own
+  # lockfile) are one entry, so a bump moves both lockfiles together: the
+  # fuzz job builds `--locked`, and a root requirement change landing alone
+  # would break it, or leave the fuzzer exercising versions that don't ship.
   - package-ecosystem: "cargo"
-    directory: "/"
+    directories:
+      - "/"
+      - "/fuzz"
     schedule:
       interval: "weekly"
       day: "monday"
@@ -16,31 +22,22 @@ updates:
       prefix: "deps(rust)"
     labels:
       - "dependencies"
-    # Only patch releases are grouped; minor bumps are reviewed one by one.
     groups:
+      # Patch releases ride together.
       rust-patch:
         patterns:
           - "*"
         update-types:
           - "patch"
-
-  # The fuzz harnesses are a separate workspace with their own lockfile.
-  - package-ecosystem: "cargo"
-    directory: "/fuzz"
-    schedule:
-      interval: "weekly"
-      day: "monday"
-    cooldown:
-      default-days: 7
-    open-pull-requests-limit: 5
-    commit-message:
-      prefix: "deps(fuzz)"
-    labels:
-      - "dependencies"
-    groups:
-      fuzz:
+      # Minor and major bumps are still reviewed one dependency at a time,
+      # each as a single PR across both directories.
+      rust-per-dependency:
+        group-by: dependency-name
         patterns:
           - "*"
+        update-types:
+          - "minor"
+          - "major"
 
   # Keeps the SHA-pinned actions in .github/workflows current.
   - package-ecosystem: "github-actions"

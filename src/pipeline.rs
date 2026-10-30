@@ -482,6 +482,13 @@ impl<T: tokio::io::AsyncWrite + Unpin> tokio::io::AsyncWrite for WriteDeadline<T
         cx: &mut std::task::Context<'_>,
     ) -> std::task::Poll<std::io::Result<()>> {
         let polled = std::pin::Pin::new(&mut self.inner).poll_flush(cx);
+        // Everything handed over has reached the peer: it has caught up, and
+        // the backlog is over. Left open, its `since` outlived a keep-alive
+        // idle, and the next response's first wait was judged against that
+        // idle time too — failing at once instead of getting the grace.
+        if let std::task::Poll::Ready(Ok(())) = polled {
+            self.backlog = None;
+        }
         self.guard(cx, polled)
     }
 
@@ -984,6 +991,82 @@ mod tests {
         // 1 KiB every 20 ms is ~50 KiB/s against a 4 KiB/s floor.
         let (written, _) = write_to_a_trickling_reader(64 * 1024, 1024, 4096).await;
         written.expect("an above-rate reader is served in full");
+    }
+
+    /// A writer whose writes and flushes are each switched between "the peer
+    /// is keeping up" and "the peer is not reading".
+    #[derive(Default)]
+    struct Gate {
+        writes_blocked: bool,
+        flush_blocked: bool,
+    }
+
+    impl tokio::io::AsyncWrite for Gate {
+        fn poll_write(
+            self: std::pin::Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+            buf: &[u8],
+        ) -> std::task::Poll<std::io::Result<usize>> {
+            if self.writes_blocked {
+                std::task::Poll::Pending
+            } else {
+                std::task::Poll::Ready(Ok(buf.len()))
+            }
+        }
+
+        fn poll_flush(
+            self: std::pin::Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            if self.flush_blocked {
+                std::task::Poll::Pending
+            } else {
+                std::task::Poll::Ready(Ok(()))
+            }
+        }
+
+        fn poll_shutdown(
+            self: std::pin::Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            std::task::Poll::Ready(Ok(()))
+        }
+    }
+
+    /// A backlog opened by a flush that had to wait (a TLS stream pushes its
+    /// records out in `poll_flush`) ended when that flush completed — not
+    /// when the next write went out whole, which after a keep-alive idle may
+    /// be minutes later. Until then its `since` survived, and the next
+    /// response's first wait was judged against the idle time as well, so it
+    /// failed at once instead of getting the grace.
+    #[tokio::test]
+    async fn a_completed_flush_ends_the_backlog() {
+        use std::task::Poll;
+        use tokio::io::AsyncWrite;
+        let mut io = WriteDeadline::new(Gate::default(), Some(Duration::from_secs(60)))
+            .with_min_rate(crate::BodyReadPolicy {
+                idle_timeout: Duration::from_millis(50),
+                min_bytes_per_sec: 4096,
+            });
+        let mut cx = std::task::Context::from_waker(std::task::Waker::noop());
+
+        io.inner.flush_blocked = true;
+        assert!(std::pin::Pin::new(&mut io).poll_flush(&mut cx).is_pending());
+        io.inner.flush_blocked = false;
+        assert!(matches!(
+            std::pin::Pin::new(&mut io).poll_flush(&mut cx),
+            Poll::Ready(Ok(()))
+        ));
+
+        // Idle well past the grace, then a write the peer is slow to take.
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        io.inner.writes_blocked = true;
+        assert!(
+            std::pin::Pin::new(&mut io)
+                .poll_write(&mut cx, b"next response")
+                .is_pending(),
+            "a new backlog gets its grace"
+        );
     }
 
     #[test]

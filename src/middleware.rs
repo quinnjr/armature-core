@@ -3,10 +3,11 @@
 use crate::logging::{debug, error, info, trace};
 use crate::{Error, HttpRequest, HttpResponse};
 use async_trait::async_trait;
+use std::borrow::Cow;
 use std::collections::HashMap;
 use std::future::Future;
 use std::pin::Pin;
-use std::sync::Arc;
+use std::sync::{Arc, LazyLock};
 
 /// Type alias for the next handler in the middleware chain
 pub type Next = Box<
@@ -641,6 +642,16 @@ const BODY_REDACTION_SLACK: usize = 64 * 1024;
 /// Deeper nesting is logged as `<N bytes>` rather than trusted.
 const EMBEDDED_JSON_DEPTH: usize = 4;
 
+/// How many strings, numbers and form values one body may run through the
+/// value redactor. Each is a regex scan on the async worker, and a body of
+/// thousands of tiny values would otherwise cost thousands of them; past the
+/// budget the body is withheld instead.
+const REDACTION_LEAF_BUDGET: usize = 4096;
+
+/// Shorter text cannot hold anything the value redactor matches (the
+/// shortest, `pw=x`, is four bytes), so it skips the redactor and the budget.
+const MIN_REDACTABLE_LEN: usize = 4;
+
 /// The body shapes [`body_log_preview`] knows how to redact structurally.
 enum BodyKind<'a> {
     Json,
@@ -669,8 +680,13 @@ impl<'a> BodyKind<'a> {
 }
 
 /// Replace the value of every credential-named member of `value`, whatever
-/// its type, with `"[FILTERED]"`; recurse into everything else.
-fn redact_json_value(value: &mut serde_json::Value, depth: usize) {
+/// its type, with `"[FILTERED]"`; recurse into everything else. `None` once
+/// `budget` (see [`REDACTION_LEAF_BUDGET`]) runs out.
+fn redact_json_value(
+    value: &mut serde_json::Value,
+    depth: usize,
+    budget: &mut usize,
+) -> Option<()> {
     use serde_json::Value;
     match value {
         Value::Object(map) => {
@@ -678,34 +694,97 @@ fn redact_json_value(value: &mut serde_json::Value, depth: usize) {
                 if crate::error_transform::is_sensitive_key(key) {
                     *member = Value::String("[FILTERED]".to_owned());
                 } else {
-                    redact_json_value(member, depth);
+                    redact_json_value(member, depth, budget)?;
                 }
             }
         }
-        Value::Array(items) => items
-            .iter_mut()
-            .for_each(|item| redact_json_value(item, depth)),
-        Value::String(text) => *text = redact_json_string(text, depth),
+        Value::Array(items) => {
+            for item in items {
+                redact_json_value(item, depth, budget)?;
+            }
+        }
+        Value::String(text) => {
+            if let Cow::Owned(redacted) = redact_json_string(text, depth, budget)? {
+                *text = redacted;
+            }
+        }
+        // Numbers get the same value patterns as strings: a card number or
+        // SSN sent bare (`"card":4111111111111111`) is as sensitive as one
+        // sent quoted, and a key-name list cannot anticipate every field.
+        Value::Number(number) => {
+            let text = number.to_string();
+            if text.len() >= MIN_REDACTABLE_LEN {
+                *budget = budget.checked_sub(1)?;
+                if let Cow::Owned(filtered) = crate::error_transform::redact_sensitive(&text) {
+                    *value = Value::String(filtered);
+                }
+            }
+        }
         _ => {}
     }
+    Some(())
 }
 
-/// A JSON string value as it may be logged. One that itself holds JSON
-/// (`"{\"password\":\"x\"}"`) is parsed and redacted structurally, up to
-/// [`EMBEDDED_JSON_DEPTH`] levels; past that, or for anything else, the text
-/// path catches `password=x`-style content.
-fn redact_json_string(text: &str, depth: usize) -> String {
-    let trimmed = text.trim_start();
-    if trimmed.starts_with('{') || trimmed.starts_with('[') {
+/// A JSON string value as it may be logged. One that itself holds JSON —
+/// an object or array (`"{\"password\":\"x\"}"`), or a JSON-encoded string
+/// of one (double-stringified) — is parsed and redacted structurally, up to
+/// [`EMBEDDED_JSON_DEPTH`] levels; past that it is replaced by its size.
+/// Anything else goes through [`redact_text`].
+fn redact_json_string<'a>(text: &'a str, depth: usize, budget: &mut usize) -> Option<Cow<'a, str>> {
+    if text.len() < MIN_REDACTABLE_LEN {
+        return Some(Cow::Borrowed(text));
+    }
+    *budget = budget.checked_sub(1)?;
+    if text.trim_start().starts_with(['{', '[', '"']) {
         let Some(depth) = depth.checked_sub(1) else {
-            return format!("<{} bytes>", text.len());
+            return Some(Cow::Owned(format!("<{} bytes>", text.len())));
         };
         if let Ok(mut inner) = serde_json::from_str::<serde_json::Value>(text) {
-            redact_json_value(&mut inner, depth);
-            return inner.to_string();
+            redact_json_value(&mut inner, depth, budget)?;
+            return Some(Cow::Owned(inner.to_string()));
         }
     }
-    crate::error_transform::redact_sensitive(text)
+    Some(redact_text(text))
+}
+
+/// Free text (a non-JSON string value or a form value) as it may be logged:
+/// the shared value patterns, then a fail-closed check. If a credential key
+/// still sits in quotes without a `[FILTERED]` value after it — Python repr
+/// (`{'password': 'x'}`), stray escapes (`\"token\": \"x\"`), or any shape
+/// the patterns do not know — the whole text is withheld rather than trusted.
+///
+/// `Cow::Borrowed` means "unchanged": callers keep the original text then.
+fn redact_text(text: &str) -> Cow<'_, str> {
+    // A quoted key needs a quote: most text skips the second scan.
+    let filtered = crate::error_transform::redact_sensitive(text);
+    if filtered.contains(['"', '\'']) && has_unredacted_quoted_key(&filtered) {
+        return Cow::Owned("[WITHHELD]".to_owned());
+    }
+    filtered
+}
+
+/// Whether `text` holds a quoted, credential-named key (see
+/// [`crate::error_transform::is_sensitive_key`]) not followed by the
+/// `[FILTERED]` marker the value patterns leave behind.
+fn has_unredacted_quoted_key(text: &str) -> bool {
+    static QUOTED_KEY: LazyLock<Option<regex::Regex>> = LazyLock::new(|| {
+        let re = regex::Regex::new(r#"[\\'"]([A-Za-z0-9_.\[\]-]{1,128})\\?['"]"#);
+        debug_assert!(re.is_ok(), "bad quoted-key pattern: {re:?}");
+        re.ok()
+    });
+    // Unable to look: assume the worst.
+    let Some(re) = QUOTED_KEY.as_ref() else {
+        return true;
+    };
+    re.captures_iter(text).any(|caps| {
+        let (Some(whole), Some(key)) = (caps.get(0), caps.get(1)) else {
+            return false;
+        };
+        crate::error_transform::is_sensitive_key(key.as_str())
+            && !text[whole.end()..]
+                .trim_start_matches(['\\', '\'', '"', ':', '=', ' ', '\t'])
+                .starts_with("[FILTERED]")
+    })
 }
 
 /// Whether a urlencoded field name names a credential. Besides the shared
@@ -716,13 +795,27 @@ fn is_sensitive_form_key(key: &str) -> bool {
     crate::error_transform::is_sensitive_key(key) || last.eq_ignore_ascii_case("code")
 }
 
+/// Whether a decoded form or multipart field name looks like one. Names are
+/// logged verbatim, so one that does not is likely the real content of a
+/// mislabeled body — JSON sent as a form (`{"password":"x"}` parses as one
+/// pair whose *name* is the whole document), or multipart text — and the
+/// body is withheld rather than logged through a name nobody redacts.
+fn is_plausible_field_name(name: &str) -> bool {
+    (1..=128).contains(&name.len())
+        && name
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'.' | b'[' | b']' | b'-'))
+}
+
 /// The full redacted rendering of `body`, or `None` if it cannot be shown
 /// safely (unknown type, or it does not parse as the declared one).
 fn redact_body(kind: BodyKind<'_>, body: &[u8]) -> Option<String> {
     match kind {
         BodyKind::Json => {
             let mut value: serde_json::Value = serde_json::from_slice(body).ok()?;
-            redact_json_value(&mut value, EMBEDDED_JSON_DEPTH);
+            redact_json_value(&mut value, EMBEDDED_JSON_DEPTH, &mut {
+                REDACTION_LEAF_BUDGET
+            })?;
             Some(value.to_string())
         }
         BodyKind::Form => {
@@ -731,18 +824,22 @@ fn redact_body(kind: BodyKind<'_>, body: &[u8]) -> Option<String> {
             // is `user[password]` here.
             let text = std::str::from_utf8(body).ok()?;
             let pairs = crate::query::parse(text);
-            let rendered: Vec<String> = pairs
-                .iter()
-                .map(|(key, value)| {
-                    let value = if is_sensitive_form_key(key) {
-                        "[FILTERED]".to_owned()
-                    } else {
-                        urlencoding::encode(&crate::error_transform::redact_sensitive(value))
-                            .into_owned()
-                    };
-                    format!("{}={value}", urlencoding::encode(key))
-                })
-                .collect();
+            if !pairs.iter().all(|(key, _)| is_plausible_field_name(key)) {
+                return None;
+            }
+            let mut budget = REDACTION_LEAF_BUDGET;
+            let mut rendered = Vec::with_capacity(pairs.len());
+            for (key, value) in pairs.iter() {
+                let value = if is_sensitive_form_key(key) {
+                    "[FILTERED]".to_owned()
+                } else {
+                    if value.len() >= MIN_REDACTABLE_LEN {
+                        budget = budget.checked_sub(1)?;
+                    }
+                    urlencoding::encode(&redact_text(value)).into_owned()
+                };
+                rendered.push(format!("{}={value}", urlencoding::encode(key)));
+            }
             Some(rendered.join("&"))
         }
         BodyKind::Multipart(content_type) => {
@@ -750,6 +847,9 @@ fn redact_body(kind: BodyKind<'_>, body: &[u8]) -> Option<String> {
             let mut parts = Vec::new();
             for field in parser.parts(body) {
                 let field = field.ok()?;
+                if !is_plausible_field_name(&field.name) {
+                    return None;
+                }
                 let size = match (&field.file, &field.value) {
                     (Some(file), _) => file.data.len(),
                     (None, Some(value)) => value.len(),
@@ -1004,6 +1104,18 @@ mod tests {
         assert_eq!(out, "\"é... (8 bytes)");
     }
 
+    #[test]
+    fn json_numbers_get_the_value_patterns_too() {
+        let logged = body_log_preview(
+            Some("application/json"),
+            br#"{"card":4111111111111111,"tax_id":123456789,"qty":3}"#,
+            1024,
+        );
+        assert!(!logged.contains("4111111111111111"), "{logged}");
+        assert!(!logged.contains("123456789"), "{logged}");
+        assert!(logged.contains("\"qty\":3"), "{logged}");
+    }
+
     /// Every round-4 bypass of the old regex-only redaction.
     #[test]
     fn json_bodies_are_redacted_structurally() {
@@ -1099,6 +1211,71 @@ mod tests {
             body_log_preview(JSON, &big, 10),
             format!("<{} bytes>", big.len())
         );
+    }
+
+    /// A body mislabeled as a form parses as pairs whose *names* are the
+    /// real content; names are logged verbatim, so any implausible name
+    /// withholds the whole body.
+    #[test]
+    fn mislabeled_form_bodies_fail_closed() {
+        for body in [
+            &br#"{"password":"s3cr3t","user":"a"}"#[..],
+            b"--XyZ\r\nContent-Disposition: form-data; name=\"password\"\r\n\r\ns3cr3t\r\n--XyZ--\r\n",
+            b"=s3cr3t",
+        ] {
+            let out = body_log_preview(FORM, body, 4096);
+            assert_eq!(out, format!("<{} bytes>", body.len()), "{out}");
+        }
+        // Bracketed, dotted and dashed names are still fine.
+        let out = body_log_preview(FORM, b"user[0][name]=a&x.y-z_1=b", 4096);
+        assert_eq!(out, "user%5B0%5D%5Bname%5D=a&x.y-z_1=b");
+
+        // Multipart part names get the same test.
+        let ct = "multipart/form-data; boundary=XyZ";
+        let body =
+            b"--XyZ\r\nContent-Disposition: form-data; name=\"pw: s3cr3t\"\r\n\r\nx\r\n--XyZ--\r\n";
+        let out = body_log_preview(Some(ct), body, 4096);
+        assert_eq!(out, format!("<{} bytes>", body.len()), "{out}");
+    }
+
+    /// A JSON string holding a JSON-encoded string (double-stringified) is
+    /// decoded and redacted; a quoted credential key the redactor still
+    /// cannot see past (Python repr, stray escapes) withholds the string.
+    #[test]
+    fn stringified_and_repr_credentials_fail_closed() {
+        let inner = r#"{"password":"s3cr3t"}"#;
+        let once = serde_json::to_string(inner).unwrap();
+        let twice = serde_json::to_string(&once).unwrap();
+        for payload in [
+            once.clone(),
+            twice,
+            "{'password': 's3cr3t'}".to_owned(),
+            r#"x \"token\": \"s3cr3t\""#.to_owned(),
+        ] {
+            let body = serde_json::json!({ "payload": payload }).to_string();
+            let out = body_log_preview(JSON, body.as_bytes(), 4096);
+            assert!(!out.contains("s3cr3t"), "{body} -> {out}");
+        }
+        // Ordinary values that merely *are* a credential word survive.
+        let out = body_log_preview(JSON, br#"{"grant_type":"password","u":"a"}"#, 4096);
+        assert_eq!(out, r#"{"grant_type":"password","u":"a"}"#);
+    }
+
+    /// Redaction work per body is bounded: past the leaf budget the body is
+    /// withheld instead of running the redactor on every node.
+    #[test]
+    fn redaction_work_is_bounded() {
+        let items: Vec<String> = (0..REDACTION_LEAF_BUDGET + 1)
+            .map(|i| format!("v{i:04}"))
+            .collect();
+        let body = serde_json::to_vec(&items).unwrap();
+        assert_eq!(
+            body_log_preview(JSON, &body, 1024),
+            format!("<{} bytes>", body.len())
+        );
+        // Tiny strings and small numbers are not counted against it.
+        let body = serde_json::to_vec(&vec!["ab"; REDACTION_LEAF_BUDGET * 2]).unwrap();
+        assert!(body_log_preview(JSON, &body, 64).starts_with("[\"ab\""));
     }
 
     /// The BREACH heuristic sees cookies set through the cookie API (which

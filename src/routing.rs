@@ -646,12 +646,22 @@ impl<'a> PatternSegment<'a> {
     /// Classify one non-empty pattern segment.
     #[inline]
     pub(crate) fn parse(segment: &'a str) -> Self {
+        // A name holding pattern syntax itself (`:*x`, `*{a}`) would mean one
+        // thing here and another once translated for `matchit` (`{*x}` is a
+        // catch-all there), so such a segment is literal text everywhere.
+        let plain = |name: &str| !name.contains(['{', '}', '*', ':']);
         let catch_all = |name: &'a str| Self::CatchAll(if name.is_empty() { "*" } else { name });
         if let Some(name) = segment.strip_prefix(':') {
-            return Self::Param(name);
+            if !name.is_empty() && plain(name) {
+                return Self::Param(name);
+            }
+            return Self::Static(segment);
         }
         if let Some(name) = segment.strip_prefix('*') {
-            return catch_all(name);
+            if plain(name) {
+                return catch_all(name);
+            }
+            return Self::Static(segment);
         }
         if let Some(inner) = segment
             .strip_prefix('{')
@@ -659,9 +669,10 @@ impl<'a> PatternSegment<'a> {
             && !inner.contains(['{', '}'])
         {
             if let Some(name) = inner.strip_prefix('*') {
-                return catch_all(name);
-            }
-            if !inner.is_empty() {
+                if plain(name) {
+                    return catch_all(name);
+                }
+            } else if !inner.is_empty() && plain(inner) {
                 return Self::Param(inner);
             }
         }
@@ -1111,6 +1122,24 @@ fn match_path_spans(pattern: &str, path_parts: &[&str]) -> Option<RouteParams> {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn names_holding_pattern_syntax_are_literal_in_every_reading() {
+        for segment in [":*x", "*{a}", ":{a}", "{*{a}}", "{:a}", ":"] {
+            assert!(
+                matches!(PatternSegment::parse(segment), PatternSegment::Static(_)),
+                "{segment}"
+            );
+        }
+        // So `matchit` and the segment matcher agree: `/files/:*x` matches
+        // only its literal text, never `/files/a/b`.
+        let mut router = Router::new();
+        router.get("/files/:*x", |_req: HttpRequest| async {
+            Ok(crate::HttpResponse::ok())
+        });
+        assert!(router.match_route("GET", "/files/a/b").is_none());
+    }
+
     use super::*;
     use crate::RouteParamsExt;
     use bytes::Bytes;

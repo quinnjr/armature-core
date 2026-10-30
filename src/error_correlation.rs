@@ -34,6 +34,7 @@ use crate::{Error, HttpRequest, HttpResponse};
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+use std::fmt;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -226,7 +227,13 @@ pub mod headers {
 }
 
 /// Correlation context that can be propagated across services.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+///
+/// `Debug` redacts `session_id`, `user_id` and baggage values (baggage keys
+/// are kept): contexts end up in `{:?}` log lines and panic messages, and a
+/// session id there is a live credential. Header propagation
+/// ([`inject_into_request`](Self::inject_into_request)) sends them unchanged,
+/// and [`CorrelatedError::to_json`] drops the session id and baggage values.
+#[derive(Clone, Serialize, Deserialize)]
 pub struct CorrelationContext {
     /// Correlation ID - groups related requests/errors
     pub correlation_id: String,
@@ -271,6 +278,37 @@ pub struct CorrelationContext {
 impl Default for CorrelationContext {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+/// Stand-in for a value [`CorrelationContext`]'s `Debug` keeps out of logs.
+const REDACTED: &str = "[REDACTED]";
+
+impl fmt::Debug for CorrelationContext {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        // Presence still shows (`Some("[REDACTED]")`); the value does not.
+        let redact = |value: &Option<String>| value.as_ref().map(|_| REDACTED);
+        let baggage: HashMap<&str, &str> = self
+            .baggage
+            .keys()
+            .map(|key| (key.as_str(), REDACTED))
+            .collect();
+        f.debug_struct("CorrelationContext")
+            .field("correlation_id", &self.correlation_id)
+            .field("request_id", &self.request_id)
+            .field("trace_id", &self.trace_id)
+            .field("span_id", &self.span_id)
+            .field("parent_span_id", &self.parent_span_id)
+            .field("causation_id", &self.causation_id)
+            .field("session_id", &redact(&self.session_id))
+            .field("service", &self.service)
+            .field("service_version", &self.service_version)
+            .field("user_id", &redact(&self.user_id))
+            .field("tenant_id", &self.tenant_id)
+            .field("baggage", &baggage)
+            .field("sampled", &self.sampled)
+            .field("created_at", &self.created_at)
+            .finish()
     }
 }
 
@@ -767,17 +805,41 @@ impl CorrelatedError {
     }
 
     /// Convert to JSON.
+    ///
+    /// This is an export (to logs, error stores, other services), so the
+    /// context's session id is omitted and its baggage values are redacted;
+    /// the `Serialize` impl itself is unchanged for callers that propagate a
+    /// context on purpose.
     pub fn to_json(&self) -> String {
-        serde_json::to_string_pretty(self).unwrap_or_else(|_| {
-            // Built with `json!` so a quote or backslash in the message cannot
-            // break out of its string and forge fields.
-            serde_json::json!({
-                "error_id": self.error_id,
-                "message": self.message,
-                "status": self.status,
+        let exported = serde_json::to_value(self).map(|mut value| {
+            if let Some(context) = value
+                .get_mut("context")
+                .and_then(serde_json::Value::as_object_mut)
+            {
+                context.remove("session_id");
+                if let Some(baggage) = context
+                    .get_mut("baggage")
+                    .and_then(serde_json::Value::as_object_mut)
+                {
+                    for item in baggage.values_mut() {
+                        *item = serde_json::Value::String(REDACTED.to_owned());
+                    }
+                }
+            }
+            value
+        });
+        exported
+            .and_then(|value| serde_json::to_string_pretty(&value))
+            .unwrap_or_else(|_| {
+                // Built with `json!` so a quote or backslash in the message cannot
+                // break out of its string and forge fields.
+                serde_json::json!({
+                    "error_id": self.error_id,
+                    "message": self.message,
+                    "status": self.status,
+                })
+                .to_string()
             })
-            .to_string()
-        })
     }
 }
 
@@ -1475,6 +1537,35 @@ mod tests {
         let a: [u8; 32] = rand_bytes();
         let b: [u8; 32] = rand_bytes();
         assert_ne!(a, b);
+    }
+
+    /// Session ids, user ids and baggage values never reach a Debug
+    /// rendering or the `to_json` export; outbound propagation (server-set
+    /// data) is unchanged.
+    #[test]
+    fn test_session_and_baggage_are_not_exported() {
+        let ctx = CorrelationContext::new()
+            .with_session("sess-s3cr3t")
+            .with_user_id("user-s3cr3t")
+            .with_baggage("tenant_hint", "bag-s3cr3t");
+
+        let debug = format!("{ctx:?}");
+        assert!(!debug.contains("s3cr3t"), "{debug}");
+        assert!(debug.contains("tenant_hint"), "{debug}");
+        assert!(debug.contains(&ctx.correlation_id), "{debug}");
+
+        let error = CorrelatedError::new("boom").with_context(ctx.clone());
+        let debug = format!("{error:?}");
+        assert!(!debug.contains("s3cr3t"), "{debug}");
+        let json = error.to_json();
+        assert!(!json.contains("sess-s3cr3t"), "{json}");
+        assert!(!json.contains("bag-s3cr3t"), "{json}");
+        assert!(json.contains("tenant_hint"), "{json}");
+        assert!(json.contains(&ctx.correlation_id), "{json}");
+
+        let mut req = HttpRequest::new("GET", "/".to_string());
+        ctx.inject_into_request(&mut req);
+        assert_eq!(req.headers.get(headers::SESSION_ID), Some("sess-s3cr3t"));
     }
 
     #[test]

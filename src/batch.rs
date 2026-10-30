@@ -420,6 +420,12 @@ fn build_http_request<'h>(
         Some((p, q)) => (p, Some(q)),
         None => (path, None),
     };
+    // Asterisk-form only for OPTIONS, as `admit` enforces (RFC 9112 §3.2.4).
+    if raw_path == "*" && !method.eq_ignore_ascii_case("OPTIONS") {
+        return Err(crate::Error::BadRequest(
+            "asterisk-form request target is only valid for OPTIONS".to_string(),
+        ));
+    }
     let target = match crate::routing::canonicalize_path(raw_path)
         .map_err(|rejection| crate::Error::BadRequest(rejection.to_string()))?
     {
@@ -612,16 +618,18 @@ impl BatchParser {
                     ));
                 }
 
-                // Determine body length
-                let content_length = parsed_headers
-                    .iter()
-                    .find(|(n, _)| n.eq_ignore_ascii_case("content-length"))
-                    .and_then(|(_, v)| std::str::from_utf8(v).ok())
-                    .and_then(|s| s.trim().parse::<usize>().ok())
-                    .unwrap_or(0);
+                // Determine body length. Every Content-Length line counts,
+                // and a value this parser can't read exactly is refused
+                // rather than read as "no body": a proxy that framed the
+                // request by the value it understood would otherwise forward
+                // body bytes this parser treats as the next request.
+                let content_length = framing_content_length(&parsed_headers)?;
 
-                // Check if we have complete body
-                let total_len = header_len + content_length;
+                // Check if we have complete body. Checked: a length near
+                // `usize::MAX` would otherwise wrap and slice backwards.
+                let total_len = header_len
+                    .checked_add(content_length)
+                    .ok_or(BatchParseError::BufferOverflow)?;
                 if buffer.len() < total_len {
                     // A request larger than the read buffer can never
                     // complete: returning Ok(None) would stall the
@@ -655,6 +663,39 @@ impl BatchParser {
     pub fn config(&self) -> &BatchConfig {
         &self.config
     }
+}
+
+/// The body length declared by a request's `Content-Length` field lines.
+///
+/// RFC 9110 §8.6 allows a list of identical values (`40, 40`, or the same
+/// value on two lines) and nothing else: every element must be plain decimal
+/// digits — no sign, no whitespace inside, no junk — and all must agree. Any
+/// other shape is malformed, as it is on the HTTP/3 path
+/// (`http3::reject_malformed_fields`), since two parsers that resolve it
+/// differently disagree about where the request ends.
+fn framing_content_length(headers: &[(&str, &[u8])]) -> Result<usize, BatchParseError> {
+    let malformed = || BatchParseError::InvalidSyntax("Malformed Content-Length".to_string());
+    let mut declared: Option<usize> = None;
+    for (_, value) in headers
+        .iter()
+        .filter(|(name, _)| name.eq_ignore_ascii_case("content-length"))
+    {
+        for element in value.split(|&b| b == b',') {
+            let element = element.trim_ascii();
+            if element.is_empty() || !element.iter().all(u8::is_ascii_digit) {
+                return Err(malformed());
+            }
+            let length: usize = std::str::from_utf8(element)
+                .ok()
+                .and_then(|digits| digits.parse().ok())
+                .ok_or_else(malformed)?;
+            match declared {
+                Some(previous) if previous != length => return Err(malformed()),
+                _ => declared = Some(length),
+            }
+        }
+    }
+    Ok(declared.unwrap_or(0))
 }
 
 // ============================================================================
@@ -973,6 +1014,51 @@ impl BatchReader {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn asterisk_form_converts_only_for_options() {
+        let parser = BatchParser::new(BatchConfig::default());
+        for (input, ok) in [
+            ("OPTIONS * HTTP/1.1\r\nHost: a\r\n\r\n", true),
+            ("GET * HTTP/1.1\r\nHost: a\r\n\r\n", false),
+        ] {
+            let (parsed, _) = parser.parse_single(input.as_bytes()).unwrap().unwrap();
+            assert_eq!(parsed.to_http_request().is_ok(), ok, "{input}");
+        }
+    }
+
+    #[test]
+    fn content_length_framing_is_strict() {
+        let parser = BatchParser::new(BatchConfig::default());
+        let req = |cl: &str| format!("POST /x HTTP/1.1\r\nHost: a\r\n{cl}\r\n\r\nhello");
+        // A list of identical values, or the same value twice, is one length.
+        for ok in [
+            "Content-Length: 5",
+            "Content-Length: 5, 5",
+            "Content-Length: 5\r\nContent-Length: 5",
+        ] {
+            let input = req(ok);
+            let (parsed, used) = parser.parse_single(input.as_bytes()).unwrap().unwrap();
+            assert_eq!(parsed.body, b"hello", "{ok}");
+            assert_eq!(used, input.len(), "{ok}");
+        }
+        // Anything a second parser could read differently is refused.
+        for bad in [
+            "Content-Length: +5",
+            "Content-Length: 5, 6",
+            "Content-Length: 5\r\nContent-Length: 6",
+            "Content-Length: 5x",
+            "Content-Length: ,5",
+            "Content-Length: 99999999999999999999999",
+        ] {
+            assert!(parser.parse_single(req(bad).as_bytes()).is_err(), "{bad}");
+        }
+        // A length that would wrap `header_len + length` is an error, not a
+        // backwards slice.
+        let huge = req(&format!("Content-Length: {}", usize::MAX));
+        assert!(parser.parse_single(huge.as_bytes()).is_err());
+    }
+
     use super::*;
 
     #[test]

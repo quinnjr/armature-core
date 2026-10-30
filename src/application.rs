@@ -3259,7 +3259,18 @@ pub(crate) enum Resolution {
 ///    change the outcome, answer an unmatched request `404` without reading
 ///    its body.
 pub(crate) async fn admit(req: &mut HttpRequest, state: &ServeState) -> Admission {
-    // 1. One spelling of the path for everything downstream.
+    // 1. One spelling of the path for everything downstream. Asterisk-form is
+    //    a target for OPTIONS alone (RFC 9112 §3.2.4); `canonicalize_path`
+    //    does not know the method, and hyper (HTTP/1.1 and HTTP/2) and HTTP/3
+    //    pass `GET *` through, where a `/:param` or catch-all route matched it.
+    if req.path_only() == "*" && !matches!(req.method, crate::Method::Options) {
+        debug!(method = %req.method, "Rejected asterisk-form on a method other than OPTIONS");
+        return Admission::Respond(
+            Error::BadRequest("asterisk-form request target is only valid for OPTIONS".to_string())
+                .to_client_response(),
+            true,
+        );
+    }
     let canonical = match crate::routing::canonicalize_path(req.path_only()) {
         Ok(std::borrow::Cow::Borrowed(_)) => None,
         Ok(std::borrow::Cow::Owned(path)) => Some(path),
@@ -4722,6 +4733,32 @@ mod tests {
         // not guarded.
         let response = through_pipeline(&state, "GET", "/administrators").await;
         assert_eq!(response.status, 200);
+    }
+
+    /// Asterisk-form (`*`) is a request target for `OPTIONS` alone (RFC 9112
+    /// §3.2.4). hyper (HTTP/1.1 and HTTP/2) and HTTP/3 pass `GET *` through,
+    /// and a `/:param` or catch-all route matched it, reaching a handler with
+    /// a target no client could have meant.
+    #[tokio::test]
+    async fn asterisk_form_is_refused_for_anything_but_options() {
+        let mut router = Router::new();
+        router.get("/:id", ok_handler);
+        router.get("/*rest", ok_handler);
+        let state = ServeState::for_test(
+            Arc::new(OptimizedRouter::from_router(&router)),
+            DEFAULT_MAX_BODY_SIZE,
+        );
+        for method in ["GET", "POST", "PUT", "DELETE", "HEAD", "QUERY"] {
+            let response = through_pipeline(&state, method, "*").await;
+            assert_eq!(response.status, 400, "{method} *");
+            assert_ne!(
+                &response.body[..],
+                b"secret",
+                "{method} * reached a handler"
+            );
+        }
+        let response = through_pipeline(&state, "OPTIONS", "*").await;
+        assert_ne!(response.status, 400, "OPTIONS * is a valid request");
     }
 
     fn failing_guard_registration() -> crate::module::GuardRegistration {

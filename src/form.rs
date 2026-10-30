@@ -39,7 +39,10 @@ pub fn parse_form_map(body: &[u8]) -> Result<HashMap<String, String>, Error> {
 }
 
 /// Multipart form field
-#[derive(Debug, Clone)]
+///
+/// `Debug` redacts the value: fields routinely carry passwords and tokens,
+/// and a stray `{:?}` in a log line must not leak them.
+#[derive(Clone)]
 pub struct FormField {
     /// Field name
     pub name: String,
@@ -51,12 +54,31 @@ pub struct FormField {
     pub file: Option<FormFile>,
 }
 
+impl std::fmt::Debug for FormField {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("FormField")
+            .field("name", &self.name)
+            .field(
+                "value",
+                &self
+                    .value
+                    .as_ref()
+                    .map(|v| format!("<redacted, {} bytes>", v.len())),
+            )
+            .field("file", &self.file)
+            .finish()
+    }
+}
+
 /// Longest name [`FormFile::safe_filename`] returns, in bytes. Most
 /// filesystems cap a component at 255 bytes.
 pub const MAX_SAFE_FILENAME_LEN: usize = 255;
 
 /// Uploaded file data
-#[derive(Debug, Clone)]
+///
+/// `Debug` prints the data's length, not its bytes (which may be sensitive,
+/// and are unreadable and unbounded in a log line anyway).
+#[derive(Clone)]
 pub struct FormFile {
     /// Original filename, **exactly as the client sent it**.
     ///
@@ -74,6 +96,17 @@ pub struct FormFile {
 
     /// File data
     pub data: Vec<u8>,
+}
+
+impl std::fmt::Debug for FormFile {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("FormFile")
+            .field("filename", &self.filename)
+            .field("content_type", &self.content_type)
+            .field("size", &self.size)
+            .field("data", &format_args!("<{} bytes>", self.data.len()))
+            .finish()
+    }
 }
 
 impl FormFile {
@@ -105,10 +138,14 @@ impl FormFile {
     /// use as a single component inside an upload directory.
     ///
     /// Takes the part after the last `/` or `\`, drops control characters
-    /// (including NUL), strips leading dots (no hidden files, no `..`) and
-    /// trailing dots and spaces (which Windows silently drops), and caps the
-    /// length at [`MAX_SAFE_FILENAME_LEN`] bytes. Falls back to `"file"` when
-    /// nothing is left.
+    /// (including NUL), invisible Unicode format characters (bidi overrides
+    /// such as U+202E, zero-width characters, BOM) that make a name display
+    /// as something it is not, and `:` (an NTFS alternate data stream
+    /// separator); strips leading dots (no hidden files, no `..`) and trailing
+    /// dots and spaces (which Windows silently drops), and caps the length at
+    /// [`MAX_SAFE_FILENAME_LEN`] bytes. A Windows reserved device name (`CON`,
+    /// `NUL`, `COM1`, `lpt1.txt`, ...) gets a `_` prefix. Falls back to
+    /// `"file"` when nothing is left.
     ///
     /// ```
     /// use armature_core::form::FormFile;
@@ -120,21 +157,16 @@ impl FormFile {
     pub fn safe_filename(&self) -> String {
         let name: String = last_component(&self.filename)
             .chars()
-            .filter(|c| !c.is_control())
+            .filter(|&c| !c.is_control() && !is_format_char(c) && c != ':')
             .collect();
-        let name = name
-            .trim()
-            .trim_start_matches('.')
-            .trim_end_matches(['.', ' ']);
-
-        let mut end = name.len().min(MAX_SAFE_FILENAME_LEN);
-        while !name.is_char_boundary(end) {
-            end -= 1;
-        }
-        let name = &name[..end];
+        let name = name.trim().trim_start_matches('.');
+        let name = truncate_filename(name, MAX_SAFE_FILENAME_LEN);
 
         if name.is_empty() {
             "file".to_string()
+        } else if is_windows_reserved(name) {
+            // One byte for the prefix keeps the result within the cap.
+            format!("_{}", truncate_filename(name, MAX_SAFE_FILENAME_LEN - 1))
         } else {
             name.to_string()
         }
@@ -213,6 +245,74 @@ impl FormFile {
         match (components.next(), components.next()) {
             (Some(std::path::Component::Normal(_)), None) => Ok(dir.join(&name)),
             _ => Err(Error::BadRequest("Invalid upload filename".to_string())),
+        }
+    }
+}
+
+/// `name` cut to at most `max` bytes on a char boundary, then stripped of
+/// trailing dots and spaces -- after the cut, since a cut can expose new ones
+/// that Windows would silently drop.
+fn truncate_filename(name: &str, max: usize) -> &str {
+    let mut end = name.len().min(max);
+    while !name.is_char_boundary(end) {
+        end -= 1;
+    }
+    name[..end].trim_end_matches(['.', ' '])
+}
+
+/// Unicode general category `Cf` (format): invisible characters that change
+/// how surrounding text renders -- bidi overrides/isolates (`invoice\u{202E}fdp.exe`
+/// displays as `invoiceexe.pdf`), zero-width spaces/joiners, the BOM.
+/// Listed by hand (Unicode 15.1) since the category tables are not a
+/// dependency of this crate.
+fn is_format_char(c: char) -> bool {
+    matches!(
+        c,
+        '\u{00AD}'
+            | '\u{0600}'..='\u{0605}'
+            | '\u{061C}'
+            | '\u{06DD}'
+            | '\u{070F}'
+            | '\u{0890}'..='\u{0891}'
+            | '\u{08E2}'
+            | '\u{180E}'
+            | '\u{200B}'..='\u{200F}'
+            | '\u{202A}'..='\u{202E}'
+            | '\u{2060}'..='\u{2064}'
+            | '\u{2066}'..='\u{206F}'
+            | '\u{FEFF}'
+            | '\u{FFF9}'..='\u{FFFB}'
+            | '\u{110BD}'
+            | '\u{110CD}'
+            | '\u{13430}'..='\u{1343F}'
+            | '\u{1BCA0}'..='\u{1BCA3}'
+            | '\u{1D173}'..='\u{1D17A}'
+            | '\u{E0001}'
+            | '\u{E0020}'..='\u{E007F}'
+    )
+}
+
+/// Whether Windows treats `name` as a device (`CON`, `PRN`, `AUX`, `NUL`,
+/// `COM1`-`COM9`, `LPT1`-`LPT9`, and the superscript-digit variants), with or
+/// without an extension: opening `uploads\con.txt` opens the console, not a
+/// file.
+fn is_windows_reserved(name: &str) -> bool {
+    let stem = name.split('.').next().unwrap_or(name).trim_end_matches(' ');
+    let upper = stem.to_ascii_uppercase();
+    match upper.as_str() {
+        "CON" | "PRN" | "AUX" | "NUL" => true,
+        _ => {
+            let Some(digit) = upper
+                .strip_prefix("COM")
+                .or_else(|| upper.strip_prefix("LPT"))
+            else {
+                return false;
+            };
+            let mut chars = digit.chars();
+            matches!(
+                (chars.next(), chars.next()),
+                (Some('1'..='9' | '\u{B9}' | '\u{B2}' | '\u{B3}'), None)
+            )
         }
     }
 }
@@ -375,7 +475,7 @@ impl MultipartParser {
         let (header_block, content) = if let Some(rest) = part.strip_prefix(b"\r\n") {
             (&part[..0], rest)
         } else {
-            let window = &part[..part.len().min(self.max_header_bytes + 4)];
+            let window = &part[..part.len().min(self.max_header_bytes.saturating_add(4))];
             match memchr::memmem::find(window, b"\r\n\r\n") {
                 Some(pos) if pos <= self.max_header_bytes => (&part[..pos], &part[pos + 4..]),
                 Some(_) => return Err(multipart_error("part headers too large")),
@@ -393,12 +493,24 @@ impl MultipartParser {
         let mut content_type = None;
 
         for line in headers.split("\r\n") {
+            // A line starting with SP/HT is an obsolete folded continuation
+            // (RFC 9112 §5.2). Parsers disagree on whether to unfold it into
+            // the previous header, so a fold can hide a parameter from one
+            // reader and show it to another: refuse it.
+            if line.starts_with([' ', '\t']) {
+                return Err(multipart_error("folded part header"));
+            }
             let Some((name, value)) = line.split_once(':') else {
                 return Err(multipart_error("malformed part header"));
             };
+            // The name must be a bare RFC 9110 token: no whitespace before the
+            // colon (RFC 9112 §5.1 requires rejecting it), which some readers
+            // would otherwise trim and others treat as a different header.
+            if name.is_empty() || !name.bytes().all(is_tchar) {
+                return Err(multipart_error("invalid part header name"));
+            }
             // Header names are case-insensitive (RFC 7578 §4.8 defers to
             // RFC 2045/5322).
-            let name = name.trim();
             let slot = if name.eq_ignore_ascii_case("Content-Disposition") {
                 &mut disposition
             } else if name.eq_ignore_ascii_case("Content-Type") {
@@ -422,10 +534,22 @@ impl MultipartParser {
 
         let mut name = None;
         let mut filename = None;
-        for (key, value) in parse_params(params)? {
+        // No backslash escapes here: browsers percent-encode `"` and CR/LF in
+        // these values (WHATWG HTML's multipart encoding) and send `\`
+        // literally, while RFC-style parsers unescape it. Either reading is
+        // wrong for one side, so a `\` in a quoted name/filename is refused.
+        for (key, value) in parse_params_with(params, QuotedBackslash::Reject)? {
             let slot = match key.as_str() {
                 "name" => &mut name,
                 "filename" => &mut filename,
+                // RFC 7578 §4.2: `filename*` must not be used. Ignoring it
+                // would let a client show one name here and another to a proxy
+                // or scanner that honours the RFC 5987 form.
+                "name*" | "filename*" => {
+                    return Err(multipart_error(
+                        "extended (RFC 5987) Content-Disposition parameter",
+                    ));
+                }
                 _ => continue,
             };
             if slot.replace(value).is_some() {
@@ -605,13 +729,32 @@ fn is_valid_boundary(boundary: &str) -> bool {
             .all(|b| b.is_ascii_alphanumeric() || b"'()+_,-./:=? ".contains(&b))
 }
 
+/// RFC 9110 `tchar`: the bytes a header field name (a `token`) may contain.
+fn is_tchar(b: u8) -> bool {
+    b.is_ascii_alphanumeric() || b"!#$%&'*+-.^_`|~".contains(&b)
+}
+
+/// How [`parse_params_with`] treats a `\` inside a quoted value.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum QuotedBackslash {
+    /// RFC 9110 `quoted-pair`: `\x` stands for `x`.
+    Unescape,
+    /// Refuse the parameter list.
+    Reject,
+}
+
+/// [`parse_params_with`] with RFC 9110 quoted-pair unescaping.
+fn parse_params(s: &str) -> Result<Vec<(String, String)>, Error> {
+    parse_params_with(s, QuotedBackslash::Unescape)
+}
+
 /// Parse `; key=value; key="quoted; value"` header parameters.
 ///
 /// Splitting on every `;` broke a quoted filename such as `"a;b.txt"` into a
 /// truncated name plus a phantom parameter (`b.txt"`), which is also how a
 /// client smuggles a second `name=` past a naive parser. Keys are lowercased;
-/// quoted values have their backslash escapes removed.
-fn parse_params(s: &str) -> Result<Vec<(String, String)>, Error> {
+/// a backslash in a quoted value is handled per `backslash`.
+fn parse_params_with(s: &str, backslash: QuotedBackslash) -> Result<Vec<(String, String)>, Error> {
     let bytes = s.as_bytes();
     let mut params = Vec::new();
     let mut i = 0;
@@ -652,6 +795,9 @@ fn parse_params(s: &str) -> Result<Vec<(String, String)>, Error> {
                     Some(b'"') => {
                         i += 1;
                         break;
+                    }
+                    Some(b'\\') if backslash == QuotedBackslash::Reject => {
+                        return Err(multipart_error("backslash in quoted parameter"));
                     }
                     Some(b'\\') if i + 1 < bytes.len() => {
                         value.push(bytes[i + 1]);
@@ -824,6 +970,97 @@ mod tests {
         assert_eq!(fields[0].file.as_ref().unwrap().filename, "a;name=b.txt");
     }
 
+    /// One part whose header block is `headers` (CRLF-separated lines).
+    fn one_part(headers: &str) -> Vec<u8> {
+        format!("--XB\r\n{headers}\r\n\r\nv\r\n--XB--").into_bytes()
+    }
+
+    #[test]
+    fn folded_and_non_token_part_headers_are_rejected() {
+        for headers in [
+            // obs-fold: a continuation line smuggling a second disposition.
+            "Content-Disposition: form-data; name=\"a\"\r\n name=\"admin\"",
+            "Content-Disposition: form-data; name=\"a\"\r\n\tx",
+            // Whitespace before the colon (RFC 9112 §5.1 says reject).
+            "Content-Disposition : form-data; name=\"a\"",
+            // Leading whitespace in the name, and a non-token name.
+            " Content-Disposition: form-data; name=\"a\"",
+            "Content-Disposition: form-data; name=\"a\"\r\nX(Y): z",
+            "Content-Disposition: form-data; name=\"a\"\r\n: empty-name",
+        ] {
+            assert!(
+                parser("XB").parse(&one_part(headers)).is_err(),
+                "{headers:?}"
+            );
+        }
+        // Unknown but well-formed headers are still fine.
+        let ok = one_part("Content-Disposition: form-data; name=\"a\"\r\nX-Custom_1: z");
+        assert_eq!(parser("XB").parse(&ok).unwrap()[0].name, "a");
+    }
+
+    /// Browsers percent-encode `"` in names rather than backslash-escaping
+    /// it, so `\` inside a quoted name/filename is read differently by
+    /// different parsers; refuse it rather than pick one reading.
+    #[test]
+    fn backslashes_in_quoted_disposition_values_are_rejected() {
+        for headers in [
+            r#"Content-Disposition: form-data; name="a\"b""#,
+            r#"Content-Disposition: form-data; name="f"; filename="C:\x.txt""#,
+        ] {
+            assert!(
+                parser("XB").parse(&one_part(headers)).is_err(),
+                "{headers:?}"
+            );
+        }
+    }
+
+    /// RFC 7578 §4.2 forbids `filename*`; silently ignoring it (or `name*`)
+    /// lets a client present one name to this parser and another to a proxy
+    /// or WAF that honours the extended form.
+    #[test]
+    fn extended_disposition_parameters_are_rejected() {
+        for headers in [
+            "Content-Disposition: form-data; name=\"f\"; filename=\"a.txt\"; filename*=UTF-8''evil.exe",
+            "Content-Disposition: form-data; name=\"a\"; name*=UTF-8''admin",
+        ] {
+            assert!(
+                parser("XB").parse(&one_part(headers)).is_err(),
+                "{headers:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn huge_max_header_bytes_does_not_overflow() {
+        let parser = parser("XB").with_max_header_bytes(usize::MAX);
+        let fields = parser
+            .parse(&one_part("Content-Disposition: form-data; name=\"a\""))
+            .unwrap();
+        assert_eq!(fields[0].name, "a");
+    }
+
+    #[test]
+    fn debug_output_redacts_values_and_file_contents() {
+        let field = FormField {
+            name: "password".to_string(),
+            value: Some("hunter2".to_string()),
+            file: None,
+        };
+        let shown = format!("{field:?}");
+        assert!(
+            shown.contains("password") && !shown.contains("hunter2"),
+            "{shown}"
+        );
+
+        let file = FormFile::new("a.txt".into(), "text/plain".into(), b"TOPSECRET".to_vec());
+        let shown = format!("{file:?}");
+        assert!(
+            shown.contains("a.txt") && !shown.contains("84, 79"),
+            "{shown}"
+        );
+        assert!(shown.contains('9'), "data length is still shown: {shown}");
+    }
+
     #[test]
     fn duplicate_disposition_parameters_are_rejected() {
         let body = b"--XB\r\nContent-Disposition: form-data; name=\"user\"; name=\"admin\"\r\n\r\nv\r\n--XB--";
@@ -936,6 +1173,50 @@ mod tests {
         let safe = f(&long);
         assert!(safe.len() <= MAX_SAFE_FILENAME_LEN);
         assert!(safe.starts_with('é'));
+    }
+
+    #[test]
+    fn safe_filename_strips_format_chars_and_ads_separators() {
+        let f = |name: &str| FormFile::new(name.to_string(), String::new(), vec![]).safe_filename();
+        // U+202E RIGHT-TO-LEFT OVERRIDE: `invoice\u{202E}fdp.exe` renders as
+        // `invoiceexe.pdf`.
+        assert_eq!(f("invoice\u{202E}fdp.exe"), "invoicefdp.exe");
+        assert_eq!(f("\u{200B}.env"), "env");
+        assert_eq!(f("a\u{FEFF}b\u{2066}c\u{200F}.txt"), "abc.txt");
+        // NTFS alternate data stream.
+        assert_eq!(f("file.txt:hidden.exe"), "file.txthidden.exe");
+    }
+
+    #[test]
+    fn safe_filename_avoids_windows_reserved_names() {
+        let f = |name: &str| FormFile::new(name.to_string(), String::new(), vec![]).safe_filename();
+        for (input, want) in [
+            ("CON", "_CON"),
+            ("con.txt", "_con.txt"),
+            ("Aux.tar.gz", "_Aux.tar.gz"),
+            ("nul", "_nul"),
+            ("COM1.log", "_COM1.log"),
+            ("lpt9", "_lpt9"),
+            ("PRN.", "_PRN"),
+        ] {
+            assert_eq!(f(input), want, "{input}");
+        }
+        for ok in ["CONSOLE.txt", "COM10", "LPT0", "nullable", "com"] {
+            assert_eq!(f(ok), ok);
+        }
+    }
+
+    #[test]
+    fn safe_filename_retrims_after_truncation() {
+        let f = |name: &str| FormFile::new(name.to_string(), String::new(), vec![]).safe_filename();
+        // Truncation lands right after a run of dots/spaces.
+        let name = format!("{}. .{}", "a".repeat(252), "b".repeat(20));
+        let got = f(&name);
+        assert_eq!(got, "a".repeat(252));
+        // Multi-byte chars: still cut on a char boundary.
+        let got = f(&"é".repeat(200));
+        assert!(got.len() <= MAX_SAFE_FILENAME_LEN);
+        assert!(got.chars().all(|c| c == 'é'));
     }
 
     #[test]

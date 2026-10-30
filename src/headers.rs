@@ -138,13 +138,22 @@ pub const SENSITIVE_HEADERS: &[&str] = &[
 
 /// Substrings that mark a header name as sensitive wherever they appear in it
 /// (case-insensitively).
+///
+/// Deliberately broad: a false positive costs a `<redacted>` in a debug log
+/// (or a cache bypass), a false negative leaks a credential. `auth` covers
+/// `x-auth-user`/`x-authz-*` style gateway headers, `session` covers
+/// `x-session-id`, and `-key` covers `x-client-key`, `x-license-key` and
+/// friends.
 pub const SENSITIVE_HEADER_FRAGMENTS: &[&str] = &[
     "token",
     "secret",
     "api-key",
     "apikey",
+    "-key",
     "signature",
     "password",
+    "session",
+    "auth",
 ];
 
 /// What `Debug` prints in place of a sensitive header's value.
@@ -167,11 +176,66 @@ pub fn is_sensitive_header(name: &str) -> bool {
     {
         return true;
     }
-    // Only reached from `Debug` impls, so the allocation is off the hot path.
-    let lower = name.to_ascii_lowercase();
+    // Compared in place rather than via a lowercased copy: the response caches
+    // call this for every request header, so it must not allocate.
     SENSITIVE_HEADER_FRAGMENTS
         .iter()
-        .any(|frag| lower.contains(frag))
+        .any(|frag| contains_ignore_ascii_case(name, frag))
+}
+
+/// Whether `haystack` contains `needle`, ASCII-case-insensitively. `needle`
+/// must be lowercase (every fragment above is).
+#[inline]
+fn contains_ignore_ascii_case(haystack: &str, needle: &str) -> bool {
+    haystack
+        .as_bytes()
+        .windows(needle.len())
+        .any(|w| w.eq_ignore_ascii_case(needle.as_bytes()))
+}
+
+/// Whether a request header carries a credential that makes the response to
+/// it caller-specific — i.e. a [sensitive](is_sensitive_header) header other
+/// than an anti-CSRF token.
+///
+/// CSRF tokens are excluded because they authenticate nothing on their own:
+/// they ride alongside a `Cookie`, which already counts. Everything else in
+/// the sensitive set (`Authorization`, `Cookie`, `X-Api-Key`, `X-Auth-Token`,
+/// `X-Session-Id`, ...) names *who* is asking, which a shared cache key does
+/// not.
+#[inline]
+pub(crate) fn is_credential_header(name: &str) -> bool {
+    is_sensitive_header(name)
+        && !contains_ignore_ascii_case(name, "csrf")
+        && !contains_ignore_ascii_case(name, "xsrf")
+}
+
+/// `Debug` adapter for a list of header `(name, value)` pairs that applies
+/// [`HeaderMap`]'s redaction rule: sensitive values print as [`REDACTED`],
+/// non-UTF-8 values as `<non-utf8>`. For the request/response shapes outside
+/// `HttpRequest` (arena, batch, pooled) that keep headers in their own
+/// containers.
+pub(crate) struct RedactedHeaders<'a>(pub Vec<(&'a str, &'a [u8])>);
+
+impl fmt::Debug for RedactedHeaders<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_map()
+            .entries(self.0.iter().map(|&(name, value)| {
+                let value = if is_sensitive_header(name) {
+                    REDACTED
+                } else {
+                    std::str::from_utf8(value).unwrap_or("<non-utf8>")
+                };
+                (name, value)
+            }))
+            .finish()
+    }
+}
+
+/// The part of a request target a `Debug` impl may print: everything before
+/// the `?`. The query string routinely carries tokens.
+#[inline]
+pub(crate) fn path_without_query(target: &str) -> &str {
+    target.split_once('?').map_or(target, |(p, _)| p)
 }
 
 /// Whether an inbound request/correlation ID is safe to adopt and echo back.
@@ -991,12 +1055,35 @@ mod tests {
             "X-Client-Secret",
             "X-Service-ApiKey",
             "X-Db-Password",
+            "X-Session-Id",
+            "X-Auth-User",
+            "X-Client-Key",
+            "Proxy-Authorization",
         ] {
             assert!(is_sensitive_header(name), "{name} must be redacted");
         }
-        for name in ["content-type", "accept", "x-request-id", "user-agent"] {
+        for name in [
+            "content-type",
+            "accept",
+            "x-request-id",
+            "user-agent",
+            "host",
+            "x-forwarded-for",
+            "accept-encoding",
+            "if-none-match",
+            "keep-alive",
+        ] {
             assert!(!is_sensitive_header(name), "{name} is not a credential");
         }
+
+        // Credential headers for cache purposes: everything sensitive except
+        // anti-CSRF tokens.
+        assert!(is_credential_header("X-Api-Key"));
+        assert!(is_credential_header("X-Auth-Token"));
+        assert!(is_credential_header("cookie"));
+        assert!(!is_credential_header("X-CSRF-Token"));
+        assert!(!is_credential_header("x-xsrf-token"));
+        assert!(!is_credential_header("content-type"));
 
         let mut map = HeaderMap::new();
         map.insert("x-session-token", "s3cret");

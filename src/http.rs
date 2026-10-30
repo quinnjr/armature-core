@@ -147,6 +147,35 @@ impl std::fmt::Debug for HttpRequest {
     }
 }
 
+/// Parse one `X-Forwarded-For` element into a canonical address.
+///
+/// Accepts a bare address (`203.0.113.7`, `2001:db8::1`) and the forms some
+/// proxies emit with the client's port attached (`203.0.113.7:4711`,
+/// `[2001:db8::1]:443`, `[2001:db8::1]`). Rejecting those would make every
+/// request through such a proxy anonymous. Anything else — empty, garbage, a
+/// bracketed IPv4, a bad port — is `None`, so the callers still fail closed.
+fn parse_forwarded_hop(hop: &str) -> Option<IpAddr> {
+    if let Ok(ip) = hop.parse::<IpAddr>() {
+        return Some(ip.to_canonical());
+    }
+    if let Some(rest) = hop.strip_prefix('[') {
+        let (inner, after) = rest.split_once(']')?;
+        if !(after.is_empty() || after.strip_prefix(':')?.parse::<u16>().is_ok()) {
+            return None;
+        }
+        return inner
+            .parse::<std::net::Ipv6Addr>()
+            .ok()
+            .map(|ip| IpAddr::V6(ip).to_canonical());
+    }
+    // `a.b.c.d:port`. An unbracketed IPv6 with a port is ambiguous and was
+    // already handled (or rejected) by the plain parse above.
+    hop.parse::<SocketAddr>()
+        .ok()
+        .filter(SocketAddr::is_ipv4)
+        .map(|sa| sa.ip().to_canonical())
+}
+
 impl HttpRequest {
     /// Create a request.
     ///
@@ -249,8 +278,12 @@ impl HttpRequest {
     /// assert_eq!(req.client_address(0), Some(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1))));
     /// ```
     pub fn client_address(&self, trusted_proxy_depth: usize) -> Option<IpAddr> {
+        // Canonical, like every other address this returns: a dual-stack
+        // listener reports IPv4 clients as `::ffff:a.b.c.d`, and an allowlist,
+        // rate-limit key or audit line comparing against `a.b.c.d` would
+        // otherwise miss them.
         if trusted_proxy_depth == 0 {
-            return self.peer.map(|peer| peer.ip());
+            return self.peer.map(|peer| peer.ip().to_canonical());
         }
 
         // Across every field line, not just the first. A repeated field is one
@@ -279,7 +312,7 @@ impl HttpRequest {
         // the request did not traverse the proxies it was configured to, so
         // there is no entry here anyone put there on purpose.
         let index = hops.len().checked_sub(trusted_proxy_depth)?;
-        hops.get(index)?.parse().ok()
+        parse_forwarded_hop(hops.get(index)?)
     }
 
     /// The client address, honouring `X-Forwarded-For` only when the request
@@ -346,7 +379,7 @@ impl HttpRequest {
 
         let mut leftmost = None;
         for hop in hops.iter().rev() {
-            let ip = hop.parse::<IpAddr>().ok()?.to_canonical();
+            let ip = parse_forwarded_hop(hop)?;
             if !is_trusted(ip) {
                 return Some(ip);
             }
@@ -662,9 +695,28 @@ impl HttpRequest {
 ///
 /// This provides the same API as HashMap but with zero allocation cost
 /// for empty maps.
-#[derive(Debug, Clone, Default)]
+///
+/// `Debug` redacts sensitive values (`Set-Cookie`, `Authorization`, ...) the
+/// way [`HeaderMap`]'s does: a `{:?}` of a response is the kind of thing that
+/// ends up in an error log.
+#[derive(Clone, Default)]
 pub struct LazyHeaders {
     inner: Option<HashMap<String, String>>,
+}
+
+impl std::fmt::Debug for LazyHeaders {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_map()
+            .entries(self.inner.iter().flatten().map(|(name, value)| {
+                let value = if crate::headers::is_sensitive_header(name) {
+                    crate::headers::REDACTED
+                } else {
+                    value.as_str()
+                };
+                (name, value)
+            }))
+            .finish()
+    }
 }
 
 impl LazyHeaders {
@@ -796,7 +848,11 @@ impl<'a> IntoIterator for &'a LazyHeaders {
 /// - `headers` uses `LazyHeaders` which doesn't allocate until first insert
 /// - `body` is an empty `Bytes` until set, which doesn't allocate
 /// - Use `FastResponse` from `armature_core::fast_response` for even faster creation
-#[derive(Debug)]
+///
+/// `Debug` is hand-written, like [`HttpRequest`]'s: it prints sensitive
+/// headers redacted, how many cookies are set rather than their values (each
+/// is a session token or similar), and the body's length rather than its
+/// bytes (a body is user data, often a token or a page of PII).
 pub struct HttpResponse {
     pub status: u16,
     /// Response headers with lazy allocation.
@@ -808,6 +864,17 @@ pub struct HttpResponse {
     /// Was a `Vec<u8>` shadowed by an optional `Bytes`. One field, always
     /// authoritative.
     pub body: Bytes,
+}
+
+impl std::fmt::Debug for HttpResponse {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("HttpResponse")
+            .field("status", &self.status)
+            .field("headers", &self.headers)
+            .field("cookies", &self.cookies.len())
+            .field("body_len", &self.body.len())
+            .finish()
+    }
 }
 
 /// Default pre-allocated response buffer size (512 bytes).
@@ -2373,5 +2440,67 @@ mod tests {
 
         let res = HttpResponse::ok().with_json(&data);
         assert!(res.is_ok());
+    }
+
+    /// A `{:?}` of a response must not print cookie values, credential
+    /// headers, or the body.
+    #[test]
+    fn response_debug_redacts_cookies_headers_and_body() {
+        let mut r = HttpResponse::ok()
+            .cookie("sid", "s3cret-session")
+            .with_body(b"account-number-42".to_vec());
+        r.headers
+            .insert("Set-Cookie".to_string(), "other=hdr-cookie".to_string());
+        r.headers
+            .insert("X-Auth-Token".to_string(), "tok-123".to_string());
+        r.headers
+            .insert("Content-Type".to_string(), "text/plain".to_string());
+        let out = format!("{r:?}");
+        for secret in [
+            "s3cret-session",
+            "hdr-cookie",
+            "tok-123",
+            "account-number-42",
+        ] {
+            assert!(!out.contains(secret), "{secret} leaked: {out}");
+        }
+        assert!(out.contains("text/plain"), "{out}");
+        assert!(out.contains("body_len: 17"), "{out}");
+    }
+
+    /// `client_address(0)` canonicalizes an IPv4-mapped peer like every other
+    /// path does.
+    #[test]
+    fn client_address_zero_depth_is_canonical() {
+        let mapped: SocketAddr = "[::ffff:192.0.2.9]:1234".parse().unwrap();
+        let req = HttpRequest::new("GET", "/").with_peer(Some(mapped));
+        assert_eq!(req.client_address(0), Some("192.0.2.9".parse().unwrap()));
+    }
+
+    /// Forwarded entries with a port (or brackets) are understood; garbage
+    /// still fails closed.
+    #[test]
+    fn forwarded_entries_with_ports_parse_and_garbage_fails_closed() {
+        let proxy: IpAddr = "10.0.0.1".parse().unwrap();
+        let peer = SocketAddr::new(proxy, 5555);
+        for (xff, want) in [
+            ("203.0.113.7:4711", Some("203.0.113.7")),
+            ("[2001:db8::1]:443", Some("2001:db8::1")),
+            ("[2001:db8::1]", Some("2001:db8::1")),
+            ("[::ffff:198.51.100.1]:80", Some("198.51.100.1")),
+            ("2001:db8::1", Some("2001:db8::1")),
+            ("203.0.113.7:99999", None),
+            ("[2001:db8::1]:x", None),
+            ("[203.0.113.7]:80", None),
+            ("[2001:db8::1]junk", None),
+            ("garbage", None),
+            ("", None),
+        ] {
+            let mut req = HttpRequest::new("GET", "/").with_peer(Some(peer));
+            req.headers.insert("X-Forwarded-For", xff);
+            let want = want.map(|w| w.parse::<IpAddr>().unwrap());
+            assert_eq!(req.client_address_trusted(&[proxy]), want, "{xff}");
+            assert_eq!(req.client_address(1), want, "{xff}");
+        }
     }
 }

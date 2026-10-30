@@ -294,7 +294,18 @@ pub(crate) async fn read_body_leased<E>(
                 v.extend_from_slice(&chunk);
                 acc = Some(v);
             }
-            (Some(v), _) => v.extend_from_slice(&chunk),
+            (Some(v), _) => {
+                // Grow by doubling as `Vec` would, but never past `cap`:
+                // left to itself, a body just over half the cap would be
+                // copied into a buffer of twice that, so the memory a client
+                // can pin per request was up to 2× the configured limit.
+                // (`total <= cap` here, so the clamp always fits the chunk.)
+                if v.capacity() - v.len() < chunk.len() {
+                    let target = v.capacity().saturating_mul(2).max(total).min(cap);
+                    v.reserve_exact(target - v.len());
+                }
+                v.extend_from_slice(&chunk);
+            }
         }
     }
     Ok(match acc {
@@ -586,9 +597,23 @@ impl Application {
     /// middleware and before routing.
     ///
     /// Guards declared by a module are different: they are bound to the routes
-    /// of that module's own controllers (see [`Application::register_module`])
+    /// of that module's own controllers (see [`Application::create`])
     /// and run after these. Module guards are registered automatically during
     /// [`Application::create`]; use this to add global guards manually.
+    ///
+    /// # Guards run after the body is read
+    ///
+    /// Every guard — global or module — runs once the request body has been
+    /// read and buffered (under the body cap and the slow-body policy), because
+    /// global middleware runs first and sees the full body, and a guard may
+    /// itself depend on it (a body signature check). A guard is therefore not
+    /// a way to avoid *receiving* an unauthenticated upload: it rejects the
+    /// request, but only after up to
+    /// [`with_max_body_size`](Self::with_max_body_size) bytes have arrived.
+    /// Keep the body cap tight on deployments that accept anonymous traffic,
+    /// and prefer a global guard (or middleware) over a module guard for a
+    /// cheap blanket rejection, so it runs before routing and the route's own
+    /// layers.
     pub fn with_guard(mut self, guard: Arc<dyn Guard>) -> Self {
         self.guards.push(guard);
         self
@@ -1078,14 +1103,15 @@ impl Application {
     /// leaks onto a sibling path that merely shares a prefix. Recursion does not
     /// widen this: an imported or child module's guards bind to that child's
     /// own routes, never to the parent's. A module that declares guards but
-    /// registers no controllers has nothing to bind to, so its guards are inert
-    /// (a warning is emitted). Manually-added guards (see
-    /// [`Application::with_guard`]) stay global.
+    /// registers no controllers has nothing to bind to; that is refused (see
+    /// below) rather than silently leaving the guards inert. Manually-added
+    /// guards (see [`Application::with_guard`]) stay global.
     ///
     /// # Errors
     ///
-    /// Fails if a module's guard factory fails. Registration stops there, so
-    /// that module's controllers are never registered without their guard.
+    /// Fails if a module's guard factory fails, or if a module declares guards
+    /// but no controllers. Registration stops there, so that module's
+    /// controllers are never registered without their guard.
     fn register_module(
         container: &Container,
         router: &mut Router,
@@ -1165,6 +1191,23 @@ impl Application {
         // aborts registration before any of those routes exist, so a guard
         // that cannot be built never leaves its routes reachable unguarded.
         let guard_regs = module.guards();
+        let controllers = module.controllers();
+        // A guard with no controllers of its own module has no routes to bind
+        // to and would never run. Declaring one almost always means the author
+        // expected it to protect something else (an importing module's routes,
+        // say), so starting anyway would leave those routes open while the
+        // module tree reads as guarded: fail closed instead.
+        if !guard_regs.is_empty() && controllers.is_empty() {
+            error!(
+                module_type = module_type,
+                "Module declares guards but registers no controllers; aborting module registration"
+            );
+            return Err(Error::Internal(format!(
+                "module {module_type} declares guards but registers no controllers; \
+                 module guards protect only their own module's controllers, so these \
+                 would never run (use Application::with_guard for a global guard)"
+            )));
+        }
         let mut module_guards: Vec<Arc<dyn Guard>> = Vec::with_capacity(guard_regs.len());
         for guard_reg in guard_regs {
             match (guard_reg.factory)(container) {
@@ -1185,20 +1228,12 @@ impl Application {
         }
 
         // Register all controllers
-        let controllers = module.controllers();
         debug!(
             module_type = module_type,
             controller_count = controllers.len(),
             guard_count = module_guards.len(),
             "Registering controllers"
         );
-        if !module_guards.is_empty() && controllers.is_empty() {
-            warn!(
-                module_type = module_type,
-                "Module declares guards but registers no controllers; \
-                 the guards are inert and will not run for any request"
-            );
-        }
         for controller_reg in controllers {
             // Every route this controller's registrar adds lands in this
             // range, which is what the module's guards are bound to.
@@ -1720,8 +1755,11 @@ impl Application {
                 https_port: https_addr.port(),
             });
             let max_connections = self.pipeline_config.max_connections;
+            let write_timeout = self.pipeline_config.write_timeout;
             tokio::spawn(async move {
-                if let Err(e) = serve_http_redirect(listener, redirect, max_connections).await {
+                if let Err(e) =
+                    serve_http_redirect(listener, redirect, max_connections, write_timeout).await
+                {
                     error!(error = %e, "HTTP redirect server failed");
                 }
             });
@@ -2155,7 +2193,8 @@ impl Application {
             self.http3_config.clone(),
             self.serve_state(),
             self.pipeline_config.max_connections,
-        );
+        )
+        .with_write_timeout(self.pipeline_config.write_timeout);
 
         server.listen(addr, tls_config.server_config).await
     }
@@ -2213,11 +2252,13 @@ impl Application {
         let tls_config_h3 = tls_config.clone();
         let state_h3 = self.serve_state();
         let http3_config = self.http3_config.clone();
+        let write_timeout_h3 = self.pipeline_config.write_timeout;
         let max_connections = self.pipeline_config.max_connections;
 
         // Start HTTP/3 server (UDP)
         let h3_handle = tokio::spawn(async move {
-            let server = Http3Server::from_state(http3_config, state_h3, max_connections);
+            let server = Http3Server::from_state(http3_config, state_h3, max_connections)
+                .with_write_timeout(write_timeout_h3);
             if let Err(e) = server.listen(addr, tls_config_h3.server_config).await {
                 error!(error = %e, "HTTP/3 server error");
             }
@@ -2423,12 +2464,15 @@ async fn serve_http_redirect(
     listener: TcpListener,
     target: Arc<RedirectTarget>,
     max_connections: usize,
+    write_timeout: Option<Duration>,
 ) -> Result<(), Error> {
     let limit = ConnectionLimit::new(max_connections);
     loop {
         let permit = limit.acquire().await;
         let (stream, client_addr) = listener.accept().await?;
-        let io = TokioIo::new(stream);
+        // Under the same write deadline as every other hyper path: a client
+        // that never reads its 301 must not hold a connection slot forever.
+        let io = TokioIo::new(crate::pipeline::WriteDeadline::new(stream, write_timeout));
         let target = Arc::clone(&target);
 
         tokio::spawn(async move {
@@ -2483,10 +2527,19 @@ async fn serve_http_redirect(
 /// same request.
 ///
 /// On HTTP/1.x an authority in the URI means an absolute-form (or, for
-/// `CONNECT`, authority-form) target. `armature-h1` refuses absolute-form
-/// outright, so the hyper paths do too: two backends that disagree about
-/// which `Host` a request is for are exactly the ambiguity a proxy in front
-/// can be steered through.
+/// `CONNECT`, authority-form) target. `armature-h1` 0.6 accepts absolute-form
+/// only when `Host` names the same authority; the hyper paths are stricter
+/// and refuse it outright, so no request that one backend would route by a
+/// different host than the other is ever served — at worst the hyper path
+/// answers `400` where `armature-h1` would have served.
+///
+/// `Host` itself is held to the rules `armature-h1` applies, so the hyper
+/// HTTP/1.1 paths (the no-`h1-backend` build and the micro server) and HTTP/2
+/// or HTTP/3 requests without `:authority` cannot carry a value such as
+/// `victim.example@evil.example` or `a/b` past this point to a virtual-host
+/// router or a redirect builder: it must be a syntactically valid
+/// `uri-host [":" port]` (or empty, which RFC 9112 §3.2 permits for a target
+/// with no authority), and HTTP/1.1 requires one (RFC 9112 §3.2).
 ///
 /// Returns the `Host` value to add, if any, or the reason for a `400`.
 pub(crate) fn reconcile_authority<'a, 'h>(
@@ -2504,6 +2557,15 @@ pub(crate) fn reconcile_authority<'a, 'h>(
     if hosts.next().is_some() {
         return Err("more than one Host header");
     }
+    match host {
+        Some(host) if !host.is_empty() && !is_valid_authority(host) => {
+            return Err("the Host header is not a valid authority");
+        }
+        None if version == http::Version::HTTP_11 => {
+            return Err("HTTP/1.1 requests require a Host header");
+        }
+        _ => {}
+    }
     let Some(authority) = authority else {
         return Ok(None);
     };
@@ -2520,6 +2582,91 @@ pub(crate) fn reconcile_authority<'a, 'h>(
         Some(_) => Ok(None),
         None => Ok(Some(authority)),
     }
+}
+
+/// Whether `a` is exactly `uri-host [":" port]` (RFC 3986 §3.2): a bracketed
+/// IP literal or a `reg-name` (which covers IPv4), then an optional decimal
+/// port of at most 65535. No userinfo, path or whitespace.
+///
+/// The same grammar `armature-h1` checks `Host` against, so a `Host` the
+/// default backend refuses is refused on the hyper paths too.
+pub(crate) fn is_valid_authority(a: &[u8]) -> bool {
+    let rest = if a.first() == Some(&b'[') {
+        let Some(close) = a.iter().position(|&b| b == b']') else {
+            return false;
+        };
+        let inner = &a[1..close];
+        if inner.is_empty()
+            || !inner
+                .iter()
+                .all(|b| b.is_ascii_hexdigit() || matches!(b, b':' | b'.'))
+        {
+            return false;
+        }
+        &a[close + 1..]
+    } else {
+        let end = a.iter().position(|&b| b == b':').unwrap_or(a.len());
+        let host = &a[..end];
+        if host.is_empty() || !is_reg_name(host) {
+            return false;
+        }
+        &a[end..]
+    };
+    match rest {
+        [] | [b':'] => true,
+        [b':', digits @ ..] => {
+            digits.len() <= 5
+                && digits.iter().all(u8::is_ascii_digit)
+                && digits
+                    .iter()
+                    .fold(0u32, |n, d| n * 10 + u32::from(d - b'0'))
+                    <= u32::from(u16::MAX)
+        }
+        _ => false,
+    }
+}
+
+/// `reg-name` (RFC 3986 §3.2.2): unreserved characters, sub-delims and
+/// well-formed percent-encodings.
+fn is_reg_name(host: &[u8]) -> bool {
+    let plain = |b: u8| {
+        b.is_ascii_alphanumeric()
+            || matches!(
+                b,
+                b'-' | b'.'
+                    | b'_'
+                    | b'~'
+                    | b'!'
+                    | b'$'
+                    | b'&'
+                    | b'\''
+                    | b'('
+                    | b')'
+                    | b'*'
+                    | b'+'
+                    | b','
+                    | b';'
+                    | b'='
+            )
+    };
+    let mut i = 0;
+    while i < host.len() {
+        if host[i] == b'%' {
+            if !host
+                .get(i + 1..i + 3)
+                .is_some_and(|h| h.iter().all(u8::is_ascii_hexdigit))
+            {
+                return false;
+            }
+            i += 3;
+            continue;
+        }
+        if !plain(host[i]) {
+            return false;
+        }
+        i += 1;
+    }
+    true
 }
 
 /// Handle an incoming HTTP request
@@ -3159,7 +3306,7 @@ async fn dispatch_request(
             resp
         }
         Err(err) => {
-            warn!(method = %method, path = %path, error = %err, "Request handling failed");
+            warn!(method = %method, path = %path, error = %err.log_display(), "Request handling failed");
             respond_to_error(err, filter_ctx_request, state.filter_chain.clone()).await
         }
     };
@@ -4210,15 +4357,17 @@ mod tests {
         }
     }
 
+    /// A guard with nothing to bind to fails startup instead of being
+    /// silently inert: whoever declared it expected it to protect something.
     #[test]
-    fn test_register_module_guard_without_controllers_is_inert() {
+    fn test_register_module_guard_without_controllers_fails_closed() {
         let container = Container::new();
         let mut router = Router::new();
         let mut visited = std::collections::HashSet::new();
-        Application::register_module(&container, &mut router, &mut visited, &GuardOnlyModule)
-            .unwrap();
-
-        // No controllers, so no routes for the guard to bind to.
+        let err =
+            Application::register_module(&container, &mut router, &mut visited, &GuardOnlyModule)
+                .expect_err("a guard-only module must be refused");
+        assert!(err.to_string().contains("no controllers"), "{err}");
         assert!(router.routes.is_empty());
         // `AdminModule`'s registrar adds no routes either; registering it must
         // still succeed.
@@ -4633,6 +4782,53 @@ mod tests {
         );
     }
 
+    /// `Host` is validated even when there is no authority to compare it
+    /// with, and HTTP/1.1 requires one — the rules `armature-h1` applies.
+    #[test]
+    fn host_syntax_is_validated_and_required_on_http11() {
+        use http::Version;
+        for version in [
+            Version::HTTP_10,
+            Version::HTTP_11,
+            Version::HTTP_2,
+            Version::HTTP_3,
+        ] {
+            for bad in [
+                "victim.example@evil.example",
+                "a/b",
+                "a b",
+                "host:99999",
+                "host:8o",
+                "[zz]",
+                "[::1",
+                ":80",
+            ] {
+                assert!(
+                    reconcile(version, false, None, &[bad]).is_err(),
+                    "{version:?} {bad}"
+                );
+            }
+            for good in [
+                "api.example",
+                "api.example:8443",
+                "api.example:",
+                "127.0.0.1",
+                "[::1]:443",
+                "my_host",
+                "",
+            ] {
+                assert_eq!(
+                    reconcile(version, false, None, &[good]),
+                    Ok(None),
+                    "{version:?} {good}"
+                );
+            }
+        }
+        assert!(reconcile(Version::HTTP_11, false, None, &[]).is_err());
+        assert_eq!(reconcile(Version::HTTP_10, false, None, &[]), Ok(None));
+        assert_eq!(reconcile(Version::HTTP_2, false, None, &[]), Ok(None));
+    }
+
     #[test]
     fn absolute_form_is_refused_on_http1_except_for_connect() {
         use http::Version;
@@ -4641,7 +4837,16 @@ mod tests {
             assert_eq!(reconcile(version, false, None, &["test"]), Ok(None));
         }
         assert_eq!(
-            reconcile(Version::HTTP_11, true, Some("db.example:5432"), &[]),
+            reconcile(
+                Version::HTTP_11,
+                true,
+                Some("db.example:5432"),
+                &["db.example:5432"]
+            ),
+            Ok(None)
+        );
+        assert_eq!(
+            reconcile(Version::HTTP_10, true, Some("db.example:5432"), &[]),
             Ok(Some("db.example:5432"))
         );
     }

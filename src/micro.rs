@@ -690,7 +690,7 @@ impl Middleware for Logger {
                     tracing::error!(
                         method = %method,
                         path = %path,
-                        error = %e,
+                        error = %e.log_display(),
                         duration_ms = elapsed.as_millis() as u64,
                         "Request failed"
                     );
@@ -1194,7 +1194,7 @@ impl Middleware for Compress {
 fn error_response_parts(e: &Error) -> (u16, String) {
     let status = e.status_code();
     if status >= 500 {
-        tracing::error!(error = %e, status, "Request handler failed");
+        tracing::error!(error = %e.log_display(), status, "Request handler failed");
     }
     let response = e.to_client_response();
     let body = String::from_utf8(response.into_body_bytes().to_vec()).unwrap_or_default();

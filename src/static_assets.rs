@@ -807,36 +807,90 @@ impl StaticAssetServer {
     /// source's are known and the sibling is at least as new; unknown freshness
     /// declines the sibling and compresses the source instead, which is always
     /// correct if slower.
+    ///
+    /// The body is stored under `cache_entry` (key and ETag) when one is
+    /// given. `permit` is the compression slot for an on-the-fly compression;
+    /// see [`spawn_compression`](Self::spawn_compression) for why it is handed
+    /// over rather than held by the caller.
     async fn load_body(
         &self,
         path: &Path,
         compression: Option<CompressionAlgorithm>,
         precompressed: Option<&Path>,
+        permit: Option<tokio::sync::OwnedSemaphorePermit>,
+        cache_entry: Option<(ContentCacheKey, Option<String>)>,
     ) -> Result<Bytes, Error> {
-        if let Some(sibling) = precompressed {
+        let body = if let Some(sibling) = precompressed {
             let content = tokio::fs::read(sibling)
                 .await
                 .map_err(|e| Error::Internal(format!("Failed to read pre-compressed file: {e}")))?;
-            return Ok(Bytes::from(content));
-        }
-
-        let raw_content = tokio::fs::read(path)
-            .await
-            .map_err(|e| Error::Internal(format!("Failed to read file: {}", e)))?;
-
-        let bytes = match compression {
-            // Brotli at high quality runs to hundreds of milliseconds per MiB;
-            // on the executor thread that stalls every other connection it
-            // owns. The caller holds a compression permit across this await.
-            Some(algo) => {
-                let level = self.config.compression.level;
-                tokio::task::spawn_blocking(move || compress_bytes(&raw_content, algo, level))
-                    .await
-                    .map_err(|e| Error::Internal(format!("Compression task failed: {e}")))??
+            Bytes::from(content)
+        } else {
+            let raw_content = tokio::fs::read(path)
+                .await
+                .map_err(|e| Error::Internal(format!("Failed to read file: {}", e)))?;
+            match compression {
+                // The compressed body is cached by the blocking task itself.
+                Some(algo) => {
+                    return self
+                        .spawn_compression(raw_content, algo, permit, cache_entry)
+                        .await
+                        .map_err(|e| Error::Internal(format!("Compression task failed: {e}")))?;
+                }
+                None => Bytes::from(raw_content),
             }
-            None => raw_content,
         };
-        Ok(Bytes::from(bytes))
+        if let Some((key, etag)) = cache_entry {
+            self.cache_put(
+                key,
+                CachedContent {
+                    body: body.clone(),
+                    etag,
+                },
+            );
+        }
+        Ok(body)
+    }
+
+    /// Compress `raw` on the blocking pool, caching the result from inside the
+    /// blocking task.
+    ///
+    /// Brotli at high quality runs to hundreds of milliseconds per MiB; on the
+    /// executor thread that stalls every other connection it owns. A blocking
+    /// task, though, cannot be cancelled: if the request awaiting it goes away
+    /// (client reset, connection closed) the compression runs to completion
+    /// regardless. So the task owns both the compression slot and the cache
+    /// write. Were the permit held by the request future instead, dropping
+    /// that future would free the slot while the CPU work kept going, and a
+    /// client opening and abandoning requests could run any number of
+    /// compressions at once past `max_concurrent`, saturating the blocking
+    /// pool; and caching here means abandoned work still serves the next
+    /// request instead of being thrown away.
+    fn spawn_compression(
+        &self,
+        raw: Vec<u8>,
+        algo: CompressionAlgorithm,
+        permit: Option<tokio::sync::OwnedSemaphorePermit>,
+        cache_entry: Option<(ContentCacheKey, Option<String>)>,
+    ) -> tokio::task::JoinHandle<Result<Bytes, Error>> {
+        let level = self.config.compression.level;
+        let cache = self.cache.clone();
+        tokio::task::spawn_blocking(move || {
+            // Released when this closure returns, i.e. when the CPU work is
+            // actually over -- not when a request stops waiting for it.
+            let _permit = permit;
+            let body = Bytes::from(compress_bytes(&raw, algo, level)?);
+            if let (Some(cache), Some((key, etag))) = (cache, cache_entry) {
+                cache.lock().put(
+                    key,
+                    CachedContent {
+                        body: body.clone(),
+                        etag,
+                    },
+                );
+            }
+            Ok(body)
+        })
     }
 
     /// Serve a static file as a buffered response.
@@ -1061,18 +1115,12 @@ impl StaticAssetServer {
                 entry.body
             }
             None => {
-                let body = self.load_body(path, compression, sibling_path).await?;
-                drop(permit);
-                if let Some(key) = cache_key(compression) {
-                    self.cache_put(
-                        key,
-                        CachedContent {
-                            body: body.clone(),
-                            etag: etag.clone(),
-                        },
-                    );
-                }
-                body
+                // The permit moves into the body load: an on-the-fly
+                // compression owns its slot until the CPU work ends, even if
+                // this request is dropped while waiting for it.
+                let cache_entry = cache_key(compression).map(|key| (key, etag.clone()));
+                self.load_body(path, compression, sibling_path, permit, cache_entry)
+                    .await?
             }
         };
 
@@ -1312,10 +1360,10 @@ impl StaticAssetServer {
             return Ok(None);
         };
 
+        // Outside the root is "not found", like a missing file: a distinct
+        // 403 would tell the client that the target exists out there.
         let Ok(relative) = canonical_path.strip_prefix(&self.canonical_root) else {
-            return Err(Error::Forbidden(
-                "Access denied: path traversal attempt".to_string(),
-            ));
+            return Ok(None);
         };
 
         // And on what it resolved to: `public/config -> .git/config` is a
@@ -1329,13 +1377,19 @@ impl StaticAssetServer {
 
     /// Canonicalize `path` and return it only if it resolves inside the root.
     ///
-    /// `None` when it does not exist, cannot be resolved, or escapes the root
-    /// (e.g. through a symlink) — every case where serving it is unproven safe.
+    /// `None` when it does not exist, cannot be resolved, escapes the root
+    /// (e.g. through a symlink), or — unless hidden files are served — resolves
+    /// to a hidden file: every case where serving it is unproven safe. The
+    /// hidden check runs on the *resolved* path for the same reason
+    /// `resolve_path` does: `docs/index.html -> ../.git/config` or
+    /// `app.js.gz -> .env` is a visible name for a hidden file.
     async fn contained(&self, path: &Path) -> Option<PathBuf> {
         let canonical = tokio::fs::canonicalize(path).await.ok()?;
-        canonical
-            .starts_with(&self.canonical_root)
-            .then_some(canonical)
+        let relative = canonical.strip_prefix(&self.canonical_root).ok()?;
+        if !self.config.serve_hidden && has_hidden_component(relative) {
+            return None;
+        }
+        Some(canonical)
     }
 
     /// Generate ETag for a file with compression info.
@@ -1754,7 +1808,7 @@ mod tests {
             return Ok(None);
         };
         let body = server
-            .load_body(path, Some(algo), Some(sibling.as_path()))
+            .load_body(path, Some(algo), Some(sibling.as_path()), None, None)
             .await?;
         Ok(Some(body.to_vec()))
     }
@@ -2018,6 +2072,99 @@ mod tests {
         let server = StaticAssetServer::new(StaticAssetsConfig::new(dir.path.clone())).unwrap();
         let err = server.serve(&get_req("/config.txt")).await.unwrap_err();
         assert_eq!(err.status_code(), 404);
+    }
+
+    /// Index files, pre-compressed siblings and the SPA fallback are resolved
+    /// through `contained`, which must refuse a visible name resolving to a
+    /// hidden file just as `resolve_path` does for the request path.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn contained_candidates_resolving_to_hidden_files_are_not_served() {
+        let dir = TempDir::new();
+        dir.write(".env", b"SECRET=1");
+        std::fs::create_dir(dir.path.join(".git")).unwrap();
+        dir.write(".git/config", b"[core] leaked");
+        std::fs::create_dir(dir.path.join("docs")).unwrap();
+        std::os::unix::fs::symlink("../.git/config", dir.path.join("docs/index.html")).unwrap();
+        dir.write("app.js", b"inside");
+        std::os::unix::fs::symlink(".env", dir.path.join("app.js.gz")).unwrap();
+        std::os::unix::fs::symlink(".env", dir.path.join("fallback.html")).unwrap();
+
+        let server = StaticAssetServer::new(
+            StaticAssetsConfig::new(dir.path.clone()).with_fallback("fallback.html"),
+        )
+        .unwrap();
+
+        match server.serve(&get_req("/docs/")).await {
+            Ok(resp) => panic!("index served {:?}", resp.body_ref()),
+            Err(e) => assert!(e.status_code() == 403 || e.status_code() == 404, "{e}"),
+        }
+
+        let source = dir.path.join("app.js").canonicalize().unwrap();
+        let modified = std::fs::metadata(&source).unwrap().modified().ok();
+        let got = server
+            .locate_precompressed(&source, CompressionAlgorithm::Gzip, modified)
+            .await
+            .unwrap();
+        assert!(got.is_none(), "{got:?}");
+
+        let err = server.serve(&get_req("/missing")).await.unwrap_err();
+        assert_eq!(err.status_code(), 404);
+    }
+
+    /// A request resolving outside the root answers exactly like a missing
+    /// file, so the status does not reveal what exists beyond the root.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn symlink_outside_root_is_not_found_not_forbidden() {
+        let outside = TempDir::new();
+        outside.write("secret.txt", b"outside the root");
+        let dir = TempDir::new();
+        std::os::unix::fs::symlink(outside.path.join("secret.txt"), dir.path.join("out")).unwrap();
+        std::os::unix::fs::symlink(outside.path.join("absent.txt"), dir.path.join("gone")).unwrap();
+        let server = StaticAssetServer::new(StaticAssetsConfig::new(dir.path.clone())).unwrap();
+        for target in ["/out", "/gone"] {
+            let err = server.serve(&get_req(target)).await.unwrap_err();
+            assert_eq!(err.status_code(), 404, "{target}");
+        }
+    }
+
+    /// A request that stops waiting for an on-the-fly compression must not
+    /// free its slot while the (uncancellable) blocking work still runs, and
+    /// the finished body must still land in the cache.
+    #[tokio::test]
+    async fn abandoned_compression_keeps_its_slot_and_caches_the_result() {
+        let dir = TempDir::new();
+        dir.write("app.js", &vec![b'x'; 4096]);
+        let config = StaticAssetsConfig::new(dir.path.clone())
+            .with_compression(CompressionConfig::new().with_max_concurrent(1));
+        let server = StaticAssetServer::new(config).unwrap();
+        let path = dir.path.join("app.js").canonicalize().unwrap();
+        let modified = std::fs::metadata(&path).unwrap().modified().unwrap();
+        let key: ContentCacheKey = (path, modified, Some(CompressionAlgorithm::Gzip), None);
+
+        let permit = server.compress_permits.clone().try_acquire_owned().unwrap();
+        let handle = server.spawn_compression(
+            vec![b'x'; 4096],
+            CompressionAlgorithm::Gzip,
+            Some(permit),
+            Some((key.clone(), Some("\"etag\"".to_string()))),
+        );
+        // The request is gone; nothing awaits the result any more.
+        drop(handle);
+
+        // The slot comes back only once the work is over, and by then the
+        // result has been cached (the cache write precedes the release).
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        while server.compress_permits.available_permits() == 0 {
+            assert!(std::time::Instant::now() < deadline, "slot never released");
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        let cached = server
+            .cache_get(&key)
+            .expect("abandoned work was discarded");
+        assert_eq!(cached.etag.as_deref(), Some("\"etag\""));
+        assert!(!cached.body.is_empty());
     }
 
     #[tokio::test]

@@ -69,7 +69,7 @@ impl Interceptor for LoggingInterceptor {
                 tracing::error!(
                     method = %method,
                     path = %path,
-                    error = %e,
+                    error = %e.log_display(),
                     duration_ms,
                     "request failed"
                 );
@@ -127,6 +127,12 @@ where
 /// [`with_capacity`](Self::with_capacity)); past that the oldest is evicted.
 /// An expired entry is dropped when a lookup finds it, or evicted by capacity.
 ///
+/// Bytes are bounded too, since an entry count alone lets a handful of large
+/// responses pin arbitrary memory: a body over
+/// [`max_body_bytes`](Self::with_max_body_bytes) is never stored, and the
+/// bodies held together never exceed
+/// [`max_total_bytes`](Self::with_max_total_bytes) (oldest evicted first).
+///
 /// The cache is process-local and shared across clones of the interceptor via
 /// an `Arc`, so a single `CacheInterceptor` value serves every request routed
 /// through it.
@@ -136,10 +142,15 @@ where
 /// This is a **shared, unkeyed-by-identity** cache: it does not discriminate on
 /// `Authorization`, `Cookie`, or any other per-user dimension. Placing it on a
 /// route whose response depends on the caller's identity would serve one user's
-/// body to another. To reduce that blast radius a request carrying
-/// `Authorization` or `Cookie` (or more than one `Host`) bypasses the cache
-/// entirely — it is never served a hit and its response is never stored — and
-/// it will **not store** a response that:
+/// body to another. To reduce that blast radius a *credentialed* request
+/// bypasses the cache entirely — it is never served a hit and its response is
+/// never stored. Credentialed means it carries any credential header
+/// (`Authorization`, `Cookie`, `X-Api-Key`, `X-Auth-Token`, `X-Session-*`, ...
+/// — every [sensitive](crate::headers::is_sensitive_header) header except
+/// anti-CSRF tokens) or an authentication layer has attached a
+/// [`VerifiedIdentity`](crate::VerifiedIdentity) /
+/// [`RequestRoles`](crate::RequestRoles). A request with more than one `Host`
+/// bypasses it too. Otherwise the cache will **not store** a response that:
 ///
 /// - was produced by a method other than `GET` or `HEAD`, or
 /// - carries a `Set-Cookie` header (session/user state), or
@@ -169,12 +180,65 @@ pub struct CacheInterceptor {
     /// value is a new key) can't grow it without limit. Reads use `peek`,
     /// which leaves recency alone, so lookups share the read lock and
     /// eviction is oldest-stored-first.
-    store: Arc<RwLock<LruCache<String, (Instant, HttpResponse)>>>,
+    store: Arc<RwLock<Store>>,
+    /// Largest body stored; bigger responses pass through uncached.
+    max_body_bytes: usize,
+    /// Budget for the bodies (and keys) held together.
+    max_total_bytes: usize,
+}
+
+/// The LRU plus a running total of the bytes it holds, kept under one lock so
+/// the total can't drift from the entries it counts.
+struct Store {
+    entries: LruCache<String, (Instant, HttpResponse)>,
+    bytes: usize,
+}
+
+/// What an entry counts against the byte budget: its body and its key (the
+/// key carries the attacker-chosen path and query, so it is not free either).
+fn entry_cost(key: &str, response: &HttpResponse) -> usize {
+    key.len() + response.body.len()
+}
+
+impl Store {
+    fn pop(&mut self, key: &str) {
+        if let Some((_, response)) = self.entries.pop(key) {
+            self.bytes -= entry_cost(key, &response);
+        }
+    }
+
+    /// Insert, evicting oldest entries until both the count and the byte
+    /// budget hold.
+    fn insert(&mut self, key: String, response: HttpResponse, max_total_bytes: usize) {
+        let cost = entry_cost(&key, &response);
+        // Something that can never fit must not flush the whole cache trying.
+        if cost > max_total_bytes {
+            return;
+        }
+        // A re-store replaces the old entry; take its bytes off first so the
+        // eviction loop below doesn't count it twice.
+        self.pop(&key);
+        while self.bytes + cost > max_total_bytes {
+            match self.entries.pop_lru() {
+                Some((k, (_, r))) => self.bytes -= entry_cost(&k, &r),
+                None => break,
+            }
+        }
+        // `push` hands back what the count bound evicted.
+        if let Some((k, (_, r))) = self.entries.push(key, (Instant::now(), response)) {
+            self.bytes -= entry_cost(&k, &r);
+        }
+        self.bytes += cost;
+    }
 }
 
 impl CacheInterceptor {
     /// Entries held by [`new`](Self::new) before the oldest is evicted.
     pub const DEFAULT_MAX_ENTRIES: usize = 1024;
+    /// Default largest body stored: 1 MiB.
+    pub const DEFAULT_MAX_BODY_BYTES: usize = 1024 * 1024;
+    /// Default budget for all stored bodies together: 64 MiB.
+    pub const DEFAULT_MAX_TOTAL_BYTES: usize = 64 * 1024 * 1024;
 
     pub fn new(ttl_seconds: u64) -> Self {
         Self::with_capacity(ttl_seconds, Self::DEFAULT_MAX_ENTRIES)
@@ -185,19 +249,44 @@ impl CacheInterceptor {
         let capacity = NonZeroUsize::new(max_entries).unwrap_or(NonZeroUsize::MIN);
         Self {
             ttl_seconds,
-            store: Arc::new(RwLock::new(LruCache::new(capacity))),
+            store: Arc::new(RwLock::new(Store {
+                entries: LruCache::new(capacity),
+                bytes: 0,
+            })),
+            max_body_bytes: Self::DEFAULT_MAX_BODY_BYTES,
+            max_total_bytes: Self::DEFAULT_MAX_TOTAL_BYTES,
         }
+    }
+
+    /// Never store a response whose body is larger than `bytes`
+    /// (default [`DEFAULT_MAX_BODY_BYTES`](Self::DEFAULT_MAX_BODY_BYTES)).
+    pub fn with_max_body_bytes(mut self, bytes: usize) -> Self {
+        self.max_body_bytes = bytes;
+        self
+    }
+
+    /// Hold at most `bytes` of bodies and keys in total, evicting the oldest
+    /// entries to make room (default
+    /// [`DEFAULT_MAX_TOTAL_BYTES`](Self::DEFAULT_MAX_TOTAL_BYTES)).
+    pub fn with_max_total_bytes(mut self, bytes: usize) -> Self {
+        self.max_total_bytes = bytes;
+        self
+    }
+
+    /// Bytes currently held (bodies plus keys).
+    pub fn total_bytes(&self) -> usize {
+        self.store.read().bytes
     }
 
     /// Number of entries currently held (including any not-yet-pruned expired
     /// ones). Primarily useful for tests and diagnostics.
     pub fn len(&self) -> usize {
-        self.store.read().len()
+        self.store.read().entries.len()
     }
 
     /// Whether the cache currently holds no entries.
     pub fn is_empty(&self) -> bool {
-        self.store.read().is_empty()
+        self.store.read().entries.is_empty()
     }
 }
 
@@ -301,14 +390,15 @@ fn is_cacheable_method(method: &str) -> bool {
 
 /// Whether a request must skip the cache in both directions.
 ///
-/// `Authorization`/`Cookie` mean the handler is likely answering *this* caller;
-/// the key has no identity in it, so a hit would hand them someone else's
-/// body and a store would hand theirs to everyone. Two `Host` lines leave
-/// which site the response is for a guess, so it isn't keyed on either.
+/// A credential — any credential header, not just `Authorization`/`Cookie`
+/// (an `X-Api-Key` identifies the caller just as well), or a verified
+/// identity an auth middleware attached — means the handler is likely
+/// answering *this* caller; the key has no identity in it, so a hit would
+/// hand them someone else's body and a store would hand theirs to everyone.
+/// Two `Host` lines leave which site the response is for a guess, so it
+/// isn't keyed on either.
 fn must_bypass(request: &HttpRequest) -> bool {
-    request.headers.contains("authorization")
-        || request.headers.contains("cookie")
-        || request.headers.get_unique("host").is_err()
+    crate::guard::is_credentialed_request(request) || request.headers.get_unique("host").is_err()
 }
 
 /// Whether a response must not be stored in this shared, identity-agnostic
@@ -386,7 +476,7 @@ impl Interceptor for CacheInterceptor {
         if let Some(key) = cache_key.as_deref() {
             let expired = {
                 let store = self.store.read();
-                match store.peek(key) {
+                match store.entries.peek(key) {
                     Some((stored_at, cached)) if stored_at.elapsed() < ttl => {
                         return Ok(clone_response(cached));
                     }
@@ -398,7 +488,11 @@ impl Interceptor for CacheInterceptor {
             // capacity pushes it out.
             if expired {
                 let mut store = self.store.write();
-                if store.peek(key).is_some_and(|(at, _)| at.elapsed() >= ttl) {
+                if store
+                    .entries
+                    .peek(key)
+                    .is_some_and(|(at, _)| at.elapsed() >= ttl)
+                {
                     store.pop(key);
                 }
             }
@@ -416,12 +510,13 @@ impl Interceptor for CacheInterceptor {
             && self.ttl_seconds > 0
             && (200..300).contains(&response.status)
             && !must_not_cache(&response)
+            && response.body.len() <= self.max_body_bytes
         {
-            // O(1): the capacity bound, not a full sweep under the write lock,
-            // is what keeps the store from growing.
+            // Amortized O(1): the count and byte bounds, not a full sweep under
+            // the write lock, are what keep the store from growing.
             self.store
                 .write()
-                .put(key, (Instant::now(), clone_response(&response)));
+                .insert(key, clone_response(&response), self.max_total_bytes);
         }
 
         Ok(response)
@@ -1073,5 +1168,142 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(calls.load(Ordering::SeqCst), 4);
+    }
+
+    /// Every credential header — not just `Authorization`/`Cookie` — and a
+    /// verified identity attached by middleware make the request bypass the
+    /// cache in both directions. Anti-CSRF tokens alone do not.
+    #[tokio::test]
+    async fn test_cache_interceptor_bypasses_all_credentials() {
+        let credentialed: Vec<Box<dyn Fn() -> HttpRequest>> = vec![
+            Box::new(|| with_header(HttpRequest::new("GET", "/me"), "X-Api-Key", "k")),
+            Box::new(|| with_header(HttpRequest::new("GET", "/me"), "X-Auth-Token", "t")),
+            Box::new(|| with_header(HttpRequest::new("GET", "/me"), "X-Session-Id", "s")),
+            Box::new(|| {
+                let mut r = HttpRequest::new("GET", "/me");
+                r.extensions.insert(crate::VerifiedIdentity::new("alice"));
+                r
+            }),
+            Box::new(|| {
+                let mut r = HttpRequest::new("GET", "/me");
+                r.extensions.insert(crate::RequestRoles::new(["admin"]));
+                r
+            }),
+        ];
+        for make in credentialed {
+            let interceptor = CacheInterceptor::new(60);
+            let calls = Arc::new(AtomicUsize::new(0));
+            // Seed an anonymous entry, then make sure the credentialed request
+            // is neither served it nor stores its own.
+            interceptor
+                .intercept(
+                    ExecutionContext::new(HttpRequest::new("GET", "/me")),
+                    counting_next(calls.clone(), 200, b"anon"),
+                )
+                .await
+                .unwrap();
+            let resp = interceptor
+                .intercept(
+                    ExecutionContext::new(make()),
+                    counting_next(calls.clone(), 200, b"mine"),
+                )
+                .await
+                .unwrap();
+            assert_eq!(resp.body_ref(), b"mine", "{:?}", make());
+            assert_eq!(calls.load(Ordering::SeqCst), 2);
+            assert_eq!(interceptor.len(), 1);
+        }
+
+        let interceptor = CacheInterceptor::new(60);
+        let calls = Arc::new(AtomicUsize::new(0));
+        for _ in 0..2 {
+            let req = with_header(HttpRequest::new("GET", "/p"), "X-CSRF-Token", "c");
+            interceptor
+                .intercept(
+                    ExecutionContext::new(req),
+                    counting_next(calls.clone(), 200, b"x"),
+                )
+                .await
+                .unwrap();
+        }
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            1,
+            "CSRF token alone is cacheable"
+        );
+    }
+
+    /// `host:443` and `host` may be different origins (`http://host:443` is
+    /// not `http://host`), so they must not share an entry.
+    #[tokio::test]
+    async fn test_cache_interceptor_keeps_port_in_key() {
+        let interceptor = CacheInterceptor::new(60);
+        let calls = Arc::new(AtomicUsize::new(0));
+        for (host, body) in [("h.example:443", &b"tls"[..]), ("h.example", b"plain")] {
+            let resp = interceptor
+                .intercept(
+                    ExecutionContext::new(with_header(HttpRequest::new("GET", "/"), "Host", host)),
+                    counting_next(calls.clone(), 200, body),
+                )
+                .await
+                .unwrap();
+            assert_eq!(resp.body_ref(), body);
+        }
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+    }
+
+    /// Bodies over the per-entry limit pass through uncached, and the total
+    /// byte budget evicts the oldest entries.
+    #[tokio::test]
+    async fn test_cache_interceptor_is_byte_bounded() {
+        let interceptor = CacheInterceptor::new(60)
+            .with_max_body_bytes(8)
+            .with_max_total_bytes(64);
+        let calls = Arc::new(AtomicUsize::new(0));
+        interceptor
+            .intercept(
+                ExecutionContext::new(HttpRequest::new("GET", "/big")),
+                counting_next(calls.clone(), 200, b"0123456789"),
+            )
+            .await
+            .unwrap();
+        assert!(interceptor.is_empty(), "oversized body must not be stored");
+
+        // Each entry costs key (~12 bytes) + 8 body bytes; 64 bytes holds ~3.
+        for i in 0..10 {
+            let path = format!("/s{i}");
+            interceptor
+                .intercept(
+                    ExecutionContext::new(HttpRequest::new("GET", path)),
+                    counting_next(calls.clone(), 200, b"01234567"),
+                )
+                .await
+                .unwrap();
+            assert!(interceptor.total_bytes() <= 64);
+        }
+        assert!(interceptor.len() < 10 && !interceptor.is_empty());
+
+        // Re-storing the same key doesn't double-count.
+        let mut store = Store {
+            entries: LruCache::new(NonZeroUsize::new(4).unwrap()),
+            bytes: 0,
+        };
+        for _ in 0..3 {
+            let mut r = HttpResponse::new(200);
+            r.body = Bytes::from_static(b"abcd");
+            store.insert("k".to_string(), r, 1024);
+        }
+        assert_eq!(store.bytes, 5);
+        store.pop("k");
+        assert_eq!(store.bytes, 0);
+    }
+
+    /// The key must tell apart queries the handler's `Query<T>` reads
+    /// differently: an extra empty-key pair, and `%FF` vs a literal `%FF`.
+    #[test]
+    fn cache_key_distinguishes_empty_keys_and_invalid_utf8() {
+        let key = |p: &str| cache_key(&HttpRequest::new("GET", p.to_string()));
+        assert_ne!(key("/s?q=1&=x"), key("/s?q=1"));
+        assert_ne!(key("/s?q=%FF"), key("/s?q=%25FF"));
     }
 }

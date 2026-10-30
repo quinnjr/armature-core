@@ -319,8 +319,10 @@ impl JsonStreamSender {
     /// The string must be a single NDJSON record: an interior `\n` or `\r`
     /// would end the record early and let the remainder be read as a second,
     /// attacker-shaped record, so such input is rejected rather than sent.
-    /// Leading and trailing whitespace (including a trailing newline) is
-    /// trimmed first.
+    /// It must also be exactly one JSON value: `{..} {..}` on one line, or a
+    /// value followed by trailing data, is read by lenient consumers as a
+    /// different record (or records) than the caller intended. Leading and
+    /// trailing whitespace (including a trailing newline) is trimmed first.
     pub async fn send_raw(&self, json: &str) -> Result<(), Error> {
         let json = json.trim();
         if json.contains(['\n', '\r']) {
@@ -328,6 +330,11 @@ impl JsonStreamSender {
                 "raw NDJSON record must not contain a line break".to_string(),
             ));
         }
+        // `from_str` rejects trailing non-whitespace, so this accepts exactly
+        // one value; `IgnoredAny` validates it without building it.
+        serde_json::from_str::<serde::de::IgnoredAny>(json).map_err(|_| {
+            Error::Serialization("raw NDJSON record must be exactly one JSON value".to_string())
+        })?;
         self.inner.send(format!("{}\n", json)).await?;
         self.items_sent.fetch_add(1, Ordering::Relaxed);
         Ok(())
@@ -906,6 +913,31 @@ mod tests {
         sender.send_raw("{\"a\":1}\n").await.unwrap();
         sender.close().await;
         assert_eq!(&stream.next().await.unwrap().unwrap()[..], b"{\"a\":1}\n");
+        assert!(stream.next().await.is_none());
+        assert_eq!(sender.items_sent(), 1);
+    }
+
+    /// A raw record must be exactly one JSON value: two values on one line
+    /// (`{..} {..}`), trailing garbage, or non-JSON would be read by a
+    /// consumer as something other than the one record the caller meant.
+    #[tokio::test]
+    async fn send_raw_rejects_anything_but_one_json_value() {
+        let (mut stream, sender) = JsonStream::new();
+        for bad in [
+            "{\"a\":1} {\"admin\":true}",
+            "{\"a\":1}garbage",
+            "not json",
+            "{\"a\":",
+            "",
+        ] {
+            assert!(sender.send_raw(bad).await.is_err(), "{bad:?}");
+        }
+        sender.send_raw(" [1, \"two\"] ").await.unwrap();
+        sender.close().await;
+        assert_eq!(
+            &stream.next().await.unwrap().unwrap()[..],
+            b"[1, \"two\"]\n"
+        );
         assert!(stream.next().await.is_none());
         assert_eq!(sender.items_sent(), 1);
     }

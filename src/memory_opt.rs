@@ -19,6 +19,7 @@ use bytes::{Bytes, BytesMut};
 use compact_str::CompactString;
 use smallvec::SmallVec;
 use std::collections::VecDeque;
+use std::fmt;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -30,12 +31,29 @@ use std::sync::atomic::{AtomicU64, Ordering};
 pub const INLINE_HEADER_COUNT: usize = 16;
 
 /// A header key-value pair using compact strings.
-#[derive(Debug, Clone, PartialEq, Eq)]
+///
+/// `Debug` redacts the value of a sensitive header (see
+/// [`is_sensitive_header`](crate::headers::is_sensitive_header)).
+#[derive(Clone, PartialEq, Eq)]
 pub struct SmallHeader {
     /// Header name (e.g., "Content-Type")
     pub name: CompactString,
     /// Header value
     pub value: CompactString,
+}
+
+impl fmt::Debug for SmallHeader {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let value = if crate::headers::is_sensitive_header(&self.name) {
+            crate::headers::REDACTED
+        } else {
+            self.value.as_str()
+        };
+        f.debug_struct("SmallHeader")
+            .field("name", &self.name.as_str())
+            .field("value", &value)
+            .finish()
+    }
 }
 
 impl SmallHeader {
@@ -65,9 +83,23 @@ impl SmallHeader {
 ///
 /// Uses SmallVec to store up to 16 headers inline (on stack),
 /// only allocating on heap for requests with many headers.
-#[derive(Debug, Clone, Default)]
+///
+/// `Debug` redacts sensitive values, as [`HeaderMap`](crate::HeaderMap)'s does.
+#[derive(Clone, Default)]
 pub struct SmallHeaders {
     headers: SmallVec<[SmallHeader; INLINE_HEADER_COUNT]>,
+}
+
+impl fmt::Debug for SmallHeaders {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        crate::headers::RedactedHeaders(
+            self.headers
+                .iter()
+                .map(|h| (h.name.as_str(), h.value.as_bytes()))
+                .collect(),
+        )
+        .fmt(f)
+    }
 }
 
 impl SmallHeaders {
@@ -298,10 +330,20 @@ pub const LARGE_RESPONSE_BUFFER: usize = 65536;
 /// Pre-sized buffer for response building.
 ///
 /// Avoids reallocations by pre-allocating based on expected response size.
-#[derive(Debug)]
+///
+/// `Debug` shows sizes only; the contents are a request or response body.
 pub struct PreSizedBuffer {
     buffer: BytesMut,
     initial_capacity: usize,
+}
+
+impl fmt::Debug for PreSizedBuffer {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("PreSizedBuffer")
+            .field("len", &self.buffer.len())
+            .field("initial_capacity", &self.initial_capacity)
+            .finish()
+    }
 }
 
 impl PreSizedBuffer {
@@ -653,12 +695,29 @@ impl PoolStats {
 // ============================================================================
 
 /// Poolable request builder.
-#[derive(Debug)]
+///
+/// `Debug` follows `HttpRequest`'s rules: path without query, sensitive
+/// header values redacted (via [`SmallHeaders`]), body length only (via
+/// [`PreSizedBuffer`]).
 pub struct PooledRequest {
     pub method: CompactString,
     pub path: CompactPath,
     pub headers: SmallHeaders,
     pub body: PreSizedBuffer,
+}
+
+impl fmt::Debug for PooledRequest {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("PooledRequest")
+            .field("method", &self.method.as_str())
+            .field(
+                "path",
+                &crate::headers::path_without_query(self.path.as_str()),
+            )
+            .field("headers", &self.headers)
+            .field("body", &self.body)
+            .finish()
+    }
 }
 
 impl Poolable for PooledRequest {
@@ -1124,5 +1183,21 @@ mod tests {
         let _ = stats.paths_inline();
         let _ = stats.buffer_allocs();
         let _ = stats.pool_hit_ratio();
+    }
+
+    #[test]
+    fn pooled_request_debug_follows_http_request_rules() {
+        let mut req = PooledRequest::create();
+        req.path("/me?token=q-secret")
+            .header("X-Api-Key", "h-secret")
+            .header("Accept", "text/html")
+            .body(b"b-secret");
+        let out = format!("{req:?}");
+        for secret in ["q-secret", "h-secret", "b-secret"] {
+            assert!(!out.contains(secret), "{secret} leaked: {out}");
+        }
+        assert!(out.contains("text/html"), "{out}");
+        let header = SmallHeader::new("Cookie", "sid=c-secret");
+        assert!(!format!("{header:?}").contains("c-secret"));
     }
 }

@@ -524,7 +524,8 @@ pub(crate) struct H2ConnectionLimits {
     /// "closing" into a new way to hold a slot.
     pub(crate) shutdown_grace: Duration,
     /// How long one socket write may stall (see
-    /// [`WriteDeadline`](crate::pipeline::WriteDeadline)).
+    /// [`WriteDeadline`](crate::pipeline::WriteDeadline)), and how long one
+    /// stream's response body may make no progress (see [`TrackedBody`]).
     pub(crate) write_timeout: Option<Duration>,
     /// Request-body bytes the connection may buffer at once across streams.
     pub(crate) body_budget: usize,
@@ -583,22 +584,31 @@ impl H2ConnectionServer {
         let stats = Arc::clone(&self.stats);
         stats.connection_opened();
 
-        let service = {
-            let tracker = Arc::clone(&tracker);
-            let stats = Arc::clone(&stats);
-            service_fn(move |req: hyper::Request<IncomingBody>| {
-                // Taken before the handler future exists, released when it
-                // completes or is dropped (a reset stream): the idle clock
-                // runs only while nothing is in flight.
-                let active = tracker.begin();
-                stats.request_processed();
-                let state = state.clone();
-                async move {
-                    let _active = active;
-                    crate::application::handle_request(req, state).await
-                }
-            })
-        };
+        let service =
+            {
+                let tracker = Arc::clone(&tracker);
+                let stats = Arc::clone(&stats);
+                service_fn(move |req: hyper::Request<IncomingBody>| {
+                    // Taken before the handler future exists and handed on to the
+                    // response body, so it is released only once the response has
+                    // been sent in full or the stream is gone (a reset, the
+                    // connection closing): the idle clock runs only while nothing
+                    // is in flight. Releasing it when the handler returned left a
+                    // response still waiting on the peer's flow-control window
+                    // uncounted, and a peer that never opens the window could pin
+                    // a stream's worth of response per stream, indefinitely.
+                    let active = tracker.begin();
+                    stats.request_processed();
+                    let state = state.clone();
+                    let tracker = Arc::clone(&tracker);
+                    async move {
+                        let response = crate::application::handle_request(req, state).await?;
+                        Ok::<_, hyper::Error>(response.map(|body| {
+                            TrackedBody::new(body, active, &tracker, limits.write_timeout)
+                        }))
+                    }
+                })
+            };
 
         let io = hyper_util::rt::TokioIo::new(crate::pipeline::WriteDeadline::new(
             io,
@@ -612,12 +622,20 @@ impl H2ConnectionServer {
             tokio::select! {
                 served = conn.as_mut() => break Some(served),
                 () = tokio::time::sleep_until(deadline) => {
-                    match tracker.next_deadline(
-                        tokio::time::Instant::now(),
-                        limits.idle_timeout,
-                    ) {
-                        Some(next) => deadline = next,
-                        None => break None,
+                    let now = tokio::time::Instant::now();
+                    let Some(next) = tracker.next_deadline(now, limits.idle_timeout) else {
+                        break None;
+                    };
+                    // hyper cannot reset one stream from out here, so a
+                    // response the peer has stopped accepting closes the
+                    // connection, the way a stalled write does on HTTP/1.1.
+                    match limits
+                        .write_timeout
+                        .map(|limit| tracker.next_stall_deadline(now, limit))
+                    {
+                        Some(Err(Stalled)) => break None,
+                        Some(Ok(Some(stall))) => deadline = next.min(stall),
+                        _ => deadline = next,
                     }
                 }
             }
@@ -665,7 +683,15 @@ pub(crate) struct StreamTracker {
     begun: AtomicU64,
     /// When `active` last fell to zero, as nanoseconds since `started`.
     idle_since_nanos: AtomicU64,
+    /// The response bodies still being sent, each as the moment (nanoseconds
+    /// since `started`) it last made progress. Weak, so a finished body drops
+    /// out by itself; the watcher sweeps the dead entries.
+    responses: std::sync::Mutex<Vec<std::sync::Weak<AtomicU64>>>,
 }
+
+/// A response body made no progress within the write timeout.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) struct Stalled;
 
 impl StreamTracker {
     pub(crate) fn new() -> Self {
@@ -674,6 +700,57 @@ impl StreamTracker {
             active: AtomicUsize::new(0),
             begun: AtomicU64::new(0),
             idle_since_nanos: AtomicU64::new(0),
+            responses: std::sync::Mutex::new(Vec::new()),
+        }
+    }
+
+    /// Nanoseconds from `started` to `at`.
+    fn nanos_at(&self, at: tokio::time::Instant) -> u64 {
+        u64::try_from(at.saturating_duration_since(self.started).as_nanos()).unwrap_or(u64::MAX)
+    }
+
+    /// Start watching a response body for progress; the body stamps the
+    /// returned clock each time it is polled.
+    fn watch_response(&self) -> Arc<AtomicU64> {
+        let clock = Arc::new(AtomicU64::new(self.nanos_at(tokio::time::Instant::now())));
+        if let Ok(mut responses) = self.responses.lock() {
+            // Sweep here as well as in the watcher, so a busy connection whose
+            // watcher rarely runs does not accumulate finished entries.
+            if responses.len() >= 64 {
+                responses.retain(|r| r.strong_count() > 0);
+            }
+            responses.push(Arc::downgrade(&clock));
+        }
+        clock
+    }
+
+    /// When a response body next could have stalled past `write_timeout`,
+    /// `Ok(None)` if none is being sent, or [`Stalled`] if one already has.
+    pub(crate) fn next_stall_deadline(
+        &self,
+        now: tokio::time::Instant,
+        write_timeout: Duration,
+    ) -> Result<Option<tokio::time::Instant>, Stalled> {
+        let Ok(mut responses) = self.responses.lock() else {
+            return Ok(None);
+        };
+        let mut oldest: Option<u64> = None;
+        responses.retain(|r| match r.upgrade() {
+            Some(clock) => {
+                let at = clock.load(Ordering::Acquire);
+                oldest = Some(oldest.map_or(at, |o| o.min(at)));
+                true
+            }
+            None => false,
+        });
+        let Some(oldest) = oldest else {
+            return Ok(None);
+        };
+        let expires = self.started + Duration::from_nanos(oldest) + write_timeout;
+        if expires <= now {
+            Err(Stalled)
+        } else {
+            Ok(Some(expires))
         }
     }
 
@@ -710,6 +787,100 @@ impl StreamTracker {
             self.started + Duration::from_nanos(self.idle_since_nanos.load(Ordering::Acquire));
         let expires = idle_since + idle_timeout;
         (expires > now).then_some(expires)
+    }
+}
+
+/// The largest piece of a response body handed to hyper at once. hyper polls
+/// the body for its next piece only once the previous one has been queued
+/// against the peer's flow-control window, so each poll is a sign of
+/// progress; one whole-body frame would show none until the very end.
+const RESPONSE_CHUNK: usize = 16 * 1024;
+
+/// A response body that keeps its stream counted as in flight until it has
+/// been sent (or the stream is gone), and reports its progress to the
+/// connection's watcher, which closes the connection when one stops making
+/// any for the write timeout.
+///
+/// A peer can stop a response dead without stalling the socket: advertise a
+/// zero (or never-replenished) stream window and the body waits on credit
+/// while every socket write succeeds, so the
+/// [`WriteDeadline`](crate::pipeline::WriteDeadline) never arms. Without this,
+/// such a stream was not even counted as in flight, so the connection could
+/// also go on serving cheap requests, resetting its idle clock, while up to
+/// `max_concurrent_streams` large responses sat pinned in memory.
+pub(crate) struct TrackedBody {
+    /// Bytes not yet handed to hyper.
+    pending: bytes::Bytes,
+    inner: http_body_util::Full<bytes::Bytes>,
+    /// Stamped on every poll; `None` without a write timeout.
+    progress: Option<Arc<AtomicU64>>,
+    tracker: Arc<StreamTracker>,
+    _active: ActiveStream,
+}
+
+impl TrackedBody {
+    fn new(
+        inner: http_body_util::Full<bytes::Bytes>,
+        active: ActiveStream,
+        tracker: &Arc<StreamTracker>,
+        write_timeout: Option<Duration>,
+    ) -> Self {
+        use hyper::body::Body as _;
+        // A body with nothing to send is never polled: hyper ends the stream
+        // with the headers.
+        let progress =
+            (write_timeout.is_some() && !inner.is_end_stream()).then(|| tracker.watch_response());
+        Self {
+            pending: bytes::Bytes::new(),
+            inner,
+            progress,
+            tracker: Arc::clone(tracker),
+            _active: active,
+        }
+    }
+}
+
+impl hyper::body::Body for TrackedBody {
+    type Data = bytes::Bytes;
+    type Error = std::convert::Infallible;
+
+    fn poll_frame(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Option<Result<hyper::body::Frame<Self::Data>, Self::Error>>> {
+        use std::task::Poll;
+        let this = &mut *self;
+        if let Some(progress) = &this.progress {
+            progress.store(
+                this.tracker.nanos_at(tokio::time::Instant::now()),
+                Ordering::Release,
+            );
+        }
+        if this.pending.is_empty() {
+            match std::pin::Pin::new(&mut this.inner).poll_frame(cx) {
+                Poll::Ready(Some(Ok(frame))) => match frame.into_data() {
+                    Ok(data) => this.pending = data,
+                    Err(frame) => return Poll::Ready(Some(Ok(frame))),
+                },
+                other => return other,
+            }
+        }
+        let n = this.pending.len().min(RESPONSE_CHUNK);
+        Poll::Ready(Some(Ok(hyper::body::Frame::data(this.pending.split_to(n)))))
+    }
+
+    fn is_end_stream(&self) -> bool {
+        self.pending.is_empty() && self.inner.is_end_stream()
+    }
+
+    fn size_hint(&self) -> hyper::body::SizeHint {
+        let mut hint = self.inner.size_hint();
+        let pending = self.pending.len() as u64;
+        hint.set_lower(hint.lower() + pending);
+        if let Some(upper) = hint.upper() {
+            hint.set_upper(upper + pending);
+        }
+        hint
     }
 }
 
@@ -876,10 +1047,20 @@ mod tests {
         Ok(HttpResponse::ok().with_body(b"slow".to_vec()))
     }
 
+    async fn big(_req: HttpRequest) -> Result<HttpResponse, Error> {
+        Ok(HttpResponse::ok().with_body(vec![b'x'; 1 << 20]))
+    }
+
+    async fn empty(_req: HttpRequest) -> Result<HttpResponse, Error> {
+        Ok(HttpResponse::new(204))
+    }
+
     fn state() -> ServeState {
         let mut router = Router::new();
         router.get("/hello", hello);
         router.get("/slow", slow);
+        router.get("/big", big);
+        router.get("/empty", empty);
         ServeState::for_test(
             Arc::new(OptimizedRouter::from_router(&router)),
             crate::DEFAULT_MAX_BODY_SIZE,
@@ -1026,6 +1207,125 @@ mod tests {
             .expect("an idle connection must be closed")
             .unwrap();
         assert!(ended - idle_from >= Duration::from_millis(250));
+    }
+
+    /// The finding: a peer that advertises a zero stream window stops a
+    /// response dead while every socket write succeeds, so the write deadline
+    /// never arms; and the stream stopped counting as in flight when its
+    /// handler returned, so a trickle of cheap requests kept the connection
+    /// "busy" while large responses sat pinned. The stalled body now holds
+    /// the stream in flight and, after the write timeout without progress,
+    /// gets the connection closed.
+    #[tokio::test]
+    async fn a_response_starved_of_flow_control_closes_the_connection() {
+        let limits = H2ConnectionLimits {
+            handshake_timeout: Duration::from_millis(500),
+            idle_timeout: Duration::from_millis(300),
+            shutdown_grace: Duration::from_millis(200),
+            write_timeout: Some(Duration::from_millis(400)),
+            body_budget: 1024,
+        };
+        let server = Http2Builder::new()
+            .connection_server(&crate::pipeline::PipelineConfig::default(), 1024)
+            .with_limits(limits);
+        let (client, done) = serve_one(server).await;
+        let mut builder =
+            hyper::client::conn::http2::Builder::new(hyper_util::rt::TokioExecutor::new());
+        builder.initial_stream_window_size(0).adaptive_window(false);
+        let (mut sender, conn) = builder
+            .handshake::<_, Empty<Bytes>>(hyper_util::rt::TokioIo::new(client))
+            .await
+            .expect("h2 handshake");
+        tokio::spawn(conn);
+
+        let request = hyper::Request::get("http://localhost/big")
+            .body(Empty::<Bytes>::new())
+            .unwrap();
+        // The head is not flow-controlled; the body never gets a byte of
+        // window.
+        let pinned = sender.send_request(request).await.expect("head served");
+        assert_eq!(pinned.status(), 200);
+
+        // Keep the connection looking busy with requests that need no window.
+        let trickle = tokio::spawn(async move {
+            loop {
+                let request = hyper::Request::get("http://localhost/empty")
+                    .body(Empty::<Bytes>::new())
+                    .unwrap();
+                if sender.send_request(request).await.is_err() {
+                    return;
+                }
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+        });
+
+        tokio::time::timeout(Duration::from_secs(3), done)
+            .await
+            .expect("a starved response must not hold the connection open")
+            .unwrap();
+        trickle.abort();
+        drop(pinned);
+    }
+
+    /// A slow reader that keeps granting window is not mistaken for a stalled
+    /// one: progress, not total time, is what the write timeout bounds.
+    #[tokio::test]
+    async fn a_slow_but_progressing_response_is_not_cut_off() {
+        let limits = H2ConnectionLimits {
+            handshake_timeout: Duration::from_millis(500),
+            idle_timeout: Duration::from_millis(300),
+            shutdown_grace: Duration::from_millis(200),
+            write_timeout: Some(Duration::from_millis(400)),
+            body_budget: 1024,
+        };
+        let server = Http2Builder::new()
+            .connection_server(&crate::pipeline::PipelineConfig::default(), 1024)
+            .with_limits(limits);
+        let (client, _done) = serve_one(server).await;
+        let (mut sender, conn) = hyper::client::conn::http2::handshake(
+            hyper_util::rt::TokioExecutor::new(),
+            hyper_util::rt::TokioIo::new(client),
+        )
+        .await
+        .expect("h2 handshake");
+        tokio::spawn(conn);
+
+        let request = hyper::Request::get("http://localhost/big")
+            .body(Empty::<Bytes>::new())
+            .unwrap();
+        let response = sender.send_request(request).await.expect("served");
+        let mut body = response.into_body();
+        let mut received = 0usize;
+        let started = Instant::now();
+        // Drain slowly: well past the write timeout in total, never stalled
+        // for anything like it.
+        while let Some(frame) = body.frame().await {
+            received += frame
+                .expect("not cut off")
+                .into_data()
+                .map_or(0, |d| d.len());
+            if started.elapsed() < Duration::from_millis(900) {
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+        }
+        assert_eq!(received, 1 << 20);
+        assert!(started.elapsed() >= Duration::from_millis(400));
+    }
+
+    #[tokio::test]
+    async fn the_tracker_reports_a_stalled_response() {
+        let tracker = Arc::new(StreamTracker::new());
+        let limit = Duration::from_millis(100);
+        let now = tokio::time::Instant::now();
+        assert_eq!(tracker.next_stall_deadline(now, limit), Ok(None));
+        let clock = tracker.watch_response();
+        let expires = tracker
+            .next_stall_deadline(now, limit)
+            .unwrap()
+            .expect("one response pending");
+        assert_eq!(tracker.next_stall_deadline(expires, limit), Err(Stalled));
+        drop(clock);
+        assert_eq!(tracker.next_stall_deadline(expires, limit), Ok(None));
     }
 
     #[tokio::test]

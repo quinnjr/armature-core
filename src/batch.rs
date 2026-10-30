@@ -167,7 +167,9 @@ impl BatchConfigBuilder {
 // ============================================================================
 
 /// A parsed HTTP request from a batch (borrowed version)
-#[derive(Debug)]
+///
+/// `Debug` follows `HttpRequest`'s rules: path without query, sensitive
+/// header values redacted, body length only.
 pub struct ParsedRequest<'a> {
     /// HTTP method (GET, POST, etc.)
     pub method: &'a str,
@@ -184,7 +186,10 @@ pub struct ParsedRequest<'a> {
 }
 
 /// An owned parsed HTTP request (no lifetime dependencies)
-#[derive(Debug, Clone)]
+///
+/// `Debug` follows `HttpRequest`'s rules: path without query, sensitive
+/// header values redacted, body length only.
+#[derive(Clone)]
 pub struct OwnedParsedRequest {
     /// HTTP method (GET, POST, etc.)
     pub method: String,
@@ -198,6 +203,49 @@ pub struct OwnedParsedRequest {
     pub body: Bytes,
     /// Total bytes consumed for this request
     pub bytes_consumed: usize,
+}
+
+impl ParsedRequest<'_> {
+    /// `Debug` body shared with [`OwnedParsedRequest`], which borrows itself
+    /// into a `ParsedRequest` and renders under its own name.
+    fn fmt_as(&self, f: &mut std::fmt::Formatter<'_>, name: &str) -> std::fmt::Result {
+        f.debug_struct(name)
+            .field("method", &self.method)
+            .field("path", &crate::headers::path_without_query(self.path))
+            .field("has_query", &self.path.contains('?'))
+            .field("version", &self.version)
+            .field(
+                "headers",
+                &crate::headers::RedactedHeaders(self.headers.clone()),
+            )
+            .field("body_len", &self.body.len())
+            .field("bytes_consumed", &self.bytes_consumed)
+            .finish()
+    }
+}
+
+impl std::fmt::Debug for ParsedRequest<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.fmt_as(f, "ParsedRequest")
+    }
+}
+
+impl std::fmt::Debug for OwnedParsedRequest {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        ParsedRequest {
+            method: &self.method,
+            path: &self.path,
+            version: &self.version,
+            headers: self
+                .headers
+                .iter()
+                .map(|(n, v)| (n.as_str(), v.as_slice()))
+                .collect(),
+            body: &self.body,
+            bytes_consumed: self.bytes_consumed,
+        }
+        .fmt_as(f, "OwnedParsedRequest")
+    }
 }
 
 impl OwnedParsedRequest {
@@ -616,7 +664,9 @@ impl BatchStats {
 // ============================================================================
 
 /// A reusable buffer for batch reading from sockets
-#[derive(Debug)]
+///
+/// `Debug` shows positions and sizes, not the buffered bytes: those are raw
+/// requests, credentials and bodies included.
 pub struct BatchBuffer {
     /// The underlying buffer
     buffer: BytesMut,
@@ -626,6 +676,18 @@ pub struct BatchBuffer {
     read_pos: usize,
     /// Write position (end of valid data)
     write_pos: usize,
+}
+
+impl std::fmt::Debug for BatchBuffer {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("BatchBuffer")
+            .field("buffered", &(self.write_pos - self.read_pos))
+            .field("capacity", &self.buffer.capacity())
+            .field("config", &self.config)
+            .field("read_pos", &self.read_pos)
+            .field("write_pos", &self.write_pos)
+            .finish()
+    }
 }
 
 impl BatchBuffer {
@@ -1006,5 +1068,39 @@ mod tests {
             Some("application/json")
         );
         assert_eq!(http_req.body_ref(), b"{\"key\":\"val\"}");
+    }
+
+    #[test]
+    fn parsed_request_debug_follows_http_request_rules() {
+        let borrowed = ParsedRequest {
+            method: "POST",
+            path: "/login?code=q-secret",
+            version: "1.1",
+            headers: vec![("Cookie", b"sid=h-secret"), ("Accept", b"*/*")],
+            body: b"password=b-secret",
+            bytes_consumed: 0,
+        };
+        let owned = OwnedParsedRequest {
+            method: "POST".into(),
+            path: "/login?code=q-secret".into(),
+            version: "1.1".into(),
+            headers: vec![("Cookie".into(), b"sid=h-secret".to_vec())],
+            body: Bytes::from_static(b"password=b-secret"),
+            bytes_consumed: 0,
+        };
+        let mut buffer = BatchBuffer::new(BatchConfig::default());
+        let raw = b"GET /?k=raw-secret HTTP/1.1\r\n\r\n";
+        buffer.write_slice()[..raw.len()].copy_from_slice(raw);
+        buffer.advance_write(raw.len());
+        for out in [
+            format!("{borrowed:?}"),
+            format!("{owned:?}"),
+            format!("{buffer:?}"),
+        ] {
+            for secret in ["q-secret", "h-secret", "b-secret", "raw-secret"] {
+                assert!(!out.contains(secret), "{secret} leaked: {out}");
+            }
+        }
+        assert!(format!("{borrowed:?}").contains("*/*"));
     }
 }

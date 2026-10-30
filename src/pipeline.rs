@@ -812,7 +812,7 @@ impl PipelinedHttp1Builder {
     /// H1 builder.
     ///
     /// Every builder also carries a [`hyper::rt::Timer`] and the
-    /// [`HEADER_READ_TIMEOUT`] head deadline (see [`hardened_http1_builder`]).
+    /// [`HEADER_READ_TIMEOUT`] head deadline (see `hardened_http1_builder`).
     #[inline]
     pub fn configure_hyper_builder(&self) -> hyper::server::conn::http1::Builder {
         let mut builder = hardened_http1_builder();

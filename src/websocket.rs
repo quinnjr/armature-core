@@ -307,8 +307,9 @@ pub fn is_origin_allowed(req: &crate::HttpRequest, allowed_origins: &[&str]) -> 
 #[derive(Debug, Clone, Default)]
 pub struct WebSocketOptions {
     /// Close the connection when no message (data, ping or pong) arrives from
-    /// the peer for this long. `None` (the default) waits forever, which lets
-    /// idle or half-open peers hold a connection and its task indefinitely.
+    /// the peer for this long. `None` (the `Default`) waits forever, which
+    /// lets idle or half-open peers hold a connection and its task
+    /// indefinitely; [`handle_websocket`] uses [`DEFAULT_WEBSOCKET_IDLE_TIMEOUT`].
     pub idle_timeout: Option<std::time::Duration>,
 }
 
@@ -320,14 +321,29 @@ impl WebSocketOptions {
     }
 }
 
+/// How long [`handle_websocket`] waits for any message (data, ping or pong)
+/// before closing the connection as idle.
+///
+/// Long enough for any client that sends application- or protocol-level
+/// keep-alives (browsers' and most libraries' are well under a minute), short
+/// enough that a half-open or deliberately silent peer cannot hold a
+/// connection and its task forever.
+pub const DEFAULT_WEBSOCKET_IDLE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(300);
+
+/// How long the closing handshake may take before the connection is simply
+/// dropped. `close` flushes the Close frame and waits for the peer's reply, so
+/// a peer that stops reading would otherwise hold the task in teardown.
+const CLOSE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
 /// Handle a WebSocket connection
 ///
-/// Waits indefinitely for the peer; see [`handle_websocket_with_options`] to
-/// close idle connections.
+/// Closes the connection after [`DEFAULT_WEBSOCKET_IDLE_TIMEOUT`] without a message
+/// from the peer; see [`handle_websocket_with_options`] to choose another
+/// timeout (or none).
 ///
 /// `connection_id` is not fed into `armature_core::connection_manager` —
 /// that module tracks connections under its own internally generated
-/// [`connection_manager::ConnectionId`] (`u64`) for buffer/keep-alive
+/// [`ConnectionId`](crate::connection_manager::ConnectionId) (`u64`) for buffer/keep-alive
 /// tuning, and is itself not wired into any built-in server (see its
 /// module docs). There is no registry keyed by an externally supplied
 /// `String` id for this module to join. Instead, `connection_id` is
@@ -349,9 +365,13 @@ where
     // a guard held across an `.await` stays on the thread while this task is
     // suspended, so every other task scheduled onto that thread would be
     // logged under this connection_id.
-    handle_connection(stream, WebSocketOptions::default(), handler)
-        .instrument(span)
-        .await
+    handle_connection(
+        stream,
+        WebSocketOptions::default().idle_timeout(DEFAULT_WEBSOCKET_IDLE_TIMEOUT),
+        handler,
+    )
+    .instrument(span)
+    .await
 }
 
 /// [`handle_websocket`] with [`WebSocketOptions`] (e.g. an idle timeout).
@@ -393,7 +413,7 @@ where
                 Err(_) => {
                     tracing::debug!("WebSocket idle timeout; closing");
                     let teardown = handler(WebSocketMessage::Close).await;
-                    let _ = stream.close(None).await;
+                    let _ = tokio::time::timeout(CLOSE_TIMEOUT, stream.close(None)).await;
                     return teardown;
                 }
             },
@@ -411,16 +431,16 @@ where
                     // clean close. A failure means the peer is already gone,
                     // which is exactly the state we are heading for anyway.
                     let teardown = handler(WebSocketMessage::Close).await;
-                    let _ = stream.close(None).await;
+                    let _ = tokio::time::timeout(CLOSE_TIMEOUT, stream.close(None)).await;
                     if let Err(e) = teardown {
-                        tracing::error!(error = %e, "WebSocket handler error");
+                        tracing::error!(error = %e.log_display(), "WebSocket handler error");
                         return Err(e);
                     }
                     return Ok(());
                 }
                 let ws_msg: WebSocketMessage = msg.into();
                 if let Err(e) = handler(ws_msg).await {
-                    tracing::error!(error = %e, "WebSocket handler error");
+                    tracing::error!(error = %e.log_display(), "WebSocket handler error");
                     return Err(e);
                 }
             }

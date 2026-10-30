@@ -509,8 +509,19 @@ impl HealthIndicator for DiskHealthIndicator {
         let start = Instant::now();
 
         // Get disk info (platform-specific implementation)
+        // `statvfs` is a blocking syscall that can hang for as long as the
+        // filesystem does (a stale NFS mount), so it runs on the blocking pool
+        // rather than stalling an executor thread — and every request queued
+        // behind it — for the duration. The indicator's timeout still bounds
+        // how long the check itself waits.
         #[cfg(unix)]
-        let disk_info = get_unix_disk_info(&self.path);
+        let disk_info = {
+            let path = self.path.clone();
+            tokio::task::spawn_blocking(move || get_unix_disk_info(&path))
+                .await
+                .ok()
+                .flatten()
+        };
 
         #[cfg(not(unix))]
         let disk_info: Option<(u64, u64)> = None;
@@ -779,6 +790,20 @@ impl HealthService {
         response
     }
 
+    /// [`check_liveness`](Self::check_liveness) reduced to its overall status,
+    /// for a probe endpoint served without authentication. See
+    /// [`HealthResponse::summary_only`].
+    pub async fn check_liveness_summary(&self) -> HealthResponse {
+        self.check_liveness().await.summary_only()
+    }
+
+    /// [`check_readiness`](Self::check_readiness) reduced to its overall
+    /// status, for a probe endpoint served without authentication. See
+    /// [`HealthResponse::summary_only`].
+    pub async fn check_readiness_summary(&self) -> HealthResponse {
+        self.check_readiness().await.summary_only()
+    }
+
     /// Returns the number of registered indicators
     pub async fn indicator_count(&self) -> usize {
         self.indicators.read().await.len()
@@ -945,6 +970,20 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(live.components["hangs"].status, HealthStatus::Down);
+    }
+
+    #[tokio::test]
+    async fn test_probe_summaries_hide_details() {
+        let service = HealthService::new();
+        service.register(UptimeHealthIndicator::new()).await;
+        for summary in [
+            service.check_liveness_summary().await,
+            service.check_readiness_summary().await,
+        ] {
+            assert!(summary.components.is_empty());
+            assert!(summary.info.is_none());
+            assert_eq!(summary.status, HealthStatus::Up);
+        }
     }
 
     #[tokio::test]

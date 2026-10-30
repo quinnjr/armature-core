@@ -300,7 +300,7 @@ impl Middleware for LoggerMiddleware {
                 error!(
                     method = %method,
                     path = %path,
-                    error = %e,
+                    error = %e.log_display(),
                     duration_ms = duration.as_millis(),
                     "request failed"
                 );
@@ -466,14 +466,23 @@ type CompressionSkip = Arc<dyn Fn(&HttpResponse) -> bool + Send + Sync>;
 
 /// The default BREACH heuristic: skip responses that carry a cookie or are
 /// marked non-shareable, which is where per-user secrets live.
+///
+/// Cookies count wherever they are: `HttpResponse::cookie`/`set_cookie`/
+/// `cookie_raw` put them in `response.cookies`, not in `headers`, and that is
+/// the usual way a session cookie gets set. A directive is matched on its
+/// name alone, so `private="Set-Cookie"` and `no-store=...` count too. Same
+/// rule as the micro server's compression path.
 pub fn is_likely_secret_bearing(response: &HttpResponse) -> bool {
+    if !response.cookies.is_empty() {
+        return true;
+    }
     response.headers.iter().any(|(name, value)| {
         if name.eq_ignore_ascii_case("set-cookie") {
             return true;
         }
         name.eq_ignore_ascii_case("cache-control")
             && value.split(',').any(|directive| {
-                let d = directive.trim();
+                let d = directive.split('=').next().unwrap_or("").trim();
                 d.eq_ignore_ascii_case("no-store") || d.eq_ignore_ascii_case("private")
             })
     })
@@ -602,12 +611,27 @@ impl LoggingMiddleware {
     }
 }
 
+/// How far past the preview limit a body is scanned for secrets before the
+/// preview is cut. Generous so a secret straddling the limit is still
+/// recognized whole, but bounded so logging a huge body doesn't mean
+/// regex-scanning all of it.
+const BODY_REDACTION_SLACK: usize = 64 * 1024;
+
 /// A truncated, redacted, lossily-decoded view of `body` for logging.
+///
+/// Redacts first, then truncates. Truncating first cut a secret in half at
+/// the limit — `"password":"hunt` — and the redaction patterns, which need
+/// the whole token or its closing quote, then let the visible prefix through.
 fn body_log_preview(body: &[u8], max: usize) -> String {
-    let shown = String::from_utf8_lossy(&body[..body.len().min(max)]);
-    let redacted = crate::error_transform::redact_sensitive(&shown);
-    if body.len() > max {
-        format!("{redacted}... ({} bytes)", body.len())
+    let window = &body[..body.len().min(max.saturating_add(BODY_REDACTION_SLACK))];
+    let redacted = crate::error_transform::redact_sensitive(&String::from_utf8_lossy(window));
+    if body.len() > max || redacted.len() > max {
+        // Cut on a char boundary at or below `max`.
+        let mut end = max.min(redacted.len());
+        while !redacted.is_char_boundary(end) {
+            end -= 1;
+        }
+        format!("{}... ({} bytes)", &redacted[..end], body.len())
     } else {
         redacted
     }
@@ -680,7 +704,7 @@ impl Middleware for LoggingMiddleware {
                     method = %method,
                     path = %path,
                     duration_ms = duration.as_millis(),
-                    error = %err,
+                    error = %err.log_display(),
                     "HTTP request failed"
                 );
             }
@@ -789,6 +813,51 @@ mod tests {
 
         let out = body_log_preview(&[b'a'; 10], 4);
         assert_eq!(out, "aaaa... (10 bytes)");
+
+        // A secret cut by the preview limit is still redacted: the whole
+        // member is seen (and filtered) before the cut.
+        let body = br#"{"password":"hunter2-is-long"}"#;
+        let out = body_log_preview(body, 18);
+        assert!(!out.contains("hun"), "{out}");
+        assert!(
+            out.ends_with(&format!("... ({} bytes)", body.len())),
+            "{out}"
+        );
+
+        // Multi-byte text is cut on a char boundary, not mid-codepoint.
+        let out = body_log_preview("ééé".as_bytes(), 3);
+        assert_eq!(out, "é... (6 bytes)");
+    }
+
+    /// The BREACH heuristic sees cookies set through the cookie API (which
+    /// live in `response.cookies`, not `headers`) and directives that carry
+    /// an argument.
+    #[test]
+    fn breach_heuristic_sees_cookie_api_and_directive_arguments() {
+        let r = HttpResponse::ok().cookie("sid", "abc");
+        assert!(
+            r.headers
+                .iter()
+                .all(|(n, _)| !n.eq_ignore_ascii_case("set-cookie"))
+        );
+        assert!(is_likely_secret_bearing(&r));
+
+        for cc in [
+            r#"private="Set-Cookie""#,
+            "no-store=1",
+            "max-age=0, PRIVATE",
+        ] {
+            let mut r = HttpResponse::ok();
+            r.headers
+                .insert("Cache-Control".to_string(), cc.to_string());
+            assert!(is_likely_secret_bearing(&r), "{cc}");
+        }
+        let mut r = HttpResponse::ok();
+        r.headers.insert(
+            "Cache-Control".to_string(),
+            "public, max-age=60".to_string(),
+        );
+        assert!(!is_likely_secret_bearing(&r));
     }
 
     /// H7: the legacy CORS middleware never pairs `*` with credentials.

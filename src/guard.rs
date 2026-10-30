@@ -69,6 +69,25 @@ fn is_verified(request: &HttpRequest) -> bool {
         || request.extensions.get::<RequestRoles>().is_some()
 }
 
+/// Whether the response to `request` may be specific to the caller, so a
+/// shared cache keyed only on the request line must not serve or store it
+/// freely.
+///
+/// True when the request carries any credential header
+/// ([`is_credential_header`](crate::headers::is_credential_header):
+/// `Authorization`, `Cookie`, `X-Api-Key`, `X-Auth-Token`, ...) **or** an
+/// authentication layer has already attached a verified identity. The latter
+/// matters because middleware may authenticate from something the header
+/// check can't see (mTLS, a header it then strips), and once it has, the
+/// handler answers *this* caller.
+pub(crate) fn is_credentialed_request(request: &HttpRequest) -> bool {
+    is_verified(request)
+        || request
+            .headers
+            .names()
+            .any(crate::headers::is_credential_header)
+}
+
 /// Authentication guard: admits only requests carrying a **verified**
 /// identity.
 ///

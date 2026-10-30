@@ -402,9 +402,9 @@ impl fmt::Display for CacheControl {
 pub struct CacheKey {
     /// HTTP method
     pub method: crate::Method,
-    /// Normalized request authority: the `Host` header lowercased, with a
-    /// default port (`:80`/`:443`) removed. `None` when the request has no
-    /// `Host` (HTTP/1.0, or a hand-built request).
+    /// Normalized request authority: the `Host` header trimmed and
+    /// lowercased, port kept. `None` when the request has no `Host`
+    /// (HTTP/1.0, or a hand-built request).
     ///
     /// Without it, two virtual hosts served by one application share every
     /// entry for a path, and a request whose `Host` names a site the
@@ -529,22 +529,23 @@ impl CacheKey {
     }
 }
 
-/// Normalize a `Host` value for the cache key: trimmed, lowercased (host
-/// names are case-insensitive), and without a default port, so `Example.com`,
-/// `example.com:80` and `example.com` are one site.
+/// Normalize a `Host` value for the cache key: trimmed and lowercased (host
+/// names are case-insensitive), so `Example.com` and `example.com` are one
+/// site.
 ///
-/// The request does not record its scheme, so both `:80` and `:443` are
-/// treated as default. That can only merge `http://h:443` with `http://h`,
-/// i.e. the same host named two ways, never two different hosts.
+/// The port is kept. Which port is the default depends on the scheme, and the
+/// request does not record its scheme; stripping both `:80` and `:443` merged
+/// `http://h:443` (a different origin, possibly a different server behind the
+/// same proxy) with `http://h`, letting a request to one poison the other.
+/// Keeping it costs at most a duplicate entry for `h` vs `h:80`.
 pub(crate) fn normalize_authority(host: &str) -> String {
-    let host = host.trim().to_ascii_lowercase();
-    match host
-        .strip_suffix(":80")
-        .or_else(|| host.strip_suffix(":443"))
-    {
-        Some(stripped) => stripped.to_string(),
-        None => host,
-    }
+    host.trim().to_ascii_lowercase()
+}
+
+/// Whether a response's `Cache-Control` states it is fit for a shared cache
+/// regardless of who asked: `public`, or a shared-cache lifetime (`s-maxage`).
+fn is_explicitly_shared(cc: &CacheControl) -> bool {
+    cc.is_public() || cc.get_s_maxage().is_some()
 }
 
 /// Whether the request carries more than one `Host` line. Which one the
@@ -600,6 +601,10 @@ pub struct CachedResponse {
     /// insert. `0` for entries created outside the cache, which never enter the
     /// eviction index.
     pub(crate) eviction_seq: u64,
+    /// Whether the response explicitly declared itself fit for a shared cache
+    /// (`Cache-Control: public` or `s-maxage`). Only such entries are served
+    /// to credentialed requests (see [`ResponseCache::get_with_vary`]).
+    pub(crate) explicitly_shared: bool,
 }
 
 /// The actual cached response data.
@@ -647,6 +652,9 @@ impl CachedResponse {
             base_key: None,
             path: None,
             eviction_seq: 0,
+            explicitly_shared: response_header(response, "cache-control")
+                .map(|h| CacheControl::parse(h))
+                .is_some_and(|cc| is_explicitly_shared(&cc)),
         }
     }
 
@@ -1023,9 +1031,16 @@ impl ResponseCache {
         let key = CacheKey::from_request_with_vary(request, vary_headers);
         let key_str = key.to_string_key();
 
+        // A credentialed caller is answered by the handler unless the entry
+        // explicitly said it is the same for everyone. Otherwise an entry
+        // stored from an anonymous request (or a different caller's, had a
+        // rule upstream slipped) would stand in for this caller's own view.
+        let credentialed = crate::guard::is_credentialed_request(request);
+
         let entries = self.entries.read().await;
         if let Some(cached) = entries.get(&key_str)
             && cached.is_fresh()
+            && (!credentialed || cached.explicitly_shared)
         {
             return Some(cached.to_response());
         }
@@ -1070,8 +1085,9 @@ impl ResponseCache {
     /// Store a response with a specific TTL.
     ///
     /// The caller chooses the lifetime, but every other storage rule still
-    /// applies: `no-store`/`private`/`no-cache`, `Authorization`, `Cookie` and
-    /// `Set-Cookie` all prevent storage exactly as for [`store`](Self::store),
+    /// applies: `no-store`/`private`/`no-cache`, credentials (`Authorization`,
+    /// `Cookie`, `X-Api-Key`, ..., or a verified identity), and `Set-Cookie`
+    /// all prevent storage exactly as for [`store`](Self::store),
     /// and `Set-Cookie` is never kept in the stored headers.
     pub async fn store_with_ttl(
         &self,
@@ -1202,14 +1218,15 @@ impl ResponseCache {
         // `must-revalidate` entry would be replayed to other callers verbatim
         // while fresh. Only `public` and `s-maxage`, which state the response
         // is fit for a shared cache, are accepted.
-        let has_authorization = request.headers.contains("authorization");
-        if has_authorization {
-            let explicitly_allowed = cache_control
-                .as_ref()
-                .is_some_and(|cc| cc.is_public() || cc.get_s_maxage().is_some());
-            if !explicitly_allowed {
-                return false;
-            }
+        //
+        // The same rule covers every credential, not just `Authorization`: an
+        // `X-Api-Key`, `X-Auth-Token` or session header identifies the caller
+        // as surely, and so does a `VerifiedIdentity`/`RequestRoles` an auth
+        // middleware attached (see `is_credentialed_request`).
+        if crate::guard::is_credentialed_request(request)
+            && !cache_control.as_ref().is_some_and(is_explicitly_shared)
+        {
+            return false;
         }
 
         // Cookie-authenticated requests, and responses that set a cookie, are
@@ -2369,13 +2386,90 @@ mod tests {
         b.headers.insert("Host", "b.example".to_string());
         assert!(cache.get(&b).await.is_none(), "Host must be in the key");
 
-        // Case and the default port do not make a different authority.
+        // Case does not make a different authority.
         let mut a_again = HttpRequest::new("GET", "/".to_string());
-        a_again.headers.insert("Host", "A.Example:80".to_string());
+        a_again.headers.insert("Host", " A.Example ".to_string());
         assert_eq!(
             cache.get(&a_again).await.map(|r| r.body),
             Some(Bytes::from_static(b"site a"))
         );
+
+        // A port does: the scheme isn't known, so `:443`/`:80` can't be
+        // assumed default, and `http://a.example:443` is another origin.
+        for host in ["a.example:443", "a.example:80"] {
+            let mut ported = HttpRequest::new("GET", "/".to_string());
+            ported.headers.insert("Host", host.to_string());
+            assert!(cache.get(&ported).await.is_none(), "{host}");
+        }
+    }
+
+    /// Every credential header, and a verified identity attached by
+    /// middleware, gets the `Authorization` treatment: stored only when the
+    /// response is explicitly shareable, and never served a non-shareable
+    /// entry.
+    #[tokio::test]
+    async fn test_all_credentials_treated_like_authorization() {
+        let credentialed: Vec<fn() -> HttpRequest> = vec![
+            || {
+                let mut r = HttpRequest::new("GET", "/api/me".to_string());
+                r.headers.insert("X-Api-Key", "k".to_string());
+                r
+            },
+            || {
+                let mut r = HttpRequest::new("GET", "/api/me".to_string());
+                r.headers.insert("X-Auth-Token", "t".to_string());
+                r
+            },
+            || {
+                let mut r = HttpRequest::new("GET", "/api/me".to_string());
+                r.extensions.insert(crate::VerifiedIdentity::new("alice"));
+                r
+            },
+            || {
+                let mut r = HttpRequest::new("GET", "/api/me".to_string());
+                r.extensions.insert(crate::RequestRoles::new(["admin"]));
+                r
+            },
+        ];
+        // Fresh, but not declared shareable.
+        let unshared = || {
+            HttpResponse::ok()
+                .with_cache_control(CacheControl::new().max_age(Duration::from_secs(60)))
+        };
+        for make in credentialed {
+            // Not stored without explicit permission.
+            let cache = ResponseCache::new();
+            cache.store(&make(), &unshared()).await;
+            assert_eq!(cache.stats().await.total_entries, 0, "{:?}", make());
+
+            // Not served an entry an anonymous request stored without it.
+            let anon = HttpRequest::new("GET", "/api/me".to_string());
+            cache.store(&anon, &unshared()).await;
+            assert!(cache.get(&anon).await.is_some());
+            assert!(cache.get(&make()).await.is_none(), "{:?}", make());
+
+            // `public` / `s-maxage` entries are fit for everyone.
+            let cache = ResponseCache::new();
+            cache
+                .store(
+                    &make(),
+                    &HttpResponse::ok().cache_public(Duration::from_secs(60)),
+                )
+                .await;
+            assert!(cache.get(&make()).await.is_some());
+            let cache = ResponseCache::new();
+            let shared = HttpResponse::ok()
+                .with_cache_control(CacheControl::new().s_maxage(Duration::from_secs(60)));
+            cache.store(&make(), &shared).await;
+            assert!(cache.get(&make()).await.is_some());
+        }
+
+        // An anti-CSRF token alone is not a credential.
+        let cache = ResponseCache::new();
+        let mut csrf = HttpRequest::new("GET", "/form".to_string());
+        csrf.headers.insert("X-CSRF-Token", "c".to_string());
+        cache.store(&csrf, &fresh()).await;
+        assert!(cache.get(&csrf).await.is_some());
     }
 
     /// A request carrying two `Host` lines is ambiguous about which site it
@@ -2412,5 +2506,16 @@ mod tests {
         response.status = 206;
         cache.store(&request, &response).await;
         assert!(cache.get(&request).await.is_none());
+    }
+
+    /// The key must tell apart queries the handler's `Query<T>` reads
+    /// differently: an extra empty-key pair, and `%FF` vs a literal `%FF`.
+    #[test]
+    fn cache_key_distinguishes_empty_keys_and_invalid_utf8() {
+        let key = |p: &str| {
+            CacheKey::from_request(&HttpRequest::new("GET", p.to_string())).to_string_key()
+        };
+        assert_ne!(key("/s?q=1&=x"), key("/s?q=1"));
+        assert_ne!(key("/s?q=%FF"), key("/s?q=%25FF"));
     }
 }

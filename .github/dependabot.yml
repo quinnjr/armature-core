@@ -20,6 +20,22 @@ updates:
         update-types:
           - "patch"
 
+  # The fuzz harnesses are a separate workspace with their own lockfile.
+  - package-ecosystem: "cargo"
+    directory: "/fuzz"
+    schedule:
+      interval: "weekly"
+      day: "monday"
+    open-pull-requests-limit: 5
+    commit-message:
+      prefix: "deps(fuzz)"
+    labels:
+      - "dependencies"
+    groups:
+      fuzz:
+        patterns:
+          - "*"
+
   # Keeps the SHA-pinned actions in .github/workflows current.
   - package-ecosystem: "github-actions"
     directory: "/"

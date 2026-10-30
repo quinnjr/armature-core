@@ -1222,7 +1222,7 @@ impl ErrorTransformer {
                         status = response.status,
                         path = %ctx.request.path_only(),
                         request_id = ctx.request_id,
-                        error = %error,
+                        error = %error.log_display(),
                         "Server error occurred"
                     );
                 } else {

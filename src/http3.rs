@@ -480,7 +480,7 @@ mod server {
     use http_body_util::BodyExt;
     use std::sync::Arc;
     use std::task::Poll;
-    use tracing::{debug, error, info};
+    use tracing::{debug, info};
 
     /// HTTP/3 Server
     ///
@@ -494,6 +494,9 @@ mod server {
         state: ServeState,
         /// Connections served at once; see [`Http3Server::listen`].
         max_connections: usize,
+        /// How long one response write may stall; see
+        /// [`with_write_timeout`](Self::with_write_timeout).
+        write_timeout: Option<Duration>,
     }
 
     impl Http3Server {
@@ -510,6 +513,7 @@ mod server {
                 stats: Arc::new(Http3Stats::new()),
                 state,
                 max_connections: crate::pipeline::DEFAULT_MAX_CONNECTIONS,
+                write_timeout: crate::pipeline::PipelineConfig::default().write_timeout,
             }
         }
 
@@ -529,7 +533,23 @@ mod server {
                 stats: Arc::new(Http3Stats::new()),
                 state,
                 max_connections: max_connections.max(1),
+                write_timeout: crate::pipeline::PipelineConfig::default().write_timeout,
             }
+        }
+
+        /// Bound how long one response write may stall, as
+        /// [`PipelineConfig::write_timeout`](crate::pipeline::PipelineConfig::write_timeout)
+        /// does for the TCP transports.
+        ///
+        /// QUIC has no socket to put a write deadline on: a response waits on
+        /// the peer's flow-control credit (`MAX_STREAM_DATA`), and a peer that
+        /// never grants any while answering PINGs would otherwise hold the
+        /// stream, its connection and a connection slot forever. Each chunk of
+        /// the response must be accepted within this; past it the stream is
+        /// reset. `None` disables the bound.
+        pub(crate) fn with_write_timeout(mut self, write_timeout: Option<Duration>) -> Self {
+            self.write_timeout = write_timeout;
+            self
         }
 
         /// Get statistics
@@ -550,11 +570,10 @@ mod server {
             tls.alpn_protocols = h3_alpn(&tls_config);
             // 0-RTT (early data) is enabled by advertising a non-zero
             // `max_early_data_size`; QUIC requires exactly `u32::MAX` when
-            // enabled. Off, it is left at rustls' default of zero and clients
-            // never send early data at all.
-            if self.config.enable_0rtt {
-                tls.max_early_data_size = u32::MAX;
-            }
+            // enabled. Off, it is set to zero explicitly rather than inherited:
+            // the config is the caller's, and one built for TLS-over-TCP early
+            // data must not silently turn on replayable 0-RTT over QUIC.
+            tls.max_early_data_size = if self.config.enable_0rtt { u32::MAX } else { 0 };
             let crypto = quinn::crypto::rustls::QuicServerConfig::try_from(Arc::new(tls))
                 .map_err(|e| Error::Internal(format!("Failed to create QUIC crypto: {}", e)))?;
 
@@ -603,9 +622,30 @@ mod server {
                 enable_0rtt: self.config.enable_0rtt,
                 idle_timeout: self.config.max_idle_timeout,
                 max_field_section_size: self.config.max_field_section_size,
+                write_timeout: self.write_timeout,
             };
 
             while let Some(incoming) = endpoint.accept().await {
+                // Validate the client's address before it costs anything. An
+                // Initial packet's source address is trivially spoofed, and
+                // each one accepted took a connection slot for as long as the
+                // handshake could take — a stream of forged Initials filled the
+                // cap without the sender ever receiving a byte. A Retry is
+                // stateless: only a client that can receive at its address
+                // comes back, with a token that validates it.
+                //
+                // Always on, at the cost of one round trip on a client's first
+                // connection: quinn hands out NEW_TOKEN tokens on every
+                // connection, and a returning client that presents one is
+                // already validated and skips the Retry — which is also the
+                // only client that can have a 0-RTT ticket, so early data
+                // keeps its zero-round-trip path.
+                if !incoming.remote_address_validated() && incoming.may_retry() {
+                    if let Err(e) = incoming.retry() {
+                        e.into_incoming().refuse();
+                    }
+                    continue;
+                }
                 let Ok(permit) = Arc::clone(&limit).try_acquire_owned() else {
                     debug!(
                         client = %incoming.remote_address(),
@@ -620,7 +660,8 @@ mod server {
                 tokio::spawn(async move {
                     let _permit = permit;
                     if let Err(e) = handle_connection(incoming, state, stats, options).await {
-                        error!(error = %e, "HTTP/3 connection error");
+                        // Handshake failures and timeouts are the peer's doing.
+                        debug!(error = %e, "HTTP/3 connection error");
                     }
                 });
             }
@@ -643,7 +684,24 @@ mod server {
         enable_0rtt: bool,
         idle_timeout: std::time::Duration,
         max_field_section_size: u64,
+        write_timeout: Option<Duration>,
     }
+
+    impl ConnectionOptions {
+        /// How long a handshake, or a request's HEADERS, may take to complete:
+        /// the head deadline every TCP transport uses, or the idle timeout if
+        /// that is shorter.
+        fn handshake_timeout(&self) -> Duration {
+            crate::pipeline::HEADER_READ_TIMEOUT.min(self.idle_timeout)
+        }
+    }
+
+    /// The largest piece of a response body written under one
+    /// [`ConnectionOptions::write_timeout`]: the deadline bounds a *stall*, as
+    /// [`WriteDeadline`](crate::pipeline::WriteDeadline) does on TCP, not the
+    /// whole transfer, so a large body to a slow but live client is not cut
+    /// off.
+    const RESPONSE_CHUNK: usize = 64 * 1024;
 
     /// Build the quinn transport config from an [`Http3Config`], applying every
     /// advertised knob (stream/connection flow-control windows, concurrency
@@ -697,6 +755,18 @@ mod server {
         // the keys, so what it sends cannot be a replay of someone else's
         // packets. Requests that arrive before then are early data.
         let confirmed = Arc::new(AtomicBool::new(false));
+        // The handshake holds a connection slot, so it runs under the head
+        // deadline rather than QUIC's idle timeout alone: a peer that keeps
+        // retransmitting a stalled handshake would otherwise reset that timer
+        // indefinitely.
+        let handshake_timeout = options.handshake_timeout();
+        let handshake = |connecting: quinn::Connecting| async move {
+            match tokio::time::timeout(handshake_timeout, connecting).await {
+                Ok(Ok(conn)) => Ok(conn),
+                Ok(Err(e)) => Err(Error::Internal(format!("Connection failed: {}", e))),
+                Err(_) => Err(Error::Internal("QUIC handshake timed out".to_string())),
+            }
+        };
         let conn = if options.enable_0rtt {
             // `into_0rtt` always succeeds on the server, and its future
             // resolves when the handshake completes — `true` when the client's
@@ -705,19 +775,32 @@ mod server {
                 Ok((conn, zero_rtt_accepted)) => {
                     let stats_0rtt = Arc::clone(&stats);
                     let confirmed = Arc::clone(&confirmed);
+                    let watched = conn.clone();
                     tokio::spawn(async move {
-                        let accepted = zero_rtt_accepted.await;
-                        confirmed.store(true, Ordering::Release);
-                        if accepted {
-                            stats_0rtt.zero_rtt_accepted();
+                        match tokio::time::timeout(handshake_timeout, zero_rtt_accepted).await {
+                            // The future also resolves (`false`) when the
+                            // connection is lost mid-handshake. Only a
+                            // connection that is still open has actually
+                            // confirmed it; anything else must keep being
+                            // treated as early data.
+                            Ok(accepted) if watched.close_reason().is_none() => {
+                                confirmed.store(true, Ordering::Release);
+                                if accepted {
+                                    stats_0rtt.zero_rtt_accepted();
+                                }
+                            }
+                            Ok(_) => {}
+                            // Early data is being served on a connection
+                            // whose handshake never finishes: end it.
+                            Err(_) => {
+                                watched.close(quinn::VarInt::from_u32(0x100), b"handshake timeout")
+                            }
                         }
                     });
                     conn
                 }
                 Err(connecting) => {
-                    let conn = connecting
-                        .await
-                        .map_err(|e| Error::Internal(format!("Connection failed: {}", e)))?;
+                    let conn = handshake(connecting).await?;
                     confirmed.store(true, Ordering::Release);
                     conn
                 }
@@ -725,9 +808,7 @@ mod server {
         } else {
             // No early data: wait for the full handshake before serving a
             // byte, so nothing below ever runs on an unconfirmed connection.
-            let conn = connecting
-                .await
-                .map_err(|e| Error::Internal(format!("Connection failed: {}", e)))?;
+            let conn = handshake(connecting).await?;
             confirmed.store(true, Ordering::Release);
             conn
         };
@@ -735,11 +816,10 @@ mod server {
         stats.connection_opened();
         let remote_addr = conn.remote_address();
         debug!(client = %remote_addr, "HTTP/3 connection established");
-        // Known here and nowhere downstream: QUIC gives the address on the
-        // connection, and a stream has no notion of one. The body budget is
-        // per connection for the same reason HTTP/2's is: up to
-        // `max_concurrent_bidi_streams` bodies may be buffering at once.
-        let state = state.for_peer(remote_addr).with_default_body_budget();
+        // The body budget is per connection for the same reason HTTP/2's is:
+        // up to `max_concurrent_bidi_streams` bodies may be buffering at once.
+        // The peer is filled in per request, below.
+        let state = state.with_default_body_budget();
 
         // QUIC's own idle timeout only fires when *no packets* flow, so a
         // client that keeps pinging holds a connection with zero streams
@@ -753,8 +833,7 @@ mod server {
             tokio::spawn(async move {
                 // The first request is due within the head deadline every TCP
                 // transport uses, or the idle timeout if that is shorter.
-                let mut deadline = tracker.started
-                    + crate::pipeline::HEADER_READ_TIMEOUT.min(options.idle_timeout);
+                let mut deadline = tracker.started + options.handshake_timeout();
                 loop {
                     tokio::select! {
                         _ = conn.closed() => return,
@@ -778,6 +857,7 @@ mod server {
 
         // Create HTTP/3 connection. `h3`'s default field-section limit is
         // unbounded; see `Http3Config::max_field_section_size`.
+        let quic_conn = conn.clone();
         let mut h3_conn = h3::server::builder()
             .max_field_section_size(options.max_field_section_size)
             .build(h3_quinn::Connection::new(conn))
@@ -788,18 +868,26 @@ mod server {
         loop {
             match h3_conn.accept().await {
                 Ok(Some(resolver)) => {
-                    stats.stream_created();
-                    let active = tracker.begin();
-                    let state = state.clone();
+                    let _stream = OpenStream::new(Arc::clone(&stats));
+                    // The address now, not at the handshake: QUIC connections
+                    // migrate, and a request must be attributed to where it
+                    // actually came from.
+                    let state = state.for_peer(quic_conn.remote_address());
                     let stats = Arc::clone(&stats);
                     let confirmed = Arc::clone(&confirmed);
+                    let tracker = Arc::clone(&tracker);
 
                     tokio::spawn(async move {
-                        let _active = active;
-                        if let Err(e) =
-                            handle_request_resolver(resolver, state, stats, &confirmed).await
+                        let _stream = _stream;
+                        if let Err(e) = handle_request_resolver(
+                            resolver, state, stats, &confirmed, &tracker, options,
+                        )
+                        .await
                         {
-                            error!(error = %e, "HTTP/3 request error");
+                            // A stream the peer reset, abandoned or starved
+                            // is not a server fault, and a peer can produce
+                            // these at will: keep them out of error logs.
+                            debug!(error = %e, "HTTP/3 request error");
                         }
                     });
                 }
@@ -808,7 +896,7 @@ mod server {
                     break;
                 }
                 Err(e) => {
-                    error!(error = %e, "HTTP/3 accept error");
+                    debug!(error = %e, "HTTP/3 accept error");
                     break;
                 }
             }
@@ -925,18 +1013,53 @@ mod server {
         buf.copy_to_bytes(remaining)
     }
 
+    /// One open request stream in [`Http3Stats`], closed when dropped — so the
+    /// gauge comes back down however the stream ends (an error, a reset, a
+    /// timeout), not only when its response was sent in full.
+    struct OpenStream(Arc<Http3Stats>);
+
+    impl OpenStream {
+        fn new(stats: Arc<Http3Stats>) -> Self {
+            stats.stream_created();
+            Self(stats)
+        }
+    }
+
+    impl Drop for OpenStream {
+        fn drop(&mut self) {
+            self.0.stream_closed();
+        }
+    }
+
     /// Handle a request using the RequestResolver API (h3 0.0.8+)
     async fn handle_request_resolver(
         resolver: h3::server::RequestResolver<h3_quinn::Connection, Bytes>,
         state: ServeState,
         stats: Arc<Http3Stats>,
         confirmed: &AtomicBool,
+        tracker: &Arc<crate::http2::StreamTracker>,
+        options: ConnectionOptions,
     ) -> Result<(), Error> {
-        // Resolve the request to get the request and stream
-        let (request, mut stream) = resolver
-            .resolve_request()
-            .await
-            .map_err(|e| Error::Internal(format!("Failed to resolve request: {}", e)))?;
+        // h3 hands over a stream as soon as the peer opens it, before any
+        // HEADERS arrive. Waiting for them is bounded, and the stream does not
+        // count as a request in flight until they have arrived: otherwise a
+        // peer that opens a stream, sends nothing and keeps the connection
+        // alive with PINGs would hold the connection (whose idle watcher sees
+        // a request in flight) and its connection slot forever. On expiry the
+        // stream is dropped, which stops both its directions.
+        let (request, mut stream) =
+            match tokio::time::timeout(options.handshake_timeout(), resolver.resolve_request())
+                .await
+            {
+                Ok(resolved) => resolved
+                    .map_err(|e| Error::Internal(format!("Failed to resolve request: {}", e)))?,
+                Err(_) => {
+                    return Err(Error::Internal(
+                        "request HEADERS not received in time".to_string(),
+                    ));
+                }
+            };
+        let _active = tracker.begin();
 
         stats.request_processed();
 
@@ -989,28 +1112,48 @@ mod server {
         };
         let http_response: http::Response<()> = Response::from_parts(parts, ());
 
-        // Send response
-        stream
-            .send_response(http_response)
-            .await
-            .map_err(|e| Error::Internal(format!("Failed to send response: {}", e)))?;
+        // Every write waits on the peer's flow-control credit, so each is
+        // bounded: see `Http3Server::with_write_timeout`.
+        let sent = send_response(&mut stream, http_response, body, options.write_timeout).await;
+        if sent.is_err() {
+            // Abandon the stream outright rather than leave a half-sent
+            // response queued against credit that may never come.
+            stream.stop_stream(h3::error::Code::H3_REQUEST_CANCELLED);
+        }
+        sent
+    }
 
-        if !body.is_empty() {
-            stream
-                .send_data(body)
-                .await
-                .map_err(|e| Error::Internal(format!("Failed to send body: {}", e)))?;
+    /// Write a response head, its body in [`RESPONSE_CHUNK`] pieces, and the
+    /// end of the stream, each under `write_timeout`.
+    async fn send_response<S>(
+        stream: &mut h3::server::RequestStream<S, Bytes>,
+        head: http::Response<()>,
+        mut body: Bytes,
+        write_timeout: Option<Duration>,
+    ) -> Result<(), Error>
+    where
+        S: h3::quic::BidiStream<Bytes>,
+    {
+        async fn bounded<T, E: std::fmt::Display>(
+            write_timeout: Option<Duration>,
+            what: &str,
+            write: impl std::future::Future<Output = Result<T, E>>,
+        ) -> Result<T, Error> {
+            let written = match write_timeout {
+                Some(limit) => tokio::time::timeout(limit, write)
+                    .await
+                    .map_err(|_| Error::Internal(format!("{what} timed out")))?,
+                None => write.await,
+            };
+            written.map_err(|e| Error::Internal(format!("Failed to {what}: {e}")))
         }
 
-        // Finish stream
-        stream
-            .finish()
-            .await
-            .map_err(|e| Error::Internal(format!("Failed to finish stream: {}", e)))?;
-
-        stats.stream_closed();
-
-        Ok(())
+        bounded(write_timeout, "send response", stream.send_response(head)).await?;
+        while !body.is_empty() {
+            let chunk = body.split_to(body.len().min(RESPONSE_CHUNK));
+            bounded(write_timeout, "send body", stream.send_data(chunk)).await?;
+        }
+        bounded(write_timeout, "finish stream", stream.finish()).await
     }
 }
 
@@ -1414,23 +1557,41 @@ mod tests {
     /// Serve `config` for a router with `/hello` on an ephemeral UDP port.
     #[cfg(all(feature = "http3", feature = "self-signed-certs"))]
     fn spawn_h3(config: Http3Config, tls: &crate::TlsConfig, max_connections: usize) -> SocketAddr {
+        spawn_h3_with(config, tls, max_connections, Some(Duration::from_secs(300))).0
+    }
+
+    /// [`spawn_h3`] with a response write timeout; also serves `/big`, a 1 MiB
+    /// body.
+    #[cfg(all(feature = "http3", feature = "self-signed-certs"))]
+    fn spawn_h3_with(
+        config: Http3Config,
+        tls: &crate::TlsConfig,
+        max_connections: usize,
+        write_timeout: Option<Duration>,
+    ) -> (SocketAddr, std::sync::Arc<Http3Stats>) {
         async fn hello(req: crate::HttpRequest) -> Result<crate::HttpResponse, crate::Error> {
             let host = req.headers.get("host").unwrap_or_default().to_owned();
             Ok(crate::HttpResponse::ok().with_body(host.into_bytes()))
         }
+        async fn big(_req: crate::HttpRequest) -> Result<crate::HttpResponse, crate::Error> {
+            Ok(crate::HttpResponse::ok().with_body(vec![b'x'; 1 << 20]))
+        }
         let mut router = crate::Router::new();
         router.get("/hello", hello);
+        router.get("/big", big);
         let state = crate::application::ServeState::for_test(
             std::sync::Arc::new(crate::route_cache::OptimizedRouter::from_router(&router)),
             crate::DEFAULT_MAX_BODY_SIZE,
         );
-        let server = Http3Server::from_state(config, state, max_connections);
+        let server = Http3Server::from_state(config, state, max_connections)
+            .with_write_timeout(write_timeout);
+        let stats = server.stats();
         let quinn_config = server.configure_quinn(tls.server_config.clone()).unwrap();
         let endpoint =
             quinn::Endpoint::server(quinn_config, "127.0.0.1:0".parse().unwrap()).unwrap();
         let addr = endpoint.local_addr().unwrap();
         tokio::spawn(server.serve_endpoint(endpoint));
-        addr
+        (addr, stats)
     }
 
     #[cfg(all(feature = "http3", feature = "self-signed-certs"))]
@@ -1532,5 +1693,96 @@ mod tests {
             matches!(reason, quinn::ConnectionError::ApplicationClosed(_)),
             "{reason:?}"
         );
+    }
+
+    /// A client whose transport keeps the connection alive with PINGs.
+    #[cfg(all(feature = "http3", feature = "self-signed-certs"))]
+    fn pinging(mut client: quinn::ClientConfig, stream_window: Option<u32>) -> quinn::ClientConfig {
+        let mut transport = quinn::TransportConfig::default();
+        transport.keep_alive_interval(Some(Duration::from_millis(100)));
+        if let Some(window) = stream_window {
+            transport.stream_receive_window(window.into());
+        }
+        client.transport_config(std::sync::Arc::new(transport));
+        client
+    }
+
+    /// The finding: h3 hands a stream to the server as soon as it is opened,
+    /// before any HEADERS, and counting it as a request in flight from then
+    /// on meant a peer that opens one, sends nothing and keeps pinging held
+    /// the connection forever. The stream now has the head deadline to send
+    /// HEADERS, and only counts once it has.
+    #[cfg(all(feature = "http3", feature = "self-signed-certs"))]
+    #[tokio::test]
+    async fn test_h3_stream_without_headers_does_not_hold_the_connection() {
+        let (tls, client) = quic_pair();
+        let config = Http3Config::builder()
+            .max_idle_timeout(Duration::from_secs(1))
+            .build();
+        let (addr, stats) = spawn_h3_with(config, &tls, 16, Some(Duration::from_secs(300)));
+        let conn = connect(&pinging(client, None), addr).await;
+
+        // Open a request stream and send one byte of a HEADERS frame (its
+        // type), never the rest: the server sees the stream, but no request.
+        let (mut send, _recv) = conn.open_bi().await.unwrap();
+        send.write_all(&[0x01]).await.unwrap();
+
+        let reason = tokio::time::timeout(Duration::from_secs(5), conn.closed())
+            .await
+            .expect("a stream that never sends HEADERS must not keep the connection");
+        assert!(
+            matches!(reason, quinn::ConnectionError::ApplicationClosed(_)),
+            "{reason:?}"
+        );
+        // The abandoned stream is not left counted as open.
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while stats.active_streams() != 0 {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("the open-stream gauge must come back to zero");
+    }
+
+    /// The finding: a response waits on the peer's flow-control credit, and
+    /// nothing bounded that wait — a client that grants none (here: a small
+    /// stream window it never drains) while pinging held the stream, the
+    /// connection and its slot forever. The stalled write now times out, the
+    /// stream is reset, and the then-idle connection is closed.
+    #[cfg(all(feature = "http3", feature = "self-signed-certs"))]
+    #[tokio::test]
+    async fn test_h3_response_stalled_on_flow_control_times_out() {
+        let (tls, client) = quic_pair();
+        let config = Http3Config::builder()
+            .max_idle_timeout(Duration::from_secs(1))
+            .build();
+        let (addr, _) = spawn_h3_with(config, &tls, 16, Some(Duration::from_millis(300)));
+        let conn = connect(&pinging(client, Some(4096)), addr).await;
+
+        let (mut driver, mut send) = h3::client::new(h3_quinn::Connection::new(conn.clone()))
+            .await
+            .unwrap();
+        tokio::spawn(async move {
+            let _ = std::future::poll_fn(|cx| driver.poll_close(cx)).await;
+        });
+        let mut stream = send
+            .send_request(
+                http::Request::get("https://localhost/big")
+                    .body(())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        stream.finish().await.unwrap();
+        // Never read the response: the 1 MiB body stalls on the 4 KiB window.
+
+        let reason = tokio::time::timeout(Duration::from_secs(5), conn.closed())
+            .await
+            .expect("a response the client never accepts must not hold the connection");
+        assert!(
+            matches!(reason, quinn::ConnectionError::ApplicationClosed(_)),
+            "{reason:?}"
+        );
+        drop(stream);
     }
 }

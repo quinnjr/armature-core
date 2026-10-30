@@ -778,6 +778,9 @@ impl OptimizedRouter {
         if let Some(params) = resolved.params {
             request.path_params = params;
         }
+        // Only routes without route-scoped layers still carry constraints
+        // here: `Router::layer_routes` moves a guarded route's constraints
+        // into the handler, behind its guards, so a guard answers first.
         if let Some(constraints) = &route.constraints {
             constraints.validate(&request.path_params)?;
         }

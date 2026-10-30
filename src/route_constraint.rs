@@ -45,6 +45,12 @@ pub trait RouteConstraint: Send + Sync {
     /// Validate a parameter value
     ///
     /// Returns Ok(()) if valid, Err with a descriptive message if invalid
+    ///
+    /// The message goes into the 400 response body and the request log, so
+    /// it names the constraint, never the value: echoing request input back
+    /// is reflected-content risk in the response and a planted string (or a
+    /// token pasted into a URL) in the logs. The built-in constraints follow
+    /// this; custom ones should too.
     fn validate(&self, value: &str) -> Result<(), String>;
 
     /// Get a description of this constraint (for error messages)
@@ -60,7 +66,7 @@ impl RouteConstraint for IntConstraint {
         value
             .parse::<i64>()
             .map(|_| ())
-            .map_err(|_| format!("'{}' is not a valid integer", value))
+            .map_err(|_| "value is not a valid integer".to_string())
     }
 
     fn description(&self) -> &str {
@@ -77,7 +83,7 @@ impl RouteConstraint for UIntConstraint {
         value
             .parse::<u64>()
             .map(|_| ())
-            .map_err(|_| format!("'{}' is not a valid unsigned integer", value))
+            .map_err(|_| "value is not a valid unsigned integer".to_string())
     }
 
     fn description(&self) -> &str {
@@ -94,7 +100,7 @@ impl RouteConstraint for FloatConstraint {
         value
             .parse::<f64>()
             .map(|_| ())
-            .map_err(|_| format!("'{}' is not a valid float", value))
+            .map_err(|_| "value is not a valid float".to_string())
     }
 
     fn description(&self) -> &str {
@@ -111,7 +117,7 @@ impl RouteConstraint for AlphaConstraint {
         if value.chars().all(|c| c.is_alphabetic()) {
             Ok(())
         } else {
-            Err(format!("'{}' must contain only letters", value))
+            Err("value must contain only letters".to_string())
         }
     }
 
@@ -129,7 +135,7 @@ impl RouteConstraint for AlphaNumConstraint {
         if value.chars().all(|c| c.is_alphanumeric()) {
             Ok(())
         } else {
-            Err(format!("'{}' must contain only letters and numbers", value))
+            Err("value must contain only letters and numbers".to_string())
         }
     }
 
@@ -148,7 +154,7 @@ impl RouteConstraint for UuidConstraint {
         if UUID_REGEX.is_match(value) {
             Ok(())
         } else {
-            Err(format!("'{}' is not a valid UUID", value))
+            Err("value is not a valid UUID".to_string())
         }
     }
 
@@ -167,7 +173,7 @@ impl RouteConstraint for EmailConstraint {
         if EMAIL_REGEX.is_match(value) {
             Ok(())
         } else {
-            Err(format!("'{}' is not a valid email address", value))
+            Err("value is not a valid email address".to_string())
         }
     }
 
@@ -223,10 +229,7 @@ impl RouteConstraint for RegexConstraint {
         if self.regex.is_match(value) {
             Ok(())
         } else {
-            Err(format!(
-                "'{}' must match pattern: {}",
-                value, self.description
-            ))
+            Err(format!("value must match pattern: {}", self.description))
         }
     }
 
@@ -295,13 +298,13 @@ impl RouteConstraint for LengthConstraint {
         if let Some(min) = self.min
             && len < min
         {
-            return Err(format!("'{}' must be at least {} characters", value, min));
+            return Err(format!("value must be at least {} characters", min));
         }
 
         if let Some(max) = self.max
             && len > max
         {
-            return Err(format!("'{}' must be at most {} characters", value, max));
+            return Err(format!("value must be at most {} characters", max));
         }
 
         Ok(())
@@ -367,18 +370,18 @@ impl RouteConstraint for RangeConstraint {
     fn validate(&self, value: &str) -> Result<(), String> {
         let num = value
             .parse::<i64>()
-            .map_err(|_| format!("'{}' is not a valid number", value))?;
+            .map_err(|_| "value is not a valid number".to_string())?;
 
         if let Some(min) = self.min
             && num < min
         {
-            return Err(format!("'{}' must be at least {}", value, min));
+            return Err(format!("value must be at least {}", min));
         }
 
         if let Some(max) = self.max
             && num > max
         {
-            return Err(format!("'{}' must be at most {}", value, max));
+            return Err(format!("value must be at most {}", max));
         }
 
         Ok(())
@@ -424,11 +427,7 @@ impl RouteConstraint for EnumConstraint {
         if self.values.contains(&value.to_string()) {
             Ok(())
         } else {
-            Err(format!(
-                "'{}' must be one of: {}",
-                value,
-                self.values.join(", ")
-            ))
+            Err(format!("value must be one of: {}", self.values.join(", ")))
         }
     }
 
@@ -711,5 +710,33 @@ mod tests {
             Bytes::from_static(&[0xff, 0xfe]),
         ));
         assert!(constraints.validate(&other).is_ok());
+    }
+
+    /// Rejection messages name the parameter and the constraint, never the
+    /// offending value (which reaches the 400 body and the logs).
+    #[test]
+    fn rejection_messages_do_not_echo_the_value() {
+        let payload = "<script>x</script>";
+        let constraints: Vec<Box<dyn RouteConstraint>> = vec![
+            Box::new(IntConstraint),
+            Box::new(UIntConstraint),
+            Box::new(FloatConstraint),
+            Box::new(AlphaConstraint),
+            Box::new(AlphaNumConstraint),
+            Box::new(UuidConstraint),
+            Box::new(EmailConstraint),
+            Box::new(RegexConstraint::new(r"\d+", "digits").unwrap()),
+            Box::new(LengthConstraint::new(Some(1), Some(3))),
+            Box::new(RangeConstraint::new(Some(0), Some(10))),
+            Box::new(EnumConstraint::new(vec!["a".to_string()])),
+        ];
+        for c in &constraints {
+            let msg = c.validate(payload).unwrap_err();
+            assert!(!msg.contains("script"), "{msg}");
+        }
+        let msg = RangeConstraint::new(Some(0), Some(10))
+            .validate("99")
+            .unwrap_err();
+        assert!(!msg.contains("99"), "{msg}");
     }
 }

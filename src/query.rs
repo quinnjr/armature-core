@@ -156,10 +156,22 @@ pub(crate) fn first_wins_urlencoded(input: &[u8]) -> Result<Cow<'_, [u8]>, Strin
 
 /// Parse `query` into key/value pairs, percent-decoding both sides.
 ///
-/// Malformed input degrades rather than erroring: a bare key gets an empty
-/// value, and an escape that does not decode is preserved verbatim so the
-/// handler sees what the client sent. Rejecting a request over a stray `%` would
-/// break clients for no security gain — nothing downstream trusts these bytes.
+/// The semantics are exactly `application/x-www-form-urlencoded` parsing as
+/// the `form_urlencoded` crate (and so `serde_urlencoded`, behind `Query<T>`
+/// and `parse_form`) does it: empty `&`-separated pieces are skipped, a bare
+/// key gets an empty value, an **empty key is kept**, `+` is a space, an
+/// escape that is not `%` plus two hex digits stays literal, and bytes that
+/// decode to invalid UTF-8 become U+FFFD.
+///
+/// Matching is the point, not a nicety. The response caches key on these
+/// pairs while the handler reads the query through serde; any input the two
+/// read differently (`?q=1&=payload` with the empty key dropped here, or
+/// `%FF` kept raw here but replaced by serde) lets two requests the handler
+/// answers differently share one cache entry.
+///
+/// Malformed input degrades rather than erroring. Rejecting a request over a
+/// stray `%` would break clients for no security gain — nothing downstream
+/// trusts these bytes.
 pub(crate) fn parse(query: &str) -> QueryPairs {
     let mut out = QueryPairs::new();
     for pair in query.split('&') {
@@ -170,9 +182,6 @@ pub(crate) fn parse(query: &str) -> QueryPairs {
             Some((k, v)) => (k, v),
             None => (pair, ""),
         };
-        if raw_key.is_empty() {
-            continue;
-        }
         out.push((decode(raw_key).into_owned(), decode(raw_value).into_owned()));
     }
     out
@@ -199,8 +208,11 @@ fn decode(s: &str) -> Cow<'_, str> {
             b'%' => {
                 // `get` does the bounds check, so a truncated escape at the end
                 // of the input falls into the `None` arm rather than panicking.
+                // Both digits must be hex. `from_str_radix` alone would also
+                // take a sign (`%+1` as 0x01), which `form_urlencoded` doesn't.
                 match bytes
                     .get(i + 1..i + 3)
+                    .filter(|h| h.iter().all(u8::is_ascii_hexdigit))
                     .and_then(|h| std::str::from_utf8(h).ok())
                     .and_then(|h| u8::from_str_radix(h, 16).ok())
                 {
@@ -222,10 +234,12 @@ fn decode(s: &str) -> Cow<'_, str> {
         }
     }
 
+    // Lossy, as `form_urlencoded` is. Handing back the raw escaped text
+    // instead made `%FF` read as the three characters `%FF` here — the same
+    // pair `%25FF` decodes to — while the handler saw U+FFFD.
     match String::from_utf8(out) {
         Ok(decoded) => Cow::Owned(decoded),
-        // Decoded to non-UTF-8: hand back the raw form rather than lossy text.
-        Err(_) => Cow::Borrowed(s),
+        Err(e) => Cow::Owned(String::from_utf8_lossy(e.as_bytes()).into_owned()),
     }
 }
 
@@ -313,8 +327,35 @@ mod tests {
         // handler sees what the client actually sent.
         assert_eq!(q.get("bad"), Some("%zz"));
         assert_eq!(q.get("trunc"), Some("%2"));
-        // A pair with an empty key is dropped: there is nothing to look it up by.
-        assert_eq!(q.len(), 4);
+        // A pair with an empty key is kept, as serde's parser keeps it.
+        assert_eq!(q.get(""), Some("novalue"));
+        assert_eq!(q.len(), 5);
+    }
+
+    /// `QueryView` must read every query exactly as `serde_urlencoded` (and
+    /// so `Query<T>`) does, or a cache keyed on the view can be made to
+    /// share an entry between requests the handler answers differently.
+    #[test]
+    fn decoding_matches_serde_urlencoded() {
+        for raw in [
+            "q=1&=payload",
+            "=",
+            "q=%FF",
+            "q=%25FF",
+            "a=%+1&b=%2&c=%zz&d=x+y&e=%E2%9C%93&f",
+            "&&k=v&&",
+            "k=%C3",
+            "%FF=v",
+        ] {
+            let req = HttpRequest::new("GET", format!("/s?{raw}"));
+            let ours: Vec<(String, String)> = req
+                .query()
+                .iter()
+                .map(|(k, v)| (k.to_owned(), v.to_owned()))
+                .collect();
+            let serde: Vec<(String, String)> = serde_urlencoded::from_str(raw).unwrap();
+            assert_eq!(ours, serde, "{raw}");
+        }
     }
 
     #[test]

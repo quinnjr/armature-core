@@ -319,6 +319,10 @@ impl Router {
     /// controllers registered, and by [`RouteGroup`](crate::RouteGroup) to
     /// enforce a group's guards and middleware.
     ///
+    /// A layered route's [`RouteConstraints`] move into the innermost layer
+    /// (its [`Route::constraints`] becomes `None`), so they are validated after
+    /// these guards and middleware rather than before them.
+    ///
     /// # Panics
     ///
     /// Panics if `range` is out of bounds for [`Router::routes`], like slice
@@ -333,11 +337,40 @@ impl Router {
             return;
         }
         for route in &mut self.routes[range] {
-            route.handler = layer_handler(route.handler.clone(), middleware, guards);
+            // Both routers validate `route.constraints` *before* calling the
+            // handler, i.e. before any layer bound here. A guarded route would
+            // then answer 400 for a malformed parameter and 401/403 for a
+            // well-formed one, letting an unauthenticated caller map guarded
+            // routes and their parameter shapes. Moving the check into the
+            // innermost layer makes the guards (and middleware) answer first,
+            // and keeps both routers identical: each sees no route-level
+            // constraints and the same validating handler. Re-layering later
+            // nests new layers outside this one, so it stays innermost.
+            let mut handler = route.handler.clone();
+            if let Some(constraints) = route.constraints.take() {
+                handler = constrained_handler(handler, constraints);
+            }
+            route.handler = layer_handler(handler, middleware, guards);
         }
         // The index holds positions and parameter names, not handlers, so it
         // stays valid; no rebuild is needed.
     }
+}
+
+/// Wrap `handler` so `constraints` are validated against the request's path
+/// parameters (already set by the router) just before it runs, with the same
+/// error the routers produce for a route-level constraint.
+fn constrained_handler(handler: BoxedHandler, constraints: RouteConstraints) -> BoxedHandler {
+    let constraints = Arc::new(constraints);
+    crate::handler::from_legacy_handler(Arc::new(move |req: HttpRequest| {
+        let constraints = Arc::clone(&constraints);
+        let inner = handler.clone();
+        Box::pin(async move {
+            trace!("Validating route constraints");
+            constraints.validate(&req.path_params)?;
+            inner.call(req).await
+        })
+    }))
 }
 
 /// The `403` a guard that returns `Ok(false)` produces, on every transport and
@@ -1744,5 +1777,65 @@ mod tests {
         let req = HttpRequest::new("GET", "/nonexistent".to_string());
         let result = router.route(req).await;
         assert!(matches!(result, Err(Error::RouteNotFound(_))));
+    }
+
+    struct FixedGuard(bool);
+
+    #[async_trait::async_trait]
+    impl Guard for FixedGuard {
+        async fn can_activate(&self, _ctx: &GuardContext) -> Result<bool, Error> {
+            Ok(self.0)
+        }
+    }
+
+    fn guarded_constrained_router(allow: bool) -> Router {
+        let mut router = Router::new();
+        router.add_route(
+            Route::new(HttpMethod::GET, "/admin/users/:id", test_handler).with_constraints(
+                RouteConstraints::new()
+                    .add("id", Box::new(crate::route_constraint::UIntConstraint)),
+            ),
+        );
+        let guards: Vec<Arc<dyn Guard>> = vec![Arc::new(FixedGuard(allow))];
+        router.layer_routes(0..1, &[], &guards);
+        router
+    }
+
+    /// A route-scoped guard must answer before the route's parameter
+    /// constraints are checked: otherwise an unauthenticated caller gets 400
+    /// for a malformed id and 403 for a well-formed one, which maps the
+    /// guarded routes and their parameter shapes without ever passing a
+    /// guard. Both routers must agree.
+    #[tokio::test]
+    async fn guards_run_before_route_constraints() {
+        let router = guarded_constrained_router(false);
+        let optimized = crate::route_cache::OptimizedRouter::from_router(&router);
+        for path in ["/admin/users/abc", "/admin/users/1"] {
+            let linear = router
+                .route(HttpRequest::new("GET", path.to_string()))
+                .await;
+            assert_eq!(linear.unwrap().status, 403, "Router {path}");
+            let fast = optimized
+                .route(HttpRequest::new("GET", path.to_string()))
+                .await;
+            assert_eq!(fast.unwrap().status, 403, "OptimizedRouter {path}");
+        }
+
+        // Past the guard, the constraint still rejects a malformed id.
+        let router = guarded_constrained_router(true);
+        let optimized = crate::route_cache::OptimizedRouter::from_router(&router);
+        let linear = router
+            .route(HttpRequest::new("GET", "/admin/users/abc".to_string()))
+            .await;
+        assert!(matches!(linear, Err(Error::BadRequest(_))), "{linear:?}");
+        let fast = optimized
+            .route(HttpRequest::new("GET", "/admin/users/abc".to_string()))
+            .await;
+        assert!(matches!(fast, Err(Error::BadRequest(_))), "{fast:?}");
+        let ok = optimized
+            .route(HttpRequest::new("GET", "/admin/users/7".to_string()))
+            .await
+            .unwrap();
+        assert_eq!(ok.status, 200);
     }
 }

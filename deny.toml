@@ -11,6 +11,8 @@ version = 2
 [bans]
 multiple-versions = "allow"
 wildcards = "deny"
+# The unpublished fuzz crate depends on this one by path.
+allow-wildcard-paths = true
 deny = [
     # TLS is rustls-only: native-tls and OpenSSL drag in a C TLS stack.
     { crate = "native-tls", reason = "TLS is rustls-only" },
@@ -20,6 +22,8 @@ deny = [
     # is a second C crypto library that is built on every consumer's machine
     # but never called.
     { crate = "aws-lc-sys", reason = "the crypto provider is ring; disable the dependency's default features" },
+    { crate = "aws-lc-fips-sys", reason = "the crypto provider is ring" },
+    { crate = "aws-lc-rs", reason = "the crypto provider is ring" },
 ]
 
 [sources]

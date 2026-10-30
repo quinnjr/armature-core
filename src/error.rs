@@ -265,12 +265,38 @@ impl Error {
     pub fn client_message(&self) -> String {
         match self {
             e if e.status_code() >= 500 => "Internal Server Error".to_string(),
+            // The router builds this from the request's own method and path;
+            // echoing the target back hands a reflected string (and the
+            // framework's "check your controller paths" hint) to whoever sent
+            // it.
+            Error::RouteNotFound(_) => "Not Found".to_string(),
             Error::Deserialization(_) => {
                 "Request data could not be deserialized. Check that it matches the expected format."
                     .to_string()
             }
             e => e.to_string(),
         }
+    }
+
+    /// A rendering of this error that is safe to put in a log line.
+    ///
+    /// Identical to `Display` except for [`Error::Deserialization`], whose
+    /// serde text quotes the offending input (`invalid type: string
+    /// "hunter2", expected u32`): only its kind, line and column are rendered,
+    /// so a mistyped password or token field never reaches the logs. Every
+    /// place that logs a request's error uses this instead of `%err`.
+    ///
+    /// ```
+    /// use armature_core::Error;
+    /// let e = Error::Deserialization(
+    ///     "invalid type: string \"hunter2\", expected u32 at line 1 column 15".into(),
+    /// );
+    /// assert!(!e.log_display().to_string().contains("hunter2"));
+    /// let v = Error::Validation("email is required".into());
+    /// assert_eq!(v.log_display().to_string(), v.to_string());
+    /// ```
+    pub fn log_display(&self) -> impl std::fmt::Display + '_ {
+        LogDisplay(self)
     }
 
     /// Build a client-safe HTTP response for this error.
@@ -423,6 +449,26 @@ fn deserialization_log_fields(detail: &str) -> (&str, Option<u64>, Option<u64>) 
         None => (None, None),
     };
     (kind, line, column)
+}
+
+/// See [`Error::log_display`].
+struct LogDisplay<'a>(&'a Error);
+
+impl std::fmt::Display for LogDisplay<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self.0 {
+            Error::Deserialization(detail) => {
+                let (kind, line, column) = deserialization_log_fields(detail);
+                write!(f, "Deserialization error ({kind})")?;
+                match (line, column) {
+                    (Some(line), Some(column)) => write!(f, " at line {line} column {column}"),
+                    (Some(line), None) => write!(f, " at line {line}"),
+                    _ => Ok(()),
+                }
+            }
+            e => std::fmt::Display::fmt(e, f),
+        }
+    }
 }
 
 #[cfg(test)]

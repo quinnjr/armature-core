@@ -644,7 +644,7 @@ where
                     tracing::error!(
                         method = %method,
                         path = %path,
-                        error = %e,
+                        error = %e.log_display(),
                         duration_ms = duration.as_millis() as u64,
                         "Request failed"
                     );

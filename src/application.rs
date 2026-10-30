@@ -147,8 +147,92 @@ pub(crate) enum BodyReadError<E> {
     TooLarge,
     /// The client broke the [`BodyReadPolicy`].
     TimedOut,
+    /// The connection's [`BodyBudget`] is spent by its other streams.
+    Overloaded,
     /// The transport failed underneath the read.
     Source(E),
+}
+
+/// Request-body bytes one multiplexed connection may hold buffered at once,
+/// summed across its concurrent streams.
+///
+/// Every body is buffered whole before its handler runs, which bounds an
+/// HTTP/1.1 connection at one body cap's worth of memory. A multiplexed
+/// connection runs up to `max_concurrent_streams` requests at once, so without
+/// a shared budget its bound is that many times the cap — a gigabyte at the
+/// defaults, per connection, for the price of one TCP handshake. Each stream
+/// draws from the budget as its bytes arrive and returns them when its request
+/// is finished (see [`BodyLease`]).
+#[derive(Debug)]
+pub(crate) struct BodyBudget {
+    available: std::sync::atomic::AtomicUsize,
+}
+
+impl BodyBudget {
+    pub(crate) fn new(bytes: usize) -> Self {
+        Self {
+            available: std::sync::atomic::AtomicUsize::new(bytes),
+        }
+    }
+}
+
+/// The part of a connection's [`BodyBudget`] one request holds.
+///
+/// Held for the whole request, not just the read: the bytes it accounts for
+/// live in the request until its handler is done with them. Dropping it hands
+/// them back.
+#[derive(Debug, Default)]
+pub(crate) struct BodyLease {
+    budget: Option<Arc<BodyBudget>>,
+    held: usize,
+}
+
+impl BodyLease {
+    /// A lease on `budget`, or an unbounded one when there is none.
+    pub(crate) fn on(budget: Option<&Arc<BodyBudget>>) -> Self {
+        Self {
+            budget: budget.cloned(),
+            held: 0,
+        }
+    }
+
+    /// Take `n` more bytes, or `false` when the budget cannot cover them.
+    fn try_take(&mut self, n: usize) -> bool {
+        use std::sync::atomic::Ordering;
+        let Some(budget) = &self.budget else {
+            return true;
+        };
+        let mut left = budget.available.load(Ordering::Acquire);
+        loop {
+            let Some(after) = left.checked_sub(n) else {
+                return false;
+            };
+            match budget.available.compare_exchange_weak(
+                left,
+                after,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => {
+                    self.held += n;
+                    return true;
+                }
+                Err(now) => left = now,
+            }
+        }
+    }
+}
+
+impl Drop for BodyLease {
+    fn drop(&mut self) {
+        if let Some(budget) = &self.budget
+            && self.held > 0
+        {
+            budget
+                .available
+                .fetch_add(self.held, std::sync::atomic::Ordering::AcqRel);
+        }
+    }
 }
 
 /// Read a whole request body from a poll-style chunk source, enforcing the
@@ -158,9 +242,21 @@ pub(crate) enum BodyReadError<E> {
 /// and HTTP/3 — so the slow-body defence cannot be present on one and missing
 /// on another.
 pub(crate) async fn read_body<E>(
+    poll_next: impl FnMut(&mut Context<'_>) -> Poll<Option<Result<Bytes, E>>>,
+    cap: usize,
+    policy: BodyReadPolicy,
+) -> Result<Bytes, BodyReadError<E>> {
+    read_body_leased(poll_next, cap, policy, &mut BodyLease::default()).await
+}
+
+/// [`read_body`], drawing every chunk from `lease` as well: a chunk the
+/// connection's budget cannot cover ends the read with
+/// [`BodyReadError::Overloaded`].
+pub(crate) async fn read_body_leased<E>(
     mut poll_next: impl FnMut(&mut Context<'_>) -> Poll<Option<Result<Bytes, E>>>,
     cap: usize,
     policy: BodyReadPolicy,
+    lease: &mut BodyLease,
 ) -> Result<Bytes, BodyReadError<E>> {
     let started = tokio::time::Instant::now();
     let mut first: Option<Bytes> = None;
@@ -184,6 +280,9 @@ pub(crate) async fn read_body<E>(
         total = total.saturating_add(chunk.len());
         if total > cap {
             return Err(BodyReadError::TooLarge);
+        }
+        if !lease.try_take(chunk.len()) {
+            return Err(BodyReadError::Overloaded);
         }
         match (&mut acc, first.take()) {
             // Single-chunk bodies — the common case — pass straight through
@@ -239,6 +338,10 @@ pub(crate) struct ServeState {
     /// address has: it is a property of the connection, not of the request.
     /// `None` on a path that does not know the address.
     peer: Option<SocketAddr>,
+    /// The connection's shared request-body budget, on multiplexed transports
+    /// (see [`BodyBudget`]); `None` where a connection carries one request at a
+    /// time and the body cap alone bounds it.
+    body_budget: Option<Arc<BodyBudget>>,
 }
 
 impl ServeState {
@@ -267,6 +370,7 @@ impl ServeState {
             body_read: BodyReadPolicy::default(),
             filter_chain: None,
             peer: None,
+            body_budget: None,
         }
     }
 
@@ -318,6 +422,14 @@ impl ServeState {
         self
     }
 
+    /// The same state with a [`BodyBudget`] of twice its body cap: what an
+    /// HTTP/3 connection, which multiplexes like HTTP/2, may hold buffered.
+    #[cfg(feature = "http3")]
+    pub(crate) fn with_default_body_budget(self) -> Self {
+        let bytes = self.max_body_size.saturating_mul(2);
+        self.with_body_budget(bytes)
+    }
+
     /// The peer of the connection this state serves, if known.
     #[cfg(feature = "http3")]
     pub(crate) fn peer(&self) -> Option<SocketAddr> {
@@ -335,6 +447,15 @@ impl ServeState {
         Self {
             peer: Some(peer),
             ..self.clone()
+        }
+    }
+
+    /// The same state, with a fresh [`BodyBudget`] of `bytes` shared by every
+    /// request served from it. Called once per multiplexed connection.
+    pub(crate) fn with_body_budget(self, bytes: usize) -> Self {
+        Self {
+            body_budget: Some(Arc::new(BodyBudget::new(bytes))),
+            ..self
         }
     }
 }
@@ -622,6 +743,7 @@ impl Application {
             filter_chain: self.filter_chain.clone().map(Arc::new),
             // Set per connection by the accept loops; this is the template.
             peer: None,
+            body_budget: None,
         }
     }
 
@@ -1318,7 +1440,10 @@ impl Application {
                 apply_socket_tuning(stream.as_fd(), tuning, "accepted connection");
             }
 
-            let io = TokioIo::new(stream);
+            let io = TokioIo::new(crate::pipeline::WriteDeadline::new(
+                stream,
+                pipeline_builder.config().write_timeout,
+            ));
             let state = state.for_peer(client_addr);
             let http_builder = pipeline_builder.configure_hyper_builder();
             let stats = Arc::clone(&pipeline_stats);
@@ -1376,7 +1501,19 @@ impl Application {
     /// [`listen_on`](Self::listen_on) for what the default `h1-backend` feature
     /// changes about every HTTP/1.1 listener on this type.
     pub async fn listen_https(self, port: u16, tls_config: TlsConfig) -> Result<(), Error> {
-        let addr = SocketAddr::from(([0, 0, 0, 0], port));
+        self.listen_https_on(SocketAddr::from(([0, 0, 0, 0], port)), tls_config)
+            .await
+    }
+
+    /// [`listen_https`](Self::listen_https) on a specific address — loopback,
+    /// one interface, IPv6, or an ephemeral `:0` port — rather than every
+    /// interface.
+    pub async fn listen_https_on(
+        self,
+        addr: impl Into<SocketAddr>,
+        tls_config: TlsConfig,
+    ) -> Result<(), Error> {
+        let addr = addr.into();
 
         // See `listen_on` for why this is a `cfg`-selected binding and not a
         // branch, and why the trailing `served` is not a redundant rebind.
@@ -1419,7 +1556,7 @@ impl Application {
                 .with_tls(tls);
         let h2 = with_h2.then(|| {
             Http2Builder::with_stats(self.http2_config.clone(), Arc::clone(&self.http2_stats))
-                .configure_hyper_builder()
+                .connection_server(&self.pipeline_config, self.max_body_size)
         });
         crate::h1_backend::serve(cfg, state, h2).await
     }
@@ -1459,6 +1596,7 @@ impl Application {
             Arc::clone(&self.pipeline_stats),
         );
         let pipeline_stats = Arc::clone(&self.pipeline_stats);
+        let write_timeout = self.pipeline_config.write_timeout;
         let limit = ConnectionLimit::new(self.pipeline_config.max_connections);
 
         loop {
@@ -1494,7 +1632,10 @@ impl Application {
                 match tls_accept(&acceptor, stream).await {
                     Ok(tls_stream) => {
                         debug!(client = %client_addr, "TLS handshake successful");
-                        let io = TokioIo::new(tls_stream);
+                        let io = TokioIo::new(crate::pipeline::WriteDeadline::new(
+                            tls_stream,
+                            write_timeout,
+                        ));
 
                         let service = service_fn(move |req: Request<IncomingBody>| {
                             let state = state.clone();
@@ -1665,6 +1806,7 @@ impl Application {
         // `listen_with_config_h1` for why this listener does not gain HTTP/2.
         let acceptor = TlsAcceptor::from(without_h2_alpn(config.tls.server_config));
         let h1_builder = PipelinedHttp1Builder::new(self.pipeline_config.clone());
+        let write_timeout = self.pipeline_config.write_timeout;
         let limit = ConnectionLimit::new(self.pipeline_config.max_connections);
 
         loop {
@@ -1687,7 +1829,10 @@ impl Application {
                 let _permit = permit;
                 match tls_accept(&acceptor, stream).await {
                     Ok(tls_stream) => {
-                        let io = TokioIo::new(tls_stream);
+                        let io = TokioIo::new(crate::pipeline::WriteDeadline::new(
+                            tls_stream,
+                            write_timeout,
+                        ));
 
                         let service = service_fn(move |req: Request<IncomingBody>| {
                             let state = state.clone();
@@ -1723,7 +1868,15 @@ impl Application {
     /// # }
     /// ```
     pub async fn listen_h2c(self, port: u16) -> Result<(), Error> {
-        let addr = SocketAddr::from(([0, 0, 0, 0], port));
+        self.listen_h2c_on(SocketAddr::from(([0, 0, 0, 0], port)))
+            .await
+    }
+
+    /// [`listen_h2c`](Self::listen_h2c) on a specific address rather than
+    /// every interface. Cleartext HTTP/2 is best kept to loopback or a private
+    /// interface, which is what this is for.
+    pub async fn listen_h2c_on(self, addr: impl Into<SocketAddr>) -> Result<(), Error> {
+        let addr = addr.into();
 
         debug!(address = %addr, "Binding to address (HTTP/2 cleartext)");
         let listener = TcpListener::bind(addr).await?;
@@ -1760,9 +1913,12 @@ impl Application {
         #[cfg(not(unix))]
         let _ = &socket_tuning;
         let state = self.serve_state();
-        let h2_builder =
-            Http2Builder::with_stats(self.http2_config.clone(), Arc::clone(&self.http2_stats));
-        let h2_stats = Arc::clone(&self.http2_stats);
+        // Connection counting, request counting, the preface and idle
+        // deadlines and the body budget all live in the connection server.
+        let h2 = Arc::new(
+            Http2Builder::with_stats(self.http2_config.clone(), Arc::clone(&self.http2_stats))
+                .connection_server(&self.pipeline_config, self.max_body_size),
+        );
         let limit = ConnectionLimit::new(self.pipeline_config.max_connections);
 
         loop {
@@ -1777,32 +1933,14 @@ impl Application {
                 apply_socket_tuning(stream.as_fd(), tuning, "accepted connection");
             }
 
-            let io = TokioIo::new(stream);
             let state = state.for_peer(client_addr);
-            let http_builder = h2_builder.configure_hyper_builder();
-            let stats = Arc::clone(&h2_stats);
-
-            // Track connection
-            stats.connection_opened();
+            let h2 = Arc::clone(&h2);
 
             tokio::spawn(async move {
                 let _permit = permit;
-                let stats_for_close = Arc::clone(&stats);
-                let service = service_fn(move |req: Request<IncomingBody>| {
-                    let state = state.clone();
-                    let stats = Arc::clone(&stats);
-                    async move {
-                        stats.request_processed();
-                        handle_request(req, state).await
-                    }
-                });
-
-                if let Err(err) = http_builder.serve_connection(io, service).await {
+                if let Err(err) = h2.serve(stream, state).await {
                     error!(error = %err, client = %client_addr, "Error serving HTTP/2 connection");
                 }
-
-                // Track connection close
-                stats_for_close.connection_closed();
             });
         }
     }
@@ -1831,7 +1969,18 @@ impl Application {
     /// half is hyper's either way, so [`http2_stats`](Self::http2_stats) keeps
     /// counting here.
     pub async fn listen_https_h2(self, port: u16, tls_config: TlsConfig) -> Result<(), Error> {
-        let addr = SocketAddr::from(([0, 0, 0, 0], port));
+        self.listen_https_h2_on(SocketAddr::from(([0, 0, 0, 0], port)), tls_config)
+            .await
+    }
+
+    /// [`listen_https_h2`](Self::listen_https_h2) on a specific address rather
+    /// than every interface.
+    pub async fn listen_https_h2_on(
+        self,
+        addr: impl Into<SocketAddr>,
+        tls_config: TlsConfig,
+    ) -> Result<(), Error> {
+        let addr = addr.into();
 
         // `true`: connections that negotiate `h2` over ALPN go to hyper's
         // HTTP/2 driver rather than being closed.
@@ -1876,10 +2025,12 @@ impl Application {
             self.pipeline_config.clone(),
             Arc::clone(&self.pipeline_stats),
         );
-        let h2_builder =
-            Http2Builder::with_stats(self.http2_config.clone(), Arc::clone(&self.http2_stats));
+        let h2 = Arc::new(
+            Http2Builder::with_stats(self.http2_config.clone(), Arc::clone(&self.http2_stats))
+                .connection_server(&self.pipeline_config, self.max_body_size),
+        );
         let h1_stats = Arc::clone(&self.pipeline_stats);
-        let h2_stats = Arc::clone(&self.http2_stats);
+        let write_timeout = self.pipeline_config.write_timeout;
         let limit = ConnectionLimit::new(self.pipeline_config.max_connections);
 
         loop {
@@ -1897,9 +2048,8 @@ impl Application {
             let acceptor = acceptor.clone();
             let state = state.for_peer(client_addr);
             let h1_builder_ref = h1_builder.configure_hyper_builder();
-            let h2_builder_ref = h2_builder.configure_hyper_builder();
+            let h2 = Arc::clone(&h2);
             let h1_stats = Arc::clone(&h1_stats);
-            let h2_stats = Arc::clone(&h2_stats);
 
             tokio::spawn(async move {
                 let _permit = permit;
@@ -1913,30 +2063,17 @@ impl Application {
 
                         if is_h2 {
                             debug!(client = %client_addr, "Using HTTP/2 (ALPN negotiated h2)");
-                            h2_stats.connection_opened();
-
-                            let io = TokioIo::new(tls_stream);
-                            let stats = Arc::clone(&h2_stats);
-
-                            let service = service_fn(move |req: Request<IncomingBody>| {
-                                let state = state.clone();
-                                let stats = Arc::clone(&stats);
-                                async move {
-                                    stats.request_processed();
-                                    handle_request(req, state).await
-                                }
-                            });
-
-                            if let Err(err) = h2_builder_ref.serve_connection(io, service).await {
+                            if let Err(err) = h2.serve(tls_stream, state).await {
                                 error!(error = %err, client = %client_addr, "Error serving HTTP/2 connection");
                             }
-
-                            h2_stats.connection_closed();
                         } else {
                             debug!(client = %client_addr, "Using HTTP/1.1 (ALPN fallback)");
                             h1_stats.connection_opened();
 
-                            let io = TokioIo::new(tls_stream);
+                            let io = TokioIo::new(crate::pipeline::WriteDeadline::new(
+                                tls_stream,
+                                write_timeout,
+                            ));
                             let stats = Arc::clone(&h1_stats);
 
                             let service = service_fn(move |req: Request<IncomingBody>| {
@@ -1989,9 +2126,21 @@ impl Application {
     /// ```
     #[cfg(feature = "http3")]
     pub async fn listen_h3(self, port: u16, tls_config: TlsConfig) -> Result<(), Error> {
+        self.listen_h3_on(SocketAddr::from(([0, 0, 0, 0], port)), tls_config)
+            .await
+    }
+
+    /// [`listen_h3`](Self::listen_h3) on a specific UDP address rather than
+    /// every interface.
+    #[cfg(feature = "http3")]
+    pub async fn listen_h3_on(
+        self,
+        addr: impl Into<SocketAddr>,
+        tls_config: TlsConfig,
+    ) -> Result<(), Error> {
         use crate::http3::Http3Server;
 
-        let addr = SocketAddr::from(([0, 0, 0, 0], port));
+        let addr = addr.into();
 
         info!(
             address = %addr,
@@ -2002,7 +2151,11 @@ impl Application {
 
         // The same serve state as every TCP listener — guards, middleware,
         // CORS, filters, body limits — so QUIC is not a way around any of it.
-        let server = Http3Server::from_state(self.http3_config.clone(), self.serve_state());
+        let server = Http3Server::from_state(
+            self.http3_config.clone(),
+            self.serve_state(),
+            self.pipeline_config.max_connections,
+        );
 
         server.listen(addr, tls_config.server_config).await
     }
@@ -2034,9 +2187,21 @@ impl Application {
     /// ```
     #[cfg(feature = "http3")]
     pub async fn listen_dual_stack(self, port: u16, tls_config: TlsConfig) -> Result<(), Error> {
+        self.listen_dual_stack_on(SocketAddr::from(([0, 0, 0, 0], port)), tls_config)
+            .await
+    }
+
+    /// [`listen_dual_stack`](Self::listen_dual_stack) on a specific address:
+    /// HTTP/3 on its UDP port and HTTPS on its TCP port.
+    #[cfg(feature = "http3")]
+    pub async fn listen_dual_stack_on(
+        self,
+        addr: impl Into<SocketAddr>,
+        tls_config: TlsConfig,
+    ) -> Result<(), Error> {
         use crate::http3::Http3Server;
 
-        let addr = SocketAddr::from(([0, 0, 0, 0], port));
+        let addr = addr.into();
 
         info!(
             address = %addr,
@@ -2048,10 +2213,11 @@ impl Application {
         let tls_config_h3 = tls_config.clone();
         let state_h3 = self.serve_state();
         let http3_config = self.http3_config.clone();
+        let max_connections = self.pipeline_config.max_connections;
 
         // Start HTTP/3 server (UDP)
         let h3_handle = tokio::spawn(async move {
-            let server = Http3Server::from_state(http3_config, state_h3);
+            let server = Http3Server::from_state(http3_config, state_h3, max_connections);
             if let Err(e) = server.listen(addr, tls_config_h3.server_config).await {
                 error!(error = %e, "HTTP/3 server error");
             }
@@ -2059,7 +2225,7 @@ impl Application {
 
         // Start HTTPS server with HTTP/2 (TCP)
         let https_handle = tokio::spawn(async move {
-            if let Err(e) = self.listen_https_h2(port, tls_config).await {
+            if let Err(e) = self.listen_https_h2_on(addr, tls_config).await {
                 error!(error = %e, "HTTPS server error");
             }
         });
@@ -2304,6 +2470,58 @@ async fn serve_http_redirect(
     }
 }
 
+/// Settle a request's authority against its `Host` header.
+///
+/// HTTP/2 and HTTP/3 carry the target authority in the `:authority`
+/// pseudo-header, which hyper and `h3` move into the request URI rather than
+/// the header map — so a header-copying adapter silently drops it, and a
+/// handler or guard keyed on `Host` (virtual hosting, tenant routing, the
+/// redirect allowlist) then sees whatever `Host` the client chose to send
+/// alongside, or none at all. RFC 9113 §8.3.1 and RFC 9114 §4.3.1 require the
+/// two to agree when both are present; this enforces that, and fills `Host`
+/// in from the authority when it is absent so every transport presents the
+/// same request.
+///
+/// On HTTP/1.x an authority in the URI means an absolute-form (or, for
+/// `CONNECT`, authority-form) target. `armature-h1` refuses absolute-form
+/// outright, so the hyper paths do too: two backends that disagree about
+/// which `Host` a request is for are exactly the ambiguity a proxy in front
+/// can be steered through.
+///
+/// Returns the `Host` value to add, if any, or the reason for a `400`.
+pub(crate) fn reconcile_authority<'a, 'h>(
+    version: http::Version,
+    is_connect: bool,
+    authority: Option<&'a str>,
+    hosts: impl Iterator<Item = &'h [u8]>,
+) -> Result<Option<&'a str>, &'static str> {
+    let http1 = matches!(
+        version,
+        http::Version::HTTP_09 | http::Version::HTTP_10 | http::Version::HTTP_11
+    );
+    let mut hosts = hosts;
+    let host = hosts.next();
+    if hosts.next().is_some() {
+        return Err("more than one Host header");
+    }
+    let Some(authority) = authority else {
+        return Ok(None);
+    };
+    if http1 && !is_connect {
+        return Err("absolute-form request targets are not accepted");
+    }
+    if authority.contains('@') {
+        return Err("the request authority must not carry userinfo");
+    }
+    match host {
+        Some(host) if !host.eq_ignore_ascii_case(authority.as_bytes()) => {
+            Err("the Host header does not match the request authority")
+        }
+        Some(_) => Ok(None),
+        None => Ok(Some(authority)),
+    }
+}
+
 /// Handle an incoming HTTP request
 pub(crate) async fn handle_request(
     req: Request<IncomingBody>,
@@ -2322,6 +2540,30 @@ pub(crate) async fn handle_request(
         .uri()
         .path_and_query()
         .map_or_else(|| req.uri().path().to_owned(), |pq| pq.as_str().to_owned());
+
+    // HTTP/2's `:authority` lives in the URI, not the header map, and an
+    // HTTP/1.1 absolute-form target carries one too; settle it against `Host`
+    // before anything reads either. See `reconcile_authority`.
+    let host_from_authority = match reconcile_authority(
+        req.version(),
+        req.method() == hyper::Method::CONNECT,
+        req.uri().authority().map(|a| a.as_str()),
+        req.headers()
+            .get_all(hyper::header::HOST)
+            .iter()
+            .map(|v| v.as_bytes()),
+    ) {
+        Ok(host) => host,
+        Err(rejection) => {
+            warn!(method = %method, reason = rejection, "Rejected a request authority");
+            return Ok(to_hyper_response(
+                Error::BadRequest(rejection.to_string()).to_client_response(),
+                None,
+                &method,
+                req.uri().path(),
+            ));
+        }
+    };
 
     let mut armature_req = HttpRequest::new(method.clone(), target).with_peer(state.peer);
 
@@ -2345,6 +2587,11 @@ pub(crate) async fn handle_request(
             bytes::Bytes::copy_from_slice(value.as_bytes()),
         );
     }
+    if let Some(host) = host_from_authority {
+        armature_req
+            .headers
+            .append("host", bytes::Bytes::copy_from_slice(host.as_bytes()));
+    }
 
     let resolution = match admit(&mut armature_req, &state).await {
         Admission::Proceed(resolution) => resolution,
@@ -2363,9 +2610,13 @@ pub(crate) async fn handle_request(
         }
     };
 
-    // Read the body under the size cap and the slow-body policy.
+    // Read the body under the size cap, the slow-body policy and — on a
+    // multiplexed connection — the connection's shared body budget. The lease
+    // is held to the end of this function, because the bytes it accounts for
+    // live in the request until the handler is done with them.
+    let mut lease = BodyLease::on(state.body_budget.as_ref());
     let mut body = req.into_body();
-    let read = read_body(
+    let read = read_body_leased(
         |cx| {
             use hyper::body::Body as _;
             loop {
@@ -2383,6 +2634,7 @@ pub(crate) async fn handle_request(
         },
         state.max_body_size,
         state.body_read,
+        &mut lease,
     )
     .await;
     let body_bytes = match read {
@@ -2442,6 +2694,21 @@ fn body_read_rejection<E>(
                 "Request body not received in time"
             );
             body_timeout_response()
+        }
+        BodyReadError::Overloaded => {
+            warn!(
+                method = %method,
+                path = %path,
+                "Connection's request-body budget exhausted by concurrent streams"
+            );
+            let mut response = Error::ServiceUnavailable(
+                "too many concurrent request bodies on this connection".to_string(),
+            )
+            .to_client_response();
+            response
+                .headers
+                .insert("Retry-After".to_string(), "1".to_string());
+            response
         }
         BodyReadError::Source(_) => {
             warn!(method = %method, path = %path, "Failed to read request body");
@@ -2585,7 +2852,9 @@ pub(crate) async fn dispatch_via_h3<E: std::fmt::Display>(
         }
     };
 
-    match read_body(poll_body, state.max_body_size, state.body_read).await {
+    // Held to the end of the request; see `handle_request`.
+    let mut lease = BodyLease::on(state.body_budget.as_ref());
+    match read_body_leased(poll_body, state.max_body_size, state.body_read, &mut lease).await {
         Ok(body) => {
             if !body.is_empty() {
                 armature_req.set_body_bytes(body);
@@ -4317,6 +4586,168 @@ mod tests {
             // Long enough for several keep-alive pings to be scheduled.
             tokio::time::sleep(Duration::from_millis(150)).await;
         }
+    }
+
+    // ---- :authority and Host ------------------------------------------------
+
+    fn reconcile<'a>(
+        version: http::Version,
+        connect: bool,
+        authority: Option<&'a str>,
+        hosts: &[&'static str],
+    ) -> Result<Option<&'a str>, &'static str> {
+        reconcile_authority(
+            version,
+            connect,
+            authority,
+            hosts.iter().map(|h| h.as_bytes()),
+        )
+    }
+
+    #[test]
+    fn an_http2_authority_must_agree_with_host_and_fills_it_in() {
+        use http::Version;
+        for version in [Version::HTTP_2, Version::HTTP_3] {
+            assert_eq!(
+                reconcile(version, false, Some("api.example"), &[]),
+                Ok(Some("api.example")),
+                "Host comes from :authority when absent"
+            );
+            assert_eq!(
+                reconcile(
+                    version,
+                    false,
+                    Some("API.example:8443"),
+                    &["api.EXAMPLE:8443"]
+                ),
+                Ok(None),
+                "matching is case-insensitive"
+            );
+            assert!(reconcile(version, false, Some("api.example"), &["admin.example"]).is_err());
+            assert!(reconcile(version, false, Some("u@api.example"), &[]).is_err());
+            assert_eq!(reconcile(version, false, None, &["api.example"]), Ok(None));
+        }
+        assert!(
+            reconcile(Version::HTTP_2, false, None, &["a.example", "b.example"]).is_err(),
+            "two Host headers name two hosts"
+        );
+    }
+
+    #[test]
+    fn absolute_form_is_refused_on_http1_except_for_connect() {
+        use http::Version;
+        for version in [Version::HTTP_10, Version::HTTP_11] {
+            assert!(reconcile(version, false, Some("other.example"), &["test"]).is_err());
+            assert_eq!(reconcile(version, false, None, &["test"]), Ok(None));
+        }
+        assert_eq!(
+            reconcile(Version::HTTP_11, true, Some("db.example:5432"), &[]),
+            Ok(Some("db.example:5432"))
+        );
+    }
+
+    async fn echo_host(req: HttpRequest) -> Result<HttpResponse, Error> {
+        let host = req.headers.get("host").unwrap_or_default().to_owned();
+        Ok(HttpResponse::ok().with_body(host.into_bytes()))
+    }
+
+    /// Over a real h2c connection: the handler sees `:authority` as `Host`,
+    /// and a `Host` that contradicts it is refused.
+    #[tokio::test]
+    async fn h2c_carries_the_authority_into_host_and_refuses_a_mismatch() {
+        use http_body_util::{BodyExt, Empty};
+
+        let mut router = Router::new();
+        router.get("/host", echo_host);
+        let app = Application::new(Container::new(), router);
+        let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(app.serve_h2c(listener, None));
+
+        let stream = tokio::net::TcpStream::connect(addr).await.unwrap();
+        let (mut sender, conn) = hyper::client::conn::http2::handshake(
+            hyper_util::rt::TokioExecutor::new(),
+            TokioIo::new(stream),
+        )
+        .await
+        .expect("h2 handshake");
+        tokio::spawn(conn);
+
+        let request = Request::get("http://tenant.example/host")
+            .body(Empty::<Bytes>::new())
+            .unwrap();
+        let response = sender.send_request(request).await.unwrap();
+        assert_eq!(response.status(), 200);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        assert_eq!(&body[..], b"tenant.example");
+
+        let request = Request::get("http://tenant.example/host")
+            .header("host", "admin.example")
+            .body(Empty::<Bytes>::new())
+            .unwrap();
+        let response = sender.send_request(request).await.unwrap();
+        assert_eq!(response.status(), 400);
+    }
+
+    // ---- Multiplexed body budget ---------------------------------------------
+
+    fn chunks(
+        parts: Vec<&'static [u8]>,
+    ) -> impl FnMut(&mut Context<'_>) -> Poll<Option<Result<Bytes, std::io::Error>>> {
+        let mut parts = parts.into_iter();
+        move |_cx| Poll::Ready(parts.next().map(|c| Ok(Bytes::from_static(c))))
+    }
+
+    /// Concurrent streams on one connection share its budget: a second body
+    /// that would overrun it is refused while the first is held, and fits once
+    /// the first request is done.
+    #[tokio::test]
+    async fn concurrent_bodies_share_one_connection_budget() {
+        let budget = Arc::new(BodyBudget::new(10));
+        let policy = BodyReadPolicy::default();
+
+        let mut first = BodyLease::on(Some(&budget));
+        let body = read_body_leased(chunks(vec![b"12345", b"678"]), 100, policy, &mut first)
+            .await
+            .unwrap();
+        assert_eq!(&body[..], b"12345678");
+
+        let mut second = BodyLease::on(Some(&budget));
+        let refused = read_body_leased(chunks(vec![b"abc"]), 100, policy, &mut second).await;
+        assert!(matches!(refused, Err(BodyReadError::Overloaded)));
+        drop(second);
+
+        drop(first);
+        let mut third = BodyLease::on(Some(&budget));
+        let body = read_body_leased(chunks(vec![b"abcdefghij"]), 100, policy, &mut third)
+            .await
+            .unwrap();
+        assert_eq!(body.len(), 10);
+        drop(third);
+        assert_eq!(
+            budget.available.load(std::sync::atomic::Ordering::Acquire),
+            10,
+            "every lease hands its bytes back"
+        );
+    }
+
+    #[test]
+    fn an_exhausted_budget_is_a_retryable_503() {
+        let state = ServeState::for_test(
+            Arc::new(OptimizedRouter::from_router(&Router::new())),
+            DEFAULT_MAX_BODY_SIZE,
+        );
+        let response = body_read_rejection(
+            &BodyReadError::<std::io::Error>::Overloaded,
+            &crate::Method::from("POST"),
+            "/",
+            &state,
+        );
+        assert_eq!(response.status, 503);
+        assert_eq!(
+            response.headers.get("Retry-After").map(String::as_str),
+            Some("1")
+        );
     }
 
     // ---- H2: HTTP/3 goes through the shared pipeline ------------------------

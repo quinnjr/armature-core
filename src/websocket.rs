@@ -145,17 +145,97 @@ impl WebSocketRoom {
 }
 
 /// WebSocket manager for handling multiple rooms
+///
+/// Room names usually come from clients, so a manager that only ever adds
+/// rooms grows without bound. Prefer [`join_room`](Self::join_room) /
+/// [`leave_room`](Self::leave_room), which create a room on first join, drop
+/// it when its last connection leaves, and respect the
+/// [`with_max_rooms`](Self::with_max_rooms) cap. Joins and leaves are
+/// serialized on the manager's lock, so a room is never dropped while a
+/// concurrent join through the manager is adding to it.
 pub struct WebSocketManager {
     rooms: Arc<RwLock<HashMap<String, Arc<WebSocketRoom>>>>,
+    max_rooms: Option<usize>,
 }
 
 impl WebSocketManager {
     pub fn new() -> Self {
         Self {
             rooms: Arc::new(RwLock::new(HashMap::new())),
+            max_rooms: None,
         }
     }
 
+    /// Cap the number of live rooms. [`join_room`](Self::join_room) refuses to
+    /// create a room beyond it (joining an existing room is always allowed).
+    pub fn with_max_rooms(mut self, max_rooms: usize) -> Self {
+        self.max_rooms = Some(max_rooms);
+        self
+    }
+
+    /// Add a connection to `room`, creating the room if needed.
+    ///
+    /// Fails with [`Error::ServiceUnavailable`] when the room does not exist
+    /// and the [`with_max_rooms`](Self::with_max_rooms) cap is reached.
+    pub async fn join_room(
+        &self,
+        room: &str,
+        connection_id: String,
+        tx: broadcast::Sender<WebSocketMessage>,
+    ) -> Result<Arc<WebSocketRoom>, Error> {
+        let mut rooms = self.rooms.write().await;
+        let handle = match rooms.get(room) {
+            Some(existing) => existing.clone(),
+            None => {
+                if self.max_rooms.is_some_and(|max| rooms.len() >= max) {
+                    return Err(Error::ServiceUnavailable(
+                        "WebSocket room limit reached".to_string(),
+                    ));
+                }
+                let created = Arc::new(WebSocketRoom::new(room.to_string()));
+                rooms.insert(room.to_string(), created.clone());
+                created
+            }
+        };
+        handle.add_connection(connection_id, tx).await;
+        Ok(handle)
+    }
+
+    /// Remove a connection from `room`, dropping the room once it is empty.
+    pub async fn leave_room(&self, room: &str, connection_id: &str) {
+        let mut rooms = self.rooms.write().await;
+        if let Some(handle) = rooms.get(room).cloned() {
+            handle.remove_connection(connection_id).await;
+            if handle.connection_count().await == 0 {
+                rooms.remove(room);
+            }
+        }
+    }
+
+    /// Drop every room that has no connections left.
+    pub async fn prune_empty_rooms(&self) {
+        let mut rooms = self.rooms.write().await;
+        let mut empty = Vec::new();
+        for (name, room) in rooms.iter() {
+            if room.connection_count().await == 0 {
+                empty.push(name.clone());
+            }
+        }
+        for name in empty {
+            rooms.remove(&name);
+        }
+    }
+
+    /// Number of live rooms.
+    pub async fn room_count(&self) -> usize {
+        self.rooms.read().await.len()
+    }
+
+    /// Get a room, creating it if absent.
+    ///
+    /// Not subject to [`with_max_rooms`](Self::with_max_rooms) and never
+    /// removes rooms; with client-chosen names use
+    /// [`join_room`](Self::join_room) / [`leave_room`](Self::leave_room).
     pub async fn get_or_create_room(&self, name: &str) -> Arc<WebSocketRoom> {
         let mut rooms = self.rooms.write().await;
         rooms
@@ -181,7 +261,69 @@ impl Default for WebSocketManager {
     }
 }
 
+/// Recommended limits for a server-side WebSocket: 1 MiB per message and
+/// 64 KiB per frame.
+///
+/// tungstenite's defaults allow 64 MiB messages, so a peer can make the server
+/// buffer that much per connection. Pass this (or a tuned copy) when
+/// accepting, e.g. `tokio_tungstenite::accept_async_with_config(io,
+/// Some(recommended_config()))` or `WebSocketStream::from_raw_socket(io,
+/// Role::Server, Some(recommended_config()))`.
+pub fn recommended_config() -> tokio_tungstenite::tungstenite::protocol::WebSocketConfig {
+    tokio_tungstenite::tungstenite::protocol::WebSocketConfig::default()
+        .max_message_size(Some(1 << 20))
+        .max_frame_size(Some(64 << 10))
+}
+
+/// Whether the upgrade request's `Origin` header is in `allowed_origins`.
+///
+/// Browsers attach cookies to cross-site WebSocket handshakes and the same-
+/// origin policy does not apply to them, so a server relying on cookie auth
+/// must check `Origin` before upgrading (cross-site WebSocket hijacking).
+/// Origins are compared ASCII-case-insensitively as whole serialized origins
+/// (`scheme://host[:port]`, no trailing slash). A request without `Origin` is
+/// rejected: every browser sends it on a WebSocket handshake, so only
+/// non-browser clients omit it, and those should authenticate by other means.
+///
+/// ```
+/// use armature_core::HttpRequest;
+/// use armature_core::websocket::is_origin_allowed;
+///
+/// let mut req = HttpRequest::new("GET", "/ws");
+/// req.headers.insert("Origin", "https://app.example.com");
+/// assert!(is_origin_allowed(&req, &["https://app.example.com"]));
+/// assert!(!is_origin_allowed(&req, &["https://evil.example"]));
+/// ```
+pub fn is_origin_allowed(req: &crate::HttpRequest, allowed_origins: &[&str]) -> bool {
+    let Some(origin) = req.headers.get("origin").map(str::trim) else {
+        return false;
+    };
+    allowed_origins
+        .iter()
+        .any(|allowed| allowed.eq_ignore_ascii_case(origin))
+}
+
+/// Options for [`handle_websocket_with_options`].
+#[derive(Debug, Clone, Default)]
+pub struct WebSocketOptions {
+    /// Close the connection when no message (data, ping or pong) arrives from
+    /// the peer for this long. `None` (the default) waits forever, which lets
+    /// idle or half-open peers hold a connection and its task indefinitely.
+    pub idle_timeout: Option<std::time::Duration>,
+}
+
+impl WebSocketOptions {
+    /// Set the idle timeout.
+    pub fn idle_timeout(mut self, timeout: std::time::Duration) -> Self {
+        self.idle_timeout = Some(timeout);
+        self
+    }
+}
+
 /// Handle a WebSocket connection
+///
+/// Waits indefinitely for the peer; see [`handle_websocket_with_options`] to
+/// close idle connections.
 ///
 /// `connection_id` is not fed into `armature_core::connection_manager` —
 /// that module tracks connections under its own internally generated
@@ -207,11 +349,35 @@ where
     // a guard held across an `.await` stays on the thread while this task is
     // suspended, so every other task scheduled onto that thread would be
     // logged under this connection_id.
-    handle_connection(stream, handler).instrument(span).await
+    handle_connection(stream, WebSocketOptions::default(), handler)
+        .instrument(span)
+        .await
+}
+
+/// [`handle_websocket`] with [`WebSocketOptions`] (e.g. an idle timeout).
+///
+/// On idle timeout the handler is sent [`WebSocketMessage::Close`] for
+/// teardown, the closing handshake is attempted, and `Ok(())` is returned.
+pub async fn handle_websocket_with_options<S, F, Fut>(
+    stream: WebSocketStream<S>,
+    connection_id: String,
+    options: WebSocketOptions,
+    handler: F,
+) -> Result<(), Error>
+where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+    F: FnMut(WebSocketMessage) -> Fut,
+    Fut: std::future::Future<Output = Result<(), Error>>,
+{
+    let span = tracing::info_span!("websocket_connection", connection_id = %connection_id);
+    handle_connection(stream, options, handler)
+        .instrument(span)
+        .await
 }
 
 async fn handle_connection<S, F, Fut>(
     mut stream: WebSocketStream<S>,
+    options: WebSocketOptions,
     mut handler: F,
 ) -> Result<(), Error>
 where
@@ -220,7 +386,20 @@ where
     Fut: std::future::Future<Output = Result<(), Error>>,
 {
     // Handle incoming messages
-    while let Some(msg) = stream.next().await {
+    loop {
+        let next = match options.idle_timeout {
+            Some(limit) => match tokio::time::timeout(limit, stream.next()).await {
+                Ok(next) => next,
+                Err(_) => {
+                    tracing::debug!("WebSocket idle timeout; closing");
+                    let teardown = handler(WebSocketMessage::Close).await;
+                    let _ = stream.close(None).await;
+                    return teardown;
+                }
+            },
+            None => stream.next().await,
+        };
+        let Some(msg) = next else { break };
         match msg {
             Ok(msg) => {
                 if msg.is_close() {
@@ -273,6 +452,65 @@ mod tests {
         let client = WebSocketStream::from_raw_socket(client_io, Role::Client, None).await;
         let server = WebSocketStream::from_raw_socket(server_io, Role::Server, None).await;
         (client, server)
+    }
+
+    #[tokio::test]
+    async fn manager_drops_empty_rooms_and_caps_creation() {
+        let manager = WebSocketManager::new().with_max_rooms(1);
+        let (conn, _rx) = WebSocketConnection::new("c1".into());
+        manager
+            .join_room("a", "c1".into(), conn.tx.clone())
+            .await
+            .unwrap();
+        assert!(
+            manager
+                .join_room("b", "c1".into(), conn.tx.clone())
+                .await
+                .is_err(),
+            "a new room beyond the cap must be refused"
+        );
+        manager
+            .join_room("a", "c2".into(), conn.tx.clone())
+            .await
+            .unwrap();
+
+        manager.leave_room("a", "c1").await;
+        assert_eq!(manager.room_count().await, 1);
+        manager.leave_room("a", "c2").await;
+        assert_eq!(manager.room_count().await, 0, "empty room must be dropped");
+
+        manager.get_or_create_room("x").await;
+        manager.prune_empty_rooms().await;
+        assert_eq!(manager.room_count().await, 0);
+    }
+
+    #[tokio::test]
+    async fn idle_timeout_closes_connection() {
+        let (_client, server) = socket_pair().await;
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            handle_websocket_with_options(
+                server,
+                "idle".into(),
+                WebSocketOptions::default().idle_timeout(std::time::Duration::from_millis(50)),
+                |_msg| async { Ok(()) },
+            ),
+        )
+        .await
+        .expect("an idle connection must be closed by the idle timeout");
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn origin_allowlist() {
+        let mut req = crate::HttpRequest::new("GET", "/ws");
+        assert!(!is_origin_allowed(&req, &["https://a.example"]));
+        req.headers.insert("Origin", "HTTPS://A.example");
+        assert!(is_origin_allowed(&req, &["https://a.example"]));
+        assert!(!is_origin_allowed(&req, &["https://a.example.evil"]));
+        let cfg = recommended_config();
+        assert_eq!(cfg.max_message_size, Some(1 << 20));
+        assert_eq!(cfg.max_frame_size, Some(64 << 10));
     }
 
     #[test]

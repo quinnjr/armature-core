@@ -220,13 +220,33 @@ where
 }
 
 /// API key guard
+///
+/// Configured keys are held only as SHA-256 digests. Comparing fixed-length
+/// digests keeps the check constant-time with respect to the submitted key's
+/// *length* as well as its content, so a probe cannot learn how long any
+/// configured key is from an early length-mismatch return.
 pub struct ApiKeyGuard {
-    valid_keys: Vec<String>,
+    valid_key_digests: Vec<[u8; 32]>,
 }
 
 impl ApiKeyGuard {
+    /// Build a guard accepting any of `keys`.
+    ///
+    /// Empty strings are dropped: an empty configured key would otherwise
+    /// match an empty `X-API-Key` header and admit anyone. A guard left with
+    /// no keys rejects every request (fail closed).
     pub fn new(keys: Vec<String>) -> Self {
-        Self { valid_keys: keys }
+        let valid_key_digests = keys
+            .iter()
+            .filter(|k| !k.is_empty())
+            .map(|k| Self::digest(k.as_bytes()))
+            .collect();
+        Self { valid_key_digests }
+    }
+
+    fn digest(bytes: &[u8]) -> [u8; 32] {
+        use sha2::{Digest, Sha256};
+        Sha256::digest(bytes).into()
     }
 }
 
@@ -235,12 +255,14 @@ impl Guard for ApiKeyGuard {
     async fn can_activate(&self, context: &GuardContext) -> Result<bool, Error> {
         let api_key = context
             .get_header("x-api-key")
+            .filter(|k| !k.is_empty())
             .ok_or_else(|| Error::Forbidden("Missing API key".to_string()))?;
 
+        let presented = Self::digest(api_key.as_bytes());
         // Constant-time per key, and every key is compared: an early exit
-        // would leak which configured key shares a prefix with the guess.
-        let matched = self.valid_keys.iter().fold(false, |found, k| {
-            crate::crypto::constant_time_eq(k.as_bytes(), api_key.as_bytes()) | found
+        // would leak which configured key matched.
+        let matched = self.valid_key_digests.iter().fold(false, |found, k| {
+            crate::crypto::constant_time_eq(k, &presented) | found
         });
         if matched {
             Ok(true)
@@ -507,7 +529,58 @@ mod tests {
     fn test_api_key_guard_creation() {
         let keys = vec!["key1".to_string(), "key2".to_string()];
         let guard = ApiKeyGuard::new(keys.clone());
-        assert_eq!(guard.valid_keys, keys);
+        assert_eq!(guard.valid_key_digests.len(), keys.len());
+    }
+
+    fn api_key_context(key: Option<&str>) -> GuardContext {
+        let mut headers = HashMap::new();
+        if let Some(key) = key {
+            headers.insert("x-api-key".to_string(), key.to_string());
+        }
+        GuardContext::new(HttpRequest::from_parts(
+            "GET",
+            "/test".to_string(),
+            headers,
+            vec![],
+            HashMap::new(),
+            HashMap::new(),
+        ))
+    }
+
+    #[tokio::test]
+    async fn test_api_key_guard_empty_configured_key_never_matches() {
+        let guard = ApiKeyGuard::new(vec![String::new(), "real".to_string()]);
+        assert_eq!(guard.valid_key_digests.len(), 1);
+        assert!(
+            guard
+                .can_activate(&api_key_context(Some("")))
+                .await
+                .is_err()
+        );
+        assert!(guard.can_activate(&api_key_context(None)).await.is_err());
+        assert!(
+            guard
+                .can_activate(&api_key_context(Some("real")))
+                .await
+                .is_ok()
+        );
+    }
+
+    #[tokio::test]
+    async fn test_api_key_guard_with_only_empty_keys_fails_closed() {
+        let guard = ApiKeyGuard::new(vec![String::new()]);
+        assert!(
+            guard
+                .can_activate(&api_key_context(Some("")))
+                .await
+                .is_err()
+        );
+        assert!(
+            guard
+                .can_activate(&api_key_context(Some("x")))
+                .await
+                .is_err()
+        );
     }
 
     #[test]

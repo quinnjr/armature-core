@@ -392,7 +392,33 @@ pub enum RouteSegment {
     CatchAll(String),
 }
 
+/// A pattern segment with parameter names erased, for duplicate detection.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+enum SegmentShape<'a> {
+    Static(&'a str),
+    Param,
+    CatchAll,
+}
+
 impl CompiledRoute {
+    /// The pattern with parameter names erased.
+    fn shape(&self) -> Vec<SegmentShape<'_>> {
+        self.segments
+            .iter()
+            .map(|segment| match segment {
+                RouteSegment::Static(s) => SegmentShape::Static(s),
+                RouteSegment::Param(_) => SegmentShape::Param,
+                RouteSegment::CatchAll(_) => SegmentShape::CatchAll,
+            })
+            .collect()
+    }
+
+    /// Whether two patterns match exactly the same paths: equal segment by
+    /// segment, with parameter names ignored.
+    fn same_pattern(&self, other: &CompiledRoute) -> bool {
+        self.segments.len() == other.segments.len() && self.shape().into_iter().eq(other.shape())
+    }
+
     /// Compile a route pattern.
     pub fn compile(pattern: &str) -> Self {
         let mut segments = Vec::new();
@@ -558,27 +584,96 @@ impl OptimizedRouter {
     }
 
     /// Add a route.
+    ///
+    /// First-registered-wins, exactly as [`from_router`](Self::from_router)
+    /// and the linear [`Router`]: a later registration for a method and path
+    /// an earlier route already answers is unreachable there. A duplicate
+    /// method+pattern registration is logged at `warn` (see
+    /// [`duplicate_routes`](Self::duplicate_routes)).
     pub fn add_route(
         &mut self,
         method: HttpMethod,
         path: impl Into<String>,
         handler: BoxedHandler,
     ) {
-        let path = path.into();
-        let compiled = CompiledRoute::compile(&path);
+        self.push_route(method, &path.into(), handler, None);
+    }
+
+    /// Append one route, keeping the static fast path first-registered-wins.
+    fn push_route(
+        &mut self,
+        method: HttpMethod,
+        path: &str,
+        handler: BoxedHandler,
+        constraints: Option<RouteConstraints>,
+    ) {
+        let compiled = CompiledRoute::compile(path);
         let route_index = self.routes.len();
 
-        // Add to static routes if applicable
+        if let Some(earlier) = self
+            .routes
+            .iter()
+            .position(|r| r.method == method && r.compiled.same_pattern(&compiled))
+        {
+            // Not silently: when two modules register the same method+path,
+            // whichever registered first answers it, guards and all — so an
+            // unguarded controller imported ahead of a guarded one exposes the
+            // guarded route. `Router` registration can't fail, so this is
+            // surfaced here and through `duplicate_routes` for bootstrap.
+            tracing::warn!(
+                method = method.as_str(),
+                path,
+                earlier = %self.routes[earlier].compiled.pattern,
+                "duplicate route registration: the earlier route answers this \
+                 method and path, the later one is unreachable"
+            );
+        }
+
+        // Only take the O(1) static fast path when no earlier route shadows
+        // this concrete path. `matches` handles static, `:param`, and
+        // `*catch_all` earlier routes, so precedence is identical to the
+        // linear first-match scan. (Inserting unconditionally used to let a
+        // later exact duplicate overwrite the earlier one's slot.)
         if compiled.is_static {
-            self.static_routes.add(method.clone(), &path, route_index);
+            let shadowed_by_earlier = self
+                .routes
+                .iter()
+                .any(|earlier| earlier.method == method && earlier.compiled.matches(path));
+            if !shadowed_by_earlier {
+                self.static_routes.add(method.clone(), path, route_index);
+            }
         }
 
         self.routes.push(OptimizedRoute {
             method,
             compiled,
             handler,
-            constraints: None,
+            constraints,
         });
+    }
+
+    /// Every registration that repeats an earlier route's method and pattern,
+    /// as `(earlier_index, later_index)` pairs in registration order.
+    ///
+    /// Parameter names don't distinguish patterns (`/u/:id` and `/u/:uid` are
+    /// duplicates); an overlap that is not an exact repeat (`/u/:id` then
+    /// `/u/me`) is not reported. The later route of each pair is never
+    /// dispatched. Meant for bootstrap to refuse such a route table rather
+    /// than let registration order decide which handler — and which guards —
+    /// answer a path.
+    pub fn duplicate_routes(&self) -> Vec<(usize, usize)> {
+        let mut first_seen: HashMap<(&str, Vec<SegmentShape<'_>>), usize> = HashMap::new();
+        let mut duplicates = Vec::new();
+        for (index, route) in self.routes.iter().enumerate() {
+            let key = (route.method.as_str(), route.compiled.shape());
+            match first_seen.get(&key) {
+                Some(&earlier) => duplicates.push((earlier, index)),
+                None => {
+                    first_seen.insert(key, index);
+                }
+            }
+        }
+        duplicates
     }
 
     /// Build an `OptimizedRouter` from a fully-populated linear [`Router`].
@@ -602,29 +697,12 @@ impl OptimizedRouter {
         let mut opt = Self::new();
 
         for route in &router.routes {
-            let compiled = CompiledRoute::compile(&route.path);
-            let route_index = opt.routes.len();
-
-            // Only take the O(1) static fast path when no earlier route shadows
-            // this concrete path. `matches` handles static, `:param`, and
-            // `*catch_all` earlier routes, so precedence is identical to the
-            // linear first-match scan.
-            if compiled.is_static {
-                let shadowed_by_earlier = opt.routes.iter().any(|earlier| {
-                    earlier.method == route.method && earlier.compiled.matches(&route.path)
-                });
-                if !shadowed_by_earlier {
-                    opt.static_routes
-                        .add(route.method.clone(), &route.path, route_index);
-                }
-            }
-
-            opt.routes.push(OptimizedRoute {
-                method: route.method.clone(),
-                compiled,
-                handler: route.handler.clone(),
-                constraints: route.constraints.clone(),
-            });
+            opt.push_route(
+                route.method.clone(),
+                &route.path,
+                route.handler.clone(),
+                route.constraints.clone(),
+            );
         }
 
         opt
@@ -1473,5 +1551,44 @@ mod tests {
         assert!(cache.get(&key2).is_some());
         assert!(cache.get(&key3).is_some());
         assert_eq!(cache.len(), 3);
+    }
+
+    // ---- Duplicate registrations ------------------------------------------
+
+    fn status_handler(status: u16) -> BoxedHandler {
+        crate::handler::handler(move |_req: HttpRequest| async move {
+            Ok::<_, Error>(HttpResponse::new(status))
+        })
+    }
+
+    /// `add_route` must agree with `from_router` and the linear router: the
+    /// first registration of a method+path wins. The static fast path used to
+    /// overwrite its slot, handing the path to the *last* registration — so a
+    /// later, unguarded duplicate could take over a guarded route.
+    #[tokio::test]
+    async fn test_add_route_duplicate_static_first_wins() {
+        let mut router = OptimizedRouter::new();
+        router.add_route(HttpMethod::GET, "/admin", status_handler(200));
+        router.add_route(HttpMethod::GET, "/admin", status_handler(500));
+        let resp = router
+            .route(HttpRequest::new("GET", "/admin"))
+            .await
+            .unwrap();
+        assert_eq!(resp.status, 200, "the first registration must win");
+    }
+
+    /// Duplicate method+pattern registrations are reported so bootstrap can
+    /// refuse them; parameter names don't make two patterns different, and a
+    /// mere overlap (a param route shadowing a static one) is not a duplicate.
+    #[test]
+    fn test_duplicate_routes_reported() {
+        let mut router = OptimizedRouter::new();
+        router.add_route(HttpMethod::GET, "/admin", status_handler(200));
+        router.add_route(HttpMethod::GET, "/u/:id", status_handler(200));
+        router.add_route(HttpMethod::POST, "/admin", status_handler(200));
+        router.add_route(HttpMethod::GET, "admin/", status_handler(200));
+        router.add_route(HttpMethod::GET, "/u/:uid", status_handler(200));
+        router.add_route(HttpMethod::GET, "/u/me", status_handler(200));
+        assert_eq!(router.duplicate_routes(), vec![(0, 3), (1, 4)]);
     }
 }

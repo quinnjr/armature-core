@@ -25,10 +25,10 @@
 
 use crate::application::{ServeState, dispatch_via_h1};
 use crate::h1_backend::h2_fallback::HyperH2;
+use crate::http2::H2ConnectionServer;
 use crate::logging::{error, info};
 use crate::pipeline::PipelineConfig;
 use armature_h1::{Config, Limits, Server, ServerHandle, TcpConfig};
-use hyper_util::rt::TokioExecutor;
 use std::net::SocketAddr;
 use std::time::Duration;
 
@@ -176,10 +176,12 @@ pub(crate) fn h1_config(
 /// Serve `cfg` with `state` until shutdown, without blocking the caller's
 /// runtime.
 ///
-/// `h2` is the HTTP/2 builder for connections `armature-h1` classifies as
-/// HTTP/2 — reached via ALPN when TLS is configured on `cfg`, or via the h2c
-/// preface when `cfg.detect_h2c` is set. Pass `None` to close them instead,
-/// which is what a plain HTTP/1 listener wants.
+/// `h2` serves the connections `armature-h1` classifies as HTTP/2 — reached
+/// via ALPN when TLS is configured on `cfg`, or via the h2c preface when
+/// `cfg.detect_h2c` is set — with hyper's driver under the same preface and
+/// idle deadlines as every other HTTP/2 listener (see
+/// [`H2ConnectionServer`]). Pass `None` to close them instead, which is what a
+/// plain HTTP/1 listener wants.
 ///
 /// Dropping this future stops the server. That is worth stating because it is
 /// not what cancelling a future normally achieves here: `armature-h1`'s workers
@@ -192,7 +194,7 @@ pub(crate) fn h1_config(
 pub(crate) async fn serve(
     cfg: Config,
     state: ServeState,
-    h2: Option<hyper::server::conn::http2::Builder<TokioExecutor>>,
+    h2: Option<H2ConnectionServer>,
 ) -> Result<(), crate::Error> {
     serve_bound(cfg, state, h2, |_, _| {}).await
 }
@@ -209,7 +211,7 @@ pub(crate) async fn serve(
 pub(crate) async fn serve_bound(
     cfg: Config,
     state: ServeState,
-    h2: Option<hyper::server::conn::http2::Builder<TokioExecutor>>,
+    h2: Option<H2ConnectionServer>,
     on_bound: impl FnOnce(SocketAddr, ServerHandle),
 ) -> Result<(), crate::Error> {
     // Read before `cfg` moves into `bind`, so a failure can name the address it
@@ -248,7 +250,7 @@ pub(crate) async fn serve_bound(
     // `Server::serve` blocks until shutdown, and blocking a runtime worker
     // would stall every other task the caller has running.
     let joined = tokio::task::spawn_blocking(move || match h2 {
-        Some(builder) => server.serve_with_fallback(
+        Some(h2) => server.serve_with_fallback(
             {
                 let state = state.clone();
                 move || {
@@ -256,7 +258,7 @@ pub(crate) async fn serve_bound(
                     move |req| dispatch_via_h1(req, state.clone())
                 }
             },
-            move || HyperH2::new(state.clone(), builder.clone()),
+            move || HyperH2::new(state.clone(), h2.clone()),
         ),
         None => server.serve({
             let state = state.clone();

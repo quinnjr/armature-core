@@ -49,22 +49,79 @@ impl ServerSentEvent {
         }
     }
 
+    /// Check that `id` and `event` can be serialized without alteration.
+    ///
+    /// A CR or LF in either field would end the field early and let the rest
+    /// of the value be parsed as further SSE fields (e.g. a forged `event:` or
+    /// `data:` line); a NUL in `id` makes browsers ignore the id entirely.
+    /// [`to_string`](Self::to_string) strips those characters regardless, so
+    /// this is for callers that would rather reject such input than send a
+    /// silently altered value.
+    pub fn validate(&self) -> Result<(), Error> {
+        if let Some(ref id) = self.id
+            && id.contains(['\r', '\n', '\0'])
+        {
+            return Err(Error::Validation(
+                "SSE id must not contain CR, LF or NUL".to_string(),
+            ));
+        }
+        if let Some(ref event) = self.event
+            && event.contains(['\r', '\n'])
+        {
+            return Err(Error::Validation(
+                "SSE event type must not contain CR or LF".to_string(),
+            ));
+        }
+        Ok(())
+    }
+
     /// Convert to SSE format string
+    ///
+    /// Single-line fields (`id`, `event`) have CR/LF (and NUL, for `id`)
+    /// removed so a value cannot inject additional fields. `data` is split on
+    /// every line terminator the SSE grammar recognizes (`\r\n`, `\r`, `\n`)
+    /// and each piece is emitted as its own `data:` line, which the client
+    /// rejoins with `\n`.
     #[allow(clippy::inherent_to_string)]
     pub fn to_string(&self) -> String {
         let mut output = String::new();
 
         if let Some(ref id) = self.id {
-            output.push_str(&format!("id: {}\n", id));
+            output.push_str("id: ");
+            output.extend(id.chars().filter(|c| !matches!(c, '\r' | '\n' | '\0')));
+            output.push('\n');
         }
 
         if let Some(ref event) = self.event {
-            output.push_str(&format!("event: {}\n", event));
+            output.push_str("event: ");
+            output.extend(event.chars().filter(|c| !matches!(c, '\r' | '\n')));
+            output.push('\n');
         }
 
-        // Handle multi-line data
-        for line in self.data.lines() {
-            output.push_str(&format!("data: {}\n", line));
+        // `str::lines` only splits on `\n` (and `\r\n`), so a bare `\r` would
+        // pass through and be read by the client as a line break, starting a
+        // new, attacker-chosen field.
+        let mut rest = self.data.as_str();
+        loop {
+            match rest.find(['\r', '\n']) {
+                Some(pos) => {
+                    output.push_str("data: ");
+                    output.push_str(&rest[..pos]);
+                    output.push('\n');
+                    let skip = if rest[pos..].starts_with("\r\n") {
+                        2
+                    } else {
+                        1
+                    };
+                    rest = &rest[pos + skip..];
+                }
+                None => {
+                    output.push_str("data: ");
+                    output.push_str(rest);
+                    output.push('\n');
+                    break;
+                }
+            }
         }
 
         if let Some(retry) = self.retry {
@@ -218,6 +275,36 @@ impl Default for SseBroadcaster {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_sse_data_bare_cr_does_not_inject_field() {
+        let ev = ServerSentEvent::new("a\rb".to_string());
+        assert_eq!(ev.to_string(), "data: a\ndata: b\n\n");
+    }
+
+    #[test]
+    fn test_sse_data_splits_all_line_terminators() {
+        let ev = ServerSentEvent::new("a\r\nb\nc\rd".to_string());
+        assert_eq!(ev.to_string(), "data: a\ndata: b\ndata: c\ndata: d\n\n");
+    }
+
+    #[test]
+    fn test_sse_event_and_id_newlines_are_stripped() {
+        let ev = ServerSentEvent {
+            id: Some("1\r\nretry: 1\0".to_string()),
+            event: Some("x\nevent: y".to_string()),
+            data: "d".to_string(),
+            retry: None,
+        };
+        let out = ev.to_string();
+        assert_eq!(out, "id: 1retry: 1\nevent: xevent: y\ndata: d\n\n");
+        assert!(ev.validate().is_err());
+        assert!(
+            ServerSentEvent::with_event("ok".into(), "a\nb".into())
+                .validate()
+                .is_ok()
+        );
+    }
 
     #[tokio::test]
     async fn test_broadcast_does_not_block_on_stalled_client() {

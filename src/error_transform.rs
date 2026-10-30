@@ -50,7 +50,14 @@ use std::sync::{Arc, LazyLock};
 /// with its replacement string. Behaviour is identical to compiling the same
 /// patterns per-call; only the compilation cost is amortized.
 static SENSITIVE_PATTERNS: LazyLock<Vec<(regex::Regex, &'static str)>> = LazyLock::new(|| {
-    let patterns: [(&str, &str); 9] = [
+    let patterns: [(&str, &str); 10] = [
+        // JSON members whose key names a credential: `"password": "x"`.
+        // The key-only patterns below need `=`/`:` right after the key, so a
+        // quoted JSON key would slip past them.
+        (
+            r#""([a-z0-9_-]*(?:password|passwd|pwd|secret|token|api[_-]?key|apikey)[a-z0-9_-]*)"\s*:\s*"(?:[^"\\]|\\.)*""#,
+            r#""$1":"[FILTERED]""#,
+        ),
         // Passwords
         (r"password[=:]\s*\S+", "password=[FILTERED]"),
         (r"pwd[=:]\s*\S+", "pwd=[FILTERED]"),
@@ -80,6 +87,21 @@ static SENSITIVE_PATTERNS: LazyLock<Vec<(regex::Regex, &'static str)>> = LazyLoc
         })
         .collect()
 });
+
+/// Replace credentials and common PII in `s` with `[FILTERED]` markers, using
+/// [`SENSITIVE_PATTERNS`].
+///
+/// Best-effort: it recognizes `key=value`, `key: value` and JSON
+/// `"key": "value"` shapes for password/secret/token/API-key names, bearer
+/// tokens, and card/SSN-like digit runs. It is not a guarantee that arbitrary
+/// payloads are free of secrets.
+pub(crate) fn redact_sensitive(s: &str) -> String {
+    let mut result = s.to_string();
+    for (regex, replacement) in SENSITIVE_PATTERNS.iter() {
+        result = regex.replace_all(&result, *replacement).to_string();
+    }
+    result
+}
 
 // ============================================================================
 // Error Response Types
@@ -228,10 +250,9 @@ impl ErrorResponse {
     /// Convert to JSON string.
     pub fn to_json(&self) -> String {
         serde_json::to_string_pretty(self).unwrap_or_else(|_| {
-            format!(
-                r#"{{"status":{},"message":"{}"}}"#,
-                self.status, self.message
-            )
+            // Built with `json!` so a quote or backslash in the message cannot
+            // break out of its string and forge fields.
+            serde_json::json!({ "status": self.status, "message": self.message }).to_string()
         })
     }
 
@@ -843,7 +864,13 @@ impl ErrorContext {
     /// Create error context from a request.
     pub fn from_request(request: HttpRequest) -> Self {
         // Lookup is case-insensitive, so the second spelling was redundant.
-        let request_id = request.headers.get("x-request-id").map(str::to_owned);
+        // Echoed into error bodies, so a client-chosen ID is only adopted
+        // when it is well-formed.
+        let request_id = request
+            .headers
+            .get("x-request-id")
+            .filter(|id| crate::headers::is_valid_request_id(id))
+            .map(str::to_owned);
 
         Self {
             request,
@@ -1054,13 +1081,7 @@ impl ErrorTransformer {
     /// Uses the module-level [`SENSITIVE_PATTERNS`] regexes, which are compiled
     /// once on first use rather than on every call.
     fn filter_sensitive_string(&self, s: &str) -> String {
-        let mut result = s.to_string();
-
-        for (regex, replacement) in SENSITIVE_PATTERNS.iter() {
-            result = regex.replace_all(&result, *replacement).to_string();
-        }
-
-        result
+        redact_sensitive(s)
     }
 
     /// Default error transformation.

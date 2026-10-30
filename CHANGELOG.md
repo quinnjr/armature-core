@@ -10,6 +10,34 @@ Changes at or before `0.6.0` are recorded in the workspace
 
 ## [Unreleased]
 
+### Security
+
+- **`ModuleRegistry` binds module guards to the module's routes.** `ModuleRegistry::register_module` registered controller routes with no guards attached and only logged a guard factory failure; it now layers each module's guards onto that module's routes exactly as `Application::register_module` does, and a guard that cannot be built aborts registration. `ModuleRegistry::guards()` is deprecated.
+- **HTTP/2 connections are time-bounded.** h2c, HTTPS+h2 and the armature-h1 ALPN fallback close a connection with no request within 10 s, and with GOAWAY after `keep_alive_timeout` with no stream in flight; a silent or PING-only peer previously held a connection slot forever. Every hyper-served socket enforces `PipelineConfig::write_timeout`.
+- **Per-connection body budget.** HTTP/2 and HTTP/3 streams draw buffered request bodies from one per-connection budget (default twice the body cap, `Http2Config::max_buffered_body_bytes`); a stream that would exceed it is answered `503`, ending the `max_concurrent_streams` × body-cap amplification.
+- **HTTP/3.** The listener negotiates `h3` over ALPN (handshakes previously failed); 0-RTT is off in every preset, and when enabled unconfirmed early requests are limited to safe methods (`425` otherwise) and marked `Early-Data: 1`; QUIC connections are capped at `max_connections`; server keep-alive is off and idle connections are closed; request header sections are capped at 16 KiB (`Http3Config::max_field_section_size`).
+- **`:authority` and `Host` must agree.** HTTP/2, HTTP/3 and `micro` answer `400` when they differ and fill `Host` in from `:authority` when it is missing. Hyper HTTP/1.1 paths refuse absolute-form targets, as armature-h1 does.
+- **Response cache.** `Vary` is read case-insensitively across every header line, `Vary: *` is never stored, responses to `Authorization` requests are stored only when `public` or `s-maxage` (no longer on `must-revalidate`, since this cache never revalidates), the key includes the normalized `Host` (new `CacheKey::authority`; a duplicate `Host` bypasses the cache), and `206` is no longer cacheable by default.
+- **`CacheInterceptor`** bypasses requests carrying `Authorization` or `Cookie`, refuses `no-cache` responses, keys on `Host`, and is bounded (1024 entries by default, `with_capacity`).
+- **SSE field injection.** `ServerSentEvent` strips CR/LF from `id`/`event` (and NUL from `id`) and splits `data` on every line terminator, including a bare CR; `validate()` lets callers reject such input instead.
+- **Static assets.** Hidden files and directories (`/.env`, `/.git/…`) are `404` unless `serve_hidden` is set (`.well-known` is always served); files over `max_serve_size` are never read whole — `serve_streaming()` streams them and `serve()` refuses them; on-the-fly compression runs off the runtime, capped at 1 MiB and 4 at a time; the content cache is also bounded by bytes (`cache_max_bytes`); text types carry `charset=utf-8`, every file carries `X-Content-Type-Options: nosniff`, SVG carries a restrictive CSP, and ETags are SHA-256 based.
+- **Multipart.** RFC 2046 delimiter matching (line start only), quote-aware parameters, duplicate parameters/headers rejected, case-insensitive header names, a 1–70 character boundary, and part-count / header-size limits. `FormFile::safe_filename()` and `save_into()` (contained, never overwrites) are added; `filename` is documented as untrusted and `extension()` is `None` without a dot.
+- **Repeated query/form keys resolve to the first value in every API** (`QueryView`, `Query<T>`, `parse_form`, `parse_form_map`, `MultipartParser::to_map`), so a guard and a handler can no longer see different values.
+- **Secrets out of logs, `Debug` and error bodies.** Query strings are no longer logged (`zero_cost::LoggingService`, `LoggingInterceptor` — now `tracing` instead of `println!` —, `micro::Logger`, router/handler debug logs) or echoed by exception filters; `HttpRequest`, `QueryParams`, header extractors and `zero_cost` header types redact in `Debug`; the sensitive-header list is extended; deserialization errors from query, path and form extractors no longer expose serde detail to clients or input values to logs.
+- **Correlation and request IDs.** Trace, span and correlation IDs come from the OS CSPRNG (previously a time-seeded LCG); inbound IDs are accepted only if they match `[A-Za-z0-9._-]{1,128}` and `traceparent` is validated per W3C; `X-Session-ID` is no longer read from clients; a malformed `X-Request-ID` is replaced rather than reflected.
+- **`ApiKeyGuard`** ignores empty configured keys, rejects an empty header, and compares SHA-256 digests in constant time so key lengths do not leak.
+- **BREACH.** `CompressionMiddleware` and `micro::Compress` skip responses that set cookies or carry `Cache-Control: no-store`/`private` (`skip_when` overrides).
+- **Smaller fixes.** NaN/infinite `q` values are invalid in content negotiation; body-limit route prefixes match on segment boundaries; `JsonStreamSender::send_raw` rejects interior line breaks; ETag parsing follows RFC 9110; duplicate route registrations are logged and reported by `OptimizedRouter::duplicate_routes()`, and the static fast path is first-registration-wins; HMR is off by default in release builds; health indicators are time-bounded and have a summary-only mode; WebSocket rooms are reclaimed and can be capped, with idle-timeout and Origin-allowlist helpers; TLS warns on group/other-readable key files and on self-signed certificates.
+
+### Added
+
+- `HttpResponse::redirect_local`, `HttpRequest::client_address_trusted` / `client_address_trusted_by`, and `listen_https_on`, `listen_h2c_on`, `listen_https_h2_on`, `listen_h3_on`, `listen_dual_stack_on`.
+
+### Changed
+
+- **Breaking:** new public fields on `StaticAssetsConfig`, `CompressionConfig`, `CacheKey`, `Http2Config` and `Http3Config` break struct-literal construction; `Http3Server::from_state` takes `max_connections`. `serve()` answers `500` for files above `max_serve_size` — use `serve_streaming()` or raise the limit. Multipart bodies must use CRLF line endings.
+- Dependencies are server-only and ring-only: hyper drops `full`, tokio-tungstenite drops `connect`, rustls/tokio-rustls/quinn drop their default features (no aws-lc, no platform verifier). `Cargo.lock` is committed and CI builds `--locked`; `cargo deny` runs in CI and weekly; cargo-husky is removed (enable the hooks with `git config core.hooksPath .cargo-husky/hooks`).
+
 ## [0.12.0] - 2026-10-29
 
 ### Changed

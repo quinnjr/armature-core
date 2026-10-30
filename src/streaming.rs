@@ -141,8 +141,11 @@ impl ByteStream {
     }
 
     /// Create a new byte stream with custom buffer size.
+    ///
+    /// A size of `0` is treated as `1`: `mpsc::channel(0)` panics, and a
+    /// caller-supplied size should not be able to take the task down.
     pub fn with_buffer_size(size: usize) -> (Self, ByteStreamSender) {
-        let (sender, receiver) = mpsc::channel(size);
+        let (sender, receiver) = mpsc::channel(size.max(1));
         let bytes_sent = Arc::new(AtomicU64::new(0));
         (Self { receiver }, ByteStreamSender { sender, bytes_sent })
     }
@@ -312,8 +315,20 @@ impl JsonStreamSender {
     }
 
     /// Send a raw JSON string (must be valid JSON).
+    ///
+    /// The string must be a single NDJSON record: an interior `\n` or `\r`
+    /// would end the record early and let the remainder be read as a second,
+    /// attacker-shaped record, so such input is rejected rather than sent.
+    /// Leading and trailing whitespace (including a trailing newline) is
+    /// trimmed first.
     pub async fn send_raw(&self, json: &str) -> Result<(), Error> {
-        self.inner.send(format!("{}\n", json.trim())).await?;
+        let json = json.trim();
+        if json.contains(['\n', '\r']) {
+            return Err(Error::Serialization(
+                "raw NDJSON record must not contain a line break".to_string(),
+            ));
+        }
+        self.inner.send(format!("{}\n", json)).await?;
         self.items_sent.fetch_add(1, Ordering::Relaxed);
         Ok(())
     }
@@ -863,6 +878,36 @@ mod tests {
             .expect("wait_if_paused should resume after ack")
             .unwrap();
         assert!(!controller.is_paused());
+    }
+
+    #[tokio::test]
+    async fn zero_buffer_size_is_clamped_not_a_panic() {
+        let (mut stream, sender) = ByteStream::with_buffer_size(0);
+        let (_json, _json_sender) = JsonStream::with_buffer_size(0);
+        let (_text, _text_sender) = TextStream::with_buffer_size(0);
+        tokio::spawn(async move {
+            sender.send(b"x".to_vec()).await.unwrap();
+            sender.close().await;
+        });
+        assert_eq!(&stream.next().await.unwrap().unwrap()[..], b"x");
+    }
+
+    #[tokio::test]
+    async fn send_raw_rejects_interior_line_breaks() {
+        let (mut stream, sender) = JsonStream::new();
+        assert!(
+            sender
+                .send_raw("{\"a\":1}\n{\"admin\":true}")
+                .await
+                .is_err()
+        );
+        assert!(sender.send_raw("{\"a\":\r1}").await.is_err());
+        // A trailing newline is just whitespace and still accepted.
+        sender.send_raw("{\"a\":1}\n").await.unwrap();
+        sender.close().await;
+        assert_eq!(&stream.next().await.unwrap().unwrap()[..], b"{\"a\":1}\n");
+        assert!(stream.next().await.is_none());
+        assert_eq!(sender.items_sent(), 1);
     }
 
     #[tokio::test]

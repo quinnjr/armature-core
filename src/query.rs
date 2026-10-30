@@ -4,6 +4,18 @@
 //! `HashMap<String, String>` on every request that had one, whether or not any
 //! handler read it. This parses on first access and memoizes, so a handler that
 //! ignores the query pays nothing beyond carrying the raw bytes it already had.
+//!
+//! # Repeated keys: the first one wins
+//!
+//! `?role=user&role=admin` is ambiguous, and if one layer (say, an auth check
+//! reading [`QueryView::get`]) took the first value while another (the handler's
+//! `Query<T>` or a `HashMap` copy) took the last, an attacker could show each
+//! layer a different value. Every single-value view of urlencoded input in this
+//! crate therefore resolves a repeated key to its **first** occurrence:
+//! [`QueryView::get`], [`QueryView::to_hash_map`], the `Query<T>` extractor,
+//! [`crate::form::parse_form`], [`crate::form::parse_form_map`], and
+//! [`crate::form::MultipartParser::to_map`]. Use [`QueryView::get_all`] when
+//! every value is wanted.
 
 use smallvec::SmallVec;
 use std::borrow::Cow;
@@ -74,10 +86,14 @@ impl<'a> QueryView<'a> {
     /// An owned copy, for the call sites that genuinely need one.
     ///
     /// This is the allocation the lazy path exists to avoid — reach for it only
-    /// when a `HashMap` is actually required. Repeated keys collapse to the last
-    /// one, matching `HashMap`'s own insert semantics.
+    /// when a `HashMap` is actually required. Repeated keys collapse to the
+    /// *first* one, agreeing with [`get`](Self::get) (see the module docs).
     pub fn to_hash_map(&self) -> HashMap<String, String> {
-        self.pairs.iter().cloned().collect()
+        let mut map = HashMap::with_capacity(self.pairs.len());
+        for (k, v) in self.pairs {
+            map.entry(k.clone()).or_insert_with(|| v.clone());
+        }
+        map
     }
 }
 
@@ -94,6 +110,48 @@ impl<'a> IntoIterator for QueryView<'a> {
         }
         self.pairs.iter().map(as_strs as fn(_) -> _)
     }
+}
+
+/// Reduce urlencoded `input` to the first occurrence of each key, so serde
+/// deserialization (whose `HashMap`s keep the last value and whose structs
+/// reject duplicates) agrees with the crate-wide first-wins rule.
+///
+/// Borrows `input` unchanged in the common case of no repeated key; only input
+/// that actually repeats a key (or whose keys need decoding to tell) is
+/// re-encoded. Errors carry serde's message, for the caller to log.
+pub(crate) fn first_wins_urlencoded(input: &[u8]) -> Result<Cow<'_, [u8]>, String> {
+    // Fast path on the raw keys. A key with an escape or `+` could equal
+    // another only after decoding, so those take the slow path.
+    let mut keys: SmallVec<[&[u8]; 16]> = SmallVec::new();
+    let mut needs_decode = false;
+    for pair in input.split(|&b| b == b'&') {
+        if pair.is_empty() {
+            continue;
+        }
+        let key = pair.split(|&b| b == b'=').next().unwrap_or(pair);
+        if key.iter().any(|&b| b == b'%' || b == b'+') {
+            needs_decode = true;
+            break;
+        }
+        keys.push(key);
+    }
+    if !needs_decode {
+        keys.sort_unstable();
+        if keys.windows(2).all(|w| w[0] != w[1]) {
+            return Ok(Cow::Borrowed(input));
+        }
+    }
+
+    let pairs: Vec<(String, String)> =
+        serde_urlencoded::from_bytes(input).map_err(|e| e.to_string())?;
+    let mut seen = std::collections::HashSet::with_capacity(pairs.len());
+    let deduped: Vec<(String, String)> = pairs
+        .into_iter()
+        .filter(|(k, _)| seen.insert(k.clone()))
+        .collect();
+    serde_urlencoded::to_string(&deduped)
+        .map(|s| Cow::Owned(s.into_bytes()))
+        .map_err(|e| e.to_string())
 }
 
 /// Parse `query` into key/value pairs, percent-decoding both sides.
@@ -200,6 +258,38 @@ mod tests {
         let q = req.query();
         assert_eq!(q.get("tag"), Some("a"));
         assert_eq!(q.get_all("tag").collect::<Vec<_>>(), vec!["a", "b"]);
+    }
+
+    #[test]
+    fn to_hash_map_agrees_with_get_on_repeated_keys() {
+        let req = HttpRequest::new("GET", "/s?role=user&role=admin");
+        let q = req.query();
+        assert_eq!(q.get("role"), Some("user"));
+        assert_eq!(
+            q.to_hash_map().get("role").map(String::as_str),
+            Some("user")
+        );
+    }
+
+    #[test]
+    fn first_wins_urlencoded_borrows_when_unique_and_dedupes_otherwise() {
+        use super::first_wins_urlencoded;
+        use std::borrow::Cow;
+
+        let unique = b"a=1&b=2";
+        assert!(matches!(
+            first_wins_urlencoded(unique).unwrap(),
+            Cow::Borrowed(_)
+        ));
+        assert_eq!(
+            &*first_wins_urlencoded(b"role=user&x=1&role=admin").unwrap(),
+            b"role=user&x=1"
+        );
+        // Keys equal only after decoding are still duplicates.
+        assert_eq!(
+            &*first_wins_urlencoded(b"role=user&r%6Fle=admin").unwrap(),
+            b"role=user"
+        );
     }
 
     #[test]

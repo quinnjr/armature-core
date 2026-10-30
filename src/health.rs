@@ -220,6 +220,18 @@ impl HealthResponse {
         self
     }
 
+    /// Strip component details and application info, keeping only the
+    /// overall status and timestamp.
+    ///
+    /// For probes reachable without authentication: component details name
+    /// internal dependencies, versions, paths and error text that help an
+    /// attacker map the deployment.
+    pub fn summary_only(mut self) -> Self {
+        self.components.clear();
+        self.info = None;
+        self
+    }
+
     /// Calculates the overall status from component statuses
     pub fn calculate_status(&mut self) {
         if self.components.is_empty() {
@@ -606,11 +618,15 @@ impl HealthIndicator for UptimeHealthIndicator {
     }
 }
 
+/// Default per-indicator time limit; see [`HealthService::with_indicator_timeout`].
+pub const DEFAULT_INDICATOR_TIMEOUT: Duration = Duration::from_secs(5);
+
 /// Service for managing and executing health checks.
 pub struct HealthService {
     indicators: RwLock<Vec<Arc<dyn HealthIndicator>>>,
     info: RwLock<Option<HealthInfo>>,
     start_time: Instant,
+    indicator_timeout: Duration,
 }
 
 impl Default for HealthService {
@@ -626,7 +642,52 @@ impl HealthService {
             indicators: RwLock::new(Vec::new()),
             info: RwLock::new(None),
             start_time: Instant::now(),
+            indicator_timeout: DEFAULT_INDICATOR_TIMEOUT,
         }
+    }
+
+    /// Bound each indicator's `check()` to `timeout` (default
+    /// [`DEFAULT_INDICATOR_TIMEOUT`]). An indicator that does not answer in
+    /// time is reported `Down`. Without a bound, one hung dependency stalls
+    /// every probe request, and probes piling up on it exhaust the server.
+    pub fn with_indicator_timeout(mut self, timeout: Duration) -> Self {
+        self.indicator_timeout = timeout;
+        self
+    }
+
+    /// Run `indicators` concurrently, each under the configured timeout.
+    async fn run_indicators(
+        &self,
+        indicators: Vec<Arc<dyn HealthIndicator>>,
+    ) -> Vec<HealthCheckResult> {
+        let limit = self.indicator_timeout;
+        let futures: Vec<_> = indicators
+            .into_iter()
+            .map(|indicator| async move {
+                let start = Instant::now();
+                match tokio::time::timeout(limit, indicator.check()).await {
+                    Ok(mut result) => {
+                        if result.duration_ms.is_none() {
+                            result.duration_ms = Some(start.elapsed().as_millis() as u64);
+                        }
+                        result
+                    }
+                    Err(_) => {
+                        let mut result = HealthCheckResult::down(indicator.name())
+                            .with_error(format!("timed out after {} ms", limit.as_millis()));
+                        result.duration_ms = Some(start.elapsed().as_millis() as u64);
+                        result
+                    }
+                }
+            })
+            .collect();
+        join_all(futures).await
+    }
+
+    /// [`check`](Self::check) reduced to the overall status, for endpoints
+    /// served without authentication. See [`HealthResponse::summary_only`].
+    pub async fn check_summary(&self) -> HealthResponse {
+        self.check().await.summary_only()
     }
 
     /// Creates a health service with default indicators (memory, disk, uptime)
@@ -658,23 +719,10 @@ impl HealthService {
             response.info = Some(info);
         }
 
-        // Run all health checks concurrently
-        let futures: Vec<_> = indicators
-            .iter()
-            .map(|indicator| {
-                let indicator = Arc::clone(indicator);
-                async move {
-                    let start = Instant::now();
-                    let mut result = indicator.check().await;
-                    if result.duration_ms.is_none() {
-                        result.duration_ms = Some(start.elapsed().as_millis() as u64);
-                    }
-                    result
-                }
-            })
-            .collect();
-
-        let results = join_all(futures).await;
+        // Run all health checks concurrently, each under the timeout.
+        let all: Vec<_> = indicators.iter().cloned().collect();
+        drop(indicators);
+        let results = self.run_indicators(all).await;
 
         for result in results {
             response.components.insert(result.name.clone(), result);
@@ -696,22 +744,8 @@ impl HealthService {
             .cloned()
             .collect();
 
-        let futures: Vec<_> = liveness_indicators
-            .iter()
-            .map(|indicator| {
-                let indicator = Arc::clone(indicator);
-                async move {
-                    let start = Instant::now();
-                    let mut result = indicator.check().await;
-                    if result.duration_ms.is_none() {
-                        result.duration_ms = Some(start.elapsed().as_millis() as u64);
-                    }
-                    result
-                }
-            })
-            .collect();
-
-        let results = join_all(futures).await;
+        drop(indicators);
+        let results = self.run_indicators(liveness_indicators).await;
 
         for result in results {
             response.components.insert(result.name.clone(), result);
@@ -734,22 +768,8 @@ impl HealthService {
             .cloned()
             .collect();
 
-        let futures: Vec<_> = readiness_indicators
-            .iter()
-            .map(|indicator| {
-                let indicator = Arc::clone(indicator);
-                async move {
-                    let start = Instant::now();
-                    let mut result = indicator.check().await;
-                    if result.duration_ms.is_none() {
-                        result.duration_ms = Some(start.elapsed().as_millis() as u64);
-                    }
-                    result
-                }
-            })
-            .collect();
-
-        let results = join_all(futures).await;
+        drop(indicators);
+        let results = self.run_indicators(readiness_indicators).await;
 
         for result in results {
             response.components.insert(result.name.clone(), result);
@@ -835,6 +855,7 @@ fn current_timestamp() -> u64 {
 pub struct HealthServiceBuilder {
     indicators: Vec<Arc<dyn HealthIndicator>>,
     info: Option<HealthInfo>,
+    indicator_timeout: Duration,
 }
 
 impl Default for HealthServiceBuilder {
@@ -849,7 +870,14 @@ impl HealthServiceBuilder {
         Self {
             indicators: Vec::new(),
             info: None,
+            indicator_timeout: DEFAULT_INDICATOR_TIMEOUT,
         }
+    }
+
+    /// Per-indicator time limit; see [`HealthService::with_indicator_timeout`].
+    pub fn with_indicator_timeout(mut self, timeout: Duration) -> Self {
+        self.indicator_timeout = timeout;
+        self
     }
 
     /// Adds a health indicator
@@ -877,6 +905,7 @@ impl HealthServiceBuilder {
             indicators: RwLock::new(self.indicators),
             info: RwLock::new(self.info),
             start_time: Instant::now(),
+            indicator_timeout: self.indicator_timeout,
         }
     }
 }
@@ -884,6 +913,53 @@ impl HealthServiceBuilder {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    struct HangingIndicator;
+
+    #[async_trait]
+    impl HealthIndicator for HangingIndicator {
+        fn name(&self) -> &str {
+            "hangs"
+        }
+        async fn check(&self) -> HealthCheckResult {
+            std::future::pending().await
+        }
+        fn include_in_liveness(&self) -> bool {
+            true
+        }
+    }
+
+    #[tokio::test]
+    async fn test_hung_indicator_times_out_as_down() {
+        let service = HealthService::new().with_indicator_timeout(Duration::from_millis(20));
+        service.register(HangingIndicator).await;
+        service.register(UptimeHealthIndicator::new()).await;
+
+        let response = tokio::time::timeout(Duration::from_secs(5), service.check())
+            .await
+            .expect("a hung indicator must not stall the health check");
+        assert_eq!(response.components["hangs"].status, HealthStatus::Down);
+        assert_eq!(response.status, HealthStatus::Down);
+
+        let live = tokio::time::timeout(Duration::from_secs(5), service.check_liveness())
+            .await
+            .unwrap();
+        assert_eq!(live.components["hangs"].status, HealthStatus::Down);
+    }
+
+    #[tokio::test]
+    async fn test_summary_only_hides_details() {
+        let service = HealthService::new();
+        service.register(UptimeHealthIndicator::new()).await;
+        service
+            .set_info(HealthInfo::new("svc").with_version("1.2.3"))
+            .await;
+        let summary = service.check_summary().await;
+        assert!(summary.components.is_empty());
+        assert!(summary.info.is_none());
+        let json = serde_json::to_string(&summary).unwrap();
+        assert!(!json.contains("1.2.3"));
+    }
 
     #[test]
     fn test_health_status_is_healthy() {

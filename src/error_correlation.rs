@@ -135,20 +135,20 @@ impl IdGenerationStrategy {
                 result
             }
             IdGenerationStrategy::Short => {
-                let random: [u8; 6] = rand_bytes::<6>();
                 let alphabet = b"0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz";
                 let mut result = String::with_capacity(8);
 
-                for b in random {
-                    result.push(alphabet[(b % 62) as usize] as char);
+                // Rejection sampling: `b % 62` over all 256 byte values would
+                // favor the first 8 symbols. Bytes >= 248 (= 4 * 62) are
+                // discarded so every symbol is equally likely.
+                while result.len() < 8 {
+                    let random: [u8; 16] = rand_bytes();
+                    for b in random {
+                        if b < 248 && result.len() < 8 {
+                            result.push(alphabet[(b % 62) as usize] as char);
+                        }
+                    }
                 }
-                // Add 2 more chars from timestamp
-                let ts = SystemTime::now()
-                    .duration_since(UNIX_EPOCH)
-                    .unwrap_or_default()
-                    .as_nanos() as u64;
-                result.push(alphabet[(ts % 62) as usize] as char);
-                result.push(alphabet[((ts / 62) % 62) as usize] as char);
 
                 result
             }
@@ -171,29 +171,28 @@ fn random_hex_id(hex_len: usize) -> String {
     s
 }
 
-/// Global counter mixed into every `rand_bytes` seed so that two calls can
-/// never derive the same PRNG state, even when they land on the same
-/// timestamp reading (e.g. concurrent calls from different threads, or a
-/// tight same-thread loop where clock resolution is coarser than call
-/// latency).
-static RAND_BYTES_COUNTER: AtomicU64 = AtomicU64::new(0);
-
+/// Fill an array from the OS CSPRNG.
+///
+/// IDs built from this (trace/span/correlation IDs, ULID/UUIDv7 randomness)
+/// are echoed to clients and used to look errors up, so they must not be
+/// predictable. `uuid`'s v4 generator draws from the OS CSPRNG (`getrandom`);
+/// its 6 fixed version/variant bits live in bytes 6 and 8, so only the other
+/// 14 bytes of each UUID are used.
 fn rand_bytes<const N: usize>() -> [u8; N] {
     let mut bytes = [0u8; N];
-    // Simple PRNG seeded from timestamp XORed with a constant, additionally
-    // mixed with a monotonically increasing atomic counter. The counter
-    // guarantees uniqueness of the seed (and therefore the output) across
-    // calls regardless of clock resolution or thread interleaving.
-    let seed = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_nanos() as u64;
-    let counter = RAND_BYTES_COUNTER.fetch_add(1, Ordering::Relaxed);
-
-    let mut state = seed ^ 0xDEADBEEF ^ counter.wrapping_mul(0x9E3779B97F4A7C15);
-    for b in bytes.iter_mut() {
-        state = state.wrapping_mul(6364136223846793005).wrapping_add(1);
-        *b = (state >> 33) as u8;
+    let mut filled = 0;
+    while filled < N {
+        let uuid = uuid::Uuid::new_v4().into_bytes();
+        for (i, b) in uuid.into_iter().enumerate() {
+            if i == 6 || i == 8 {
+                continue;
+            }
+            if filled == N {
+                break;
+            }
+            bytes[filled] = b;
+            filled += 1;
+        }
     }
     bytes
 }
@@ -400,23 +399,31 @@ impl CorrelationContext {
     }
 
     /// Extract correlation context from HTTP request headers.
+    ///
+    /// Every inbound ID is client-controlled and is later echoed into
+    /// response headers, logs and error bodies, so each is validated and a
+    /// malformed one is ignored (a fresh ID is kept instead):
+    ///
+    /// - correlation/request/causation IDs must match
+    ///   [`is_valid_request_id`](crate::headers::is_valid_request_id);
+    /// - `traceparent` must be well-formed per W3C Trace Context;
+    /// - B3 trace IDs must be 16 or 32 lowercase hex, span IDs 16.
+    ///
+    /// `X-Session-ID` is deliberately **not** read: a session identifier is
+    /// something the server establishes (see
+    /// [`with_session`](Self::with_session)), and adopting a client-supplied
+    /// one would let a caller attribute its errors and logs to another
+    /// user's session.
     pub fn from_request(req: &HttpRequest) -> Self {
         let mut ctx = Self::new();
+        let valid_id = |id: &&str| crate::headers::is_valid_request_id(id);
 
-        // Extract correlation ID
-        if let Some(id) = req.headers.get(headers::CORRELATION_ID).or_else(|| {
-            req.headers
-                .get(headers::CORRELATION_ID.to_lowercase().as_str())
-        }) {
+        // Header names are matched case-insensitively by `HeaderMap`.
+        if let Some(id) = req.headers.get(headers::CORRELATION_ID).filter(valid_id) {
             ctx.correlation_id = id.to_owned();
         }
 
-        // Extract request ID
-        if let Some(id) = req
-            .headers
-            .get(headers::REQUEST_ID)
-            .or_else(|| req.headers.get(headers::REQUEST_ID.to_lowercase().as_str()))
-        {
+        if let Some(id) = req.headers.get(headers::REQUEST_ID).filter(valid_id) {
             ctx.request_id = id.to_owned();
         }
 
@@ -427,31 +434,32 @@ impl CorrelationContext {
             ctx.trace_id = Some(trace_id);
             ctx.parent_span_id = Some(span_id);
             ctx.sampled = sampled;
-            // Generate new span ID for this service
-            ctx.span_id = Some(IdGenerationStrategy::Short.generate());
+            // New span for this service, in the W3C 16-hex form so it can be
+            // propagated in an outbound `traceparent`.
+            ctx.span_id = Some(random_hex_id(16));
         }
 
         // Fall back to B3 headers (Zipkin)
         if ctx.trace_id.is_none()
-            && let Some(id) = req.headers.get(headers::B3_TRACE_ID)
+            && let Some(id) = req
+                .headers
+                .get(headers::B3_TRACE_ID)
+                .filter(|id| is_trace_hex(id, 16) || is_trace_hex(id, 32))
         {
             ctx.trace_id = Some(id.to_owned());
         }
         if ctx.span_id.is_none()
-            && let Some(id) = req.headers.get(headers::B3_SPAN_ID)
+            && let Some(id) = req
+                .headers
+                .get(headers::B3_SPAN_ID)
+                .filter(|id| is_trace_hex(id, 16))
         {
             ctx.parent_span_id = Some(id.to_owned());
-            ctx.span_id = Some(IdGenerationStrategy::Short.generate());
+            ctx.span_id = Some(random_hex_id(16));
         }
 
-        // Extract causation ID
-        if let Some(id) = req.headers.get(headers::CAUSATION_ID) {
+        if let Some(id) = req.headers.get(headers::CAUSATION_ID).filter(valid_id) {
             ctx.causation_id = Some(id.to_owned());
-        }
-
-        // Extract session ID
-        if let Some(id) = req.headers.get(headers::SESSION_ID) {
-            ctx.session_id = Some(id.to_owned());
         }
 
         ctx
@@ -521,17 +529,38 @@ impl CorrelationContext {
     }
 }
 
-/// Parse W3C traceparent header.
+/// Whether `s` is exactly `len` lowercase hex digits and not all zeros (the
+/// all-zero trace/span ID is the W3C/B3 "invalid" value).
+fn is_trace_hex(s: &str, len: usize) -> bool {
+    s.len() == len
+        && s.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
+        && s.bytes().any(|b| b != b'0')
+}
+
+/// Parse a W3C `traceparent` header, rejecting anything malformed.
+///
+/// `version-traceid-parentid-flags`: version is 2 lowercase hex and not `ff`
+/// (version `00` has exactly these four fields; later versions may append
+/// more), trace-id is 32 lowercase hex and parent-id 16, neither all zeros,
+/// and flags is 2 lowercase hex whose low bit is "sampled".
 fn parse_traceparent(value: &str) -> Option<(String, String, bool)> {
-    let parts: Vec<&str> = value.split('-').collect();
-    if parts.len() >= 4 && parts[0] == "00" {
-        let trace_id = parts[1].to_string();
-        let span_id = parts[2].to_string();
-        let sampled = parts[3] == "01";
-        Some((trace_id, span_id, sampled))
-    } else {
-        None
+    let mut parts = value.trim().split('-');
+    let version = parts.next()?;
+    let trace_id = parts.next()?;
+    let span_id = parts.next()?;
+    let flags = parts.next()?;
+    let has_more = parts.next().is_some();
+
+    let is_hex2 =
+        |s: &str| s.len() == 2 && s.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'));
+    if !is_hex2(version) || version == "ff" || (version == "00" && has_more) {
+        return None;
     }
+    if !is_trace_hex(trace_id, 32) || !is_trace_hex(span_id, 16) || !is_hex2(flags) {
+        return None;
+    }
+    let sampled = u8::from_str_radix(flags, 16).ok()? & 0x01 == 1;
+    Some((trace_id.to_string(), span_id.to_string(), sampled))
 }
 
 // ============================================================================
@@ -737,10 +766,14 @@ impl CorrelatedError {
     /// Convert to JSON.
     pub fn to_json(&self) -> String {
         serde_json::to_string_pretty(self).unwrap_or_else(|_| {
-            format!(
-                r#"{{"error_id":"{}","message":"{}","status":{}}}"#,
-                self.error_id, self.message, self.status
-            )
+            // Built with `json!` so a quote or backslash in the message cannot
+            // break out of its string and forge fields.
+            serde_json::json!({
+                "error_id": self.error_id,
+                "message": self.message,
+                "status": self.status,
+            })
+            .to_string()
         })
     }
 }
@@ -1098,12 +1131,19 @@ impl CorrelatedRequest for HttpRequest {
 
     fn correlation_id(&self) -> Option<String> {
         // One lookup: header names intern case-insensitively, so the
-        // lowercased retry was always redundant.
-        self.headers.get(headers::CORRELATION_ID).map(str::to_owned)
+        // lowercased retry was always redundant. Malformed client values are
+        // treated as absent, matching `CorrelationContext::from_request`.
+        self.headers
+            .get(headers::CORRELATION_ID)
+            .filter(|id| crate::headers::is_valid_request_id(id))
+            .map(str::to_owned)
     }
 
     fn request_id(&self) -> Option<String> {
-        self.headers.get(headers::REQUEST_ID).map(str::to_owned)
+        self.headers
+            .get(headers::REQUEST_ID)
+            .filter(|id| crate::headers::is_valid_request_id(id))
+            .map(str::to_owned)
     }
 
     fn trace_id(&self) -> Option<String> {
@@ -1114,7 +1154,10 @@ impl CorrelatedRequest for HttpRequest {
             return Some(trace_id);
         }
         // Fall back to B3
-        self.headers.get(headers::B3_TRACE_ID).map(str::to_owned)
+        self.headers
+            .get(headers::B3_TRACE_ID)
+            .filter(|id| is_trace_hex(id, 16) || is_trace_hex(id, 32))
+            .map(str::to_owned)
     }
 
     fn span_id(&self) -> Option<String> {
@@ -1125,7 +1168,10 @@ impl CorrelatedRequest for HttpRequest {
             return Some(span_id);
         }
         // Fall back to B3
-        self.headers.get(headers::B3_SPAN_ID).map(str::to_owned)
+        self.headers
+            .get(headers::B3_SPAN_ID)
+            .filter(|id| is_trace_hex(id, 16))
+            .map(str::to_owned)
     }
 }
 
@@ -1348,6 +1394,69 @@ mod tests {
         let (_, _, sampled) =
             parse_traceparent("00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-00").unwrap();
         assert!(!sampled);
+    }
+
+    #[test]
+    fn test_parse_traceparent_rejects_malformed() {
+        let ok = "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01";
+        assert!(parse_traceparent(ok).is_some());
+        for bad in [
+            "00-00000000000000000000000000000000-00f067aa0ba902b7-01",
+            "00-4bf92f3577b34da6a3ce929d0e0e4736-0000000000000000-01",
+            "00-4BF92F3577B34DA6A3CE929D0E0E4736-00f067aa0ba902b7-01",
+            "00-4bf92f3577b34da6a3ce929d0e0e473-00f067aa0ba902b7-01",
+            "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01-extra",
+            "ff-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01",
+            "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-zz",
+            "00-<script>-00f067aa0ba902b7-01",
+        ] {
+            assert!(parse_traceparent(bad).is_none(), "{bad}");
+        }
+        // Sampled is the low bit of the flags, not a literal "01".
+        let (_, _, sampled) =
+            parse_traceparent("00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-03").unwrap();
+        assert!(sampled);
+    }
+
+    #[test]
+    fn test_from_request_rejects_malformed_inbound_ids() {
+        let mut req = HttpRequest::new("GET", "/".to_string());
+        req.headers
+            .insert(headers::CORRELATION_ID, "evil\u{1b}[31m id");
+        req.headers.insert(headers::REQUEST_ID, "x".repeat(200));
+        req.headers.insert(headers::CAUSATION_ID, "a b");
+        req.headers.insert(headers::SESSION_ID, "victim-session");
+        req.headers.insert(headers::B3_TRACE_ID, "not-hex");
+        let ctx = CorrelationContext::from_request(&req);
+
+        assert!(crate::headers::is_valid_request_id(&ctx.correlation_id));
+        assert_ne!(ctx.correlation_id, "evil\u{1b}[31m id");
+        assert!(ctx.request_id.len() <= 128);
+        assert_eq!(ctx.causation_id, None);
+        assert_eq!(ctx.session_id, None, "session id is never client-supplied");
+        assert_eq!(ctx.trace_id, None);
+        assert_eq!(req.correlation_id(), None);
+
+        let mut req = HttpRequest::new("GET", "/".to_string());
+        req.headers.insert(
+            headers::TRACE_PARENT,
+            "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01",
+        );
+        let ctx = CorrelationContext::from_request(&req);
+        assert!(is_trace_hex(ctx.span_id.as_deref().unwrap(), 16));
+        assert_eq!(ctx.parent_span_id.as_deref(), Some("00f067aa0ba902b7"));
+    }
+
+    #[test]
+    fn test_short_ids_use_full_alphabet_and_length() {
+        for _ in 0..100 {
+            let id = IdGenerationStrategy::Short.generate();
+            assert_eq!(id.len(), 8);
+            assert!(id.bytes().all(|b| b.is_ascii_alphanumeric()));
+        }
+        let a: [u8; 32] = rand_bytes();
+        let b: [u8; 32] = rand_bytes();
+        assert_ne!(a, b);
     }
 
     #[test]

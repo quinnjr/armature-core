@@ -206,9 +206,16 @@ impl QueryParams {
 }
 
 impl fmt::Debug for QueryParams {
+    // Values are redacted: query strings routinely carry tokens, signatures
+    // and other secrets, and a `{:?}` is exactly what ends up in a log. The
+    // keys alone are still enough to debug which parameters arrived.
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_map()
-            .entries(self.inner.iter().map(|(k, v)| (k, v)))
+            .entries(
+                self.inner
+                    .iter()
+                    .map(|(k, _)| (k, crate::headers::REDACTED)),
+            )
             .finish()
     }
 }

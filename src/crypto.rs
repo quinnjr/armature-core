@@ -36,10 +36,13 @@ pub fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
 
     let mut result = 0u8;
     for (byte_a, byte_b) in a.iter().zip(b.iter()) {
-        result |= byte_a ^ byte_b;
+        // `black_box` is an optimization barrier: without it the compiler is
+        // free to notice that only `result == 0` matters and turn the loop
+        // back into an early-exit comparison.
+        result = std::hint::black_box(result | (byte_a ^ byte_b));
     }
 
-    result == 0
+    std::hint::black_box(result) == 0
 }
 
 #[cfg(test)]

@@ -69,7 +69,11 @@ impl Clone for QueryCache {
 ///
 /// The path and body are `Bytes`-backed, so cloning a request is a handful of
 /// refcount bumps rather than a deep copy of the target and payload.
-#[derive(Debug, Clone)]
+///
+/// `Debug` is hand-written so a `{:?}` in an error log cannot leak secrets:
+/// it prints the path without its query string and the body's length rather
+/// than its bytes (headers are redacted by [`HeaderMap`]'s own `Debug`).
+#[derive(Clone)]
 pub struct HttpRequest {
     /// The request method.
     ///
@@ -127,6 +131,20 @@ pub struct HttpRequest {
     pub peer: Option<SocketAddr>,
     /// Parsed lazily by [`HttpRequest::query`].
     query_cache: QueryCache,
+}
+
+impl std::fmt::Debug for HttpRequest {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("HttpRequest")
+            .field("method", &self.method)
+            .field("path", &self.path_only())
+            .field("has_query", &self.path.contains('?'))
+            .field("headers", &self.headers)
+            .field("body_len", &self.body.len())
+            .field("path_params", &self.path_params)
+            .field("peer", &self.peer)
+            .finish_non_exhaustive()
+    }
 }
 
 impl HttpRequest {
@@ -191,6 +209,14 @@ impl HttpRequest {
     /// ignored entirely and the socket peer is used. That is the correct default
     /// for a process reachable directly.
     ///
+    /// **Caveat:** with a non-zero depth the header is believed whatever the
+    /// socket peer is. If the process can also be reached *without* going
+    /// through the proxy (an exposed port, a misrouted load balancer), a client
+    /// connecting directly controls the whole header and can claim any
+    /// address. When that cannot be ruled out, use
+    /// [`client_address_trusted`](Self::client_address_trusted), which only
+    /// honours the header when the peer is a known proxy.
+    ///
     /// Returns `None` when the address is genuinely unknown: no peer and no
     /// usable header, or a `depth` deeper than the chain actually present, which
     /// means the deployment does not match the configuration and no entry in the
@@ -254,6 +280,80 @@ impl HttpRequest {
         // there is no entry here anyone put there on purpose.
         let index = hops.len().checked_sub(trusted_proxy_depth)?;
         hops.get(index)?.parse().ok()
+    }
+
+    /// The client address, honouring `X-Forwarded-For` only when the request
+    /// actually arrived from one of `trusted_proxies`.
+    ///
+    /// Unlike [`client_address`](Self::client_address), which trusts a fixed
+    /// number of hops regardless of who connected, this checks the socket peer
+    /// first: a request from any address not in `trusted_proxies` is
+    /// attributed to that peer and its header is ignored, so a client that
+    /// bypasses the proxy cannot spoof its address. When the peer is trusted,
+    /// the forwarded chain is walked from the right, skipping hops that are
+    /// themselves trusted proxies; the first untrusted hop is the client.
+    ///
+    /// Returns `None` when the peer is unknown, or when the chain contains a
+    /// malformed entry before an untrusted hop is found (the chain is not one
+    /// the deployment produced, so nothing in it can be believed). If every hop
+    /// is a trusted proxy, the leftmost one is returned.
+    ///
+    /// For CIDR ranges or other rules, use
+    /// [`client_address_trusted_by`](Self::client_address_trusted_by).
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use armature_core::HttpRequest;
+    /// use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+    ///
+    /// let proxy = IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1));
+    /// let mut req = HttpRequest::new("GET", "/")
+    ///     .with_peer(Some(SocketAddr::new(proxy, 5555)));
+    /// req.headers.insert("X-Forwarded-For", "198.51.100.9, 203.0.113.7");
+    /// assert_eq!(
+    ///     req.client_address_trusted(&[proxy]),
+    ///     Some(IpAddr::V4(Ipv4Addr::new(203, 0, 113, 7)))
+    /// );
+    ///
+    /// // Same header, but straight from an untrusted peer: ignored.
+    /// let direct = SocketAddr::from(([192, 0, 2, 50], 4444));
+    /// let req = req.with_peer(Some(direct));
+    /// assert_eq!(req.client_address_trusted(&[proxy]), Some(direct.ip()));
+    /// ```
+    pub fn client_address_trusted(&self, trusted_proxies: &[IpAddr]) -> Option<IpAddr> {
+        self.client_address_trusted_by(|ip| trusted_proxies.iter().any(|p| p.to_canonical() == ip))
+    }
+
+    /// [`client_address_trusted`](Self::client_address_trusted) with an
+    /// arbitrary trust predicate (e.g. a CIDR membership test). Addresses are
+    /// passed in canonical form, so an IPv4-mapped IPv6 peer is seen as IPv4.
+    pub fn client_address_trusted_by(&self, is_trusted: impl Fn(IpAddr) -> bool) -> Option<IpAddr> {
+        let peer = self.peer?.ip().to_canonical();
+        if !is_trusted(peer) {
+            return Some(peer);
+        }
+
+        // Same joining rule as `client_address`: every field line, in order,
+        // empty elements kept so a malformed chain yields `None`.
+        let hops: Vec<&str> = self
+            .headers
+            .get_all("X-Forwarded-For")
+            .into_iter()
+            .flat_map(|line| line.split(','))
+            .map(str::trim)
+            .collect();
+
+        let mut leftmost = None;
+        for hop in hops.iter().rev() {
+            let ip = hop.parse::<IpAddr>().ok()?.to_canonical();
+            if !is_trusted(ip) {
+                return Some(ip);
+            }
+            leftmost = Some(ip);
+        }
+        // No header at all: the trusted proxy itself is the only address known.
+        Some(leftmost.unwrap_or(peer))
     }
 
     /// Create a new request with pre-allocated extensions capacity.
@@ -1064,6 +1164,38 @@ impl HttpResponse {
         Self::new(303).with_header("Location".to_string(), url.into())
     }
 
+    /// Create a 302 redirect to a same-origin path, rejecting anything that
+    /// could send the client to another site.
+    ///
+    /// [`redirect`](Self::redirect) takes any URL, so passing it a
+    /// user-supplied `?next=` value is an open redirect. This accepts only a
+    /// path that starts with a single `/`; protocol-relative (`//evil.com`) and
+    /// backslash (`/\evil.com`, which browsers normalize to `//`) forms, and
+    /// any control character (header injection, or a tab/newline browsers
+    /// strip to reveal `//`), are rejected with [`crate::Error::BadRequest`].
+    ///
+    /// # Example
+    /// ```
+    /// use armature_core::HttpResponse;
+    /// assert_eq!(HttpResponse::redirect_local("/dashboard").unwrap().status, 302);
+    /// assert!(HttpResponse::redirect_local("//evil.example").is_err());
+    /// assert!(HttpResponse::redirect_local("/\\evil.example").is_err());
+    /// assert!(HttpResponse::redirect_local("https://evil.example").is_err());
+    /// ```
+    pub fn redirect_local(path: impl Into<String>) -> Result<Self, crate::Error> {
+        let path = path.into();
+        let bytes = path.as_bytes();
+        let safe = bytes.first() == Some(&b'/')
+            && !matches!(bytes.get(1), Some(b'/' | b'\\'))
+            && !path.chars().any(char::is_control);
+        if !safe {
+            return Err(crate::Error::BadRequest(
+                "redirect target must be a local path".to_string(),
+            ));
+        }
+        Ok(Self::redirect(path))
+    }
+
     /// Alias for no_content() - returns 204 with empty body.
     ///
     /// # Example
@@ -1678,6 +1810,60 @@ mod tests {
             HttpRequest::with_extensions_capacity("GET", "/", 4).peer,
             None
         );
+    }
+
+    #[test]
+    fn client_address_trusted_ignores_header_from_untrusted_peer() {
+        let trusted = [proxy().ip()];
+        let mut req = HttpRequest::new("GET", "/").with_peer(Some(proxy()));
+        req.headers
+            .insert("X-Forwarded-For", "198.51.100.9, 203.0.113.7, 10.0.0.1");
+        // Trusted hops on the right are skipped.
+        assert_eq!(
+            req.client_address_trusted(&trusted),
+            Some("203.0.113.7".parse().unwrap())
+        );
+
+        let direct: SocketAddr = "192.0.2.50:4444".parse().unwrap();
+        let req = req.with_peer(Some(direct));
+        assert_eq!(req.client_address_trusted(&trusted), Some(direct.ip()));
+
+        let mut req = HttpRequest::new("GET", "/").with_peer(Some(proxy()));
+        req.headers.insert("X-Forwarded-For", "garbage, ");
+        assert_eq!(req.client_address_trusted(&trusted), None);
+
+        let req = HttpRequest::new("GET", "/").with_peer(Some(proxy()));
+        assert_eq!(req.client_address_trusted(&trusted), Some(proxy().ip()));
+        assert_eq!(
+            HttpRequest::new("GET", "/").client_address_trusted(&trusted),
+            None
+        );
+    }
+
+    #[test]
+    fn redirect_local_rejects_off_site_targets() {
+        assert!(HttpResponse::redirect_local("/a/b?c=d").is_ok());
+        for bad in [
+            "",
+            "evil.example",
+            "//evil.example",
+            "/\\evil.example",
+            "/\t/evil.example",
+            "/x\r\nSet-Cookie: a=b",
+            "https://evil.example",
+        ] {
+            assert!(HttpResponse::redirect_local(bad).is_err(), "{bad:?}");
+        }
+    }
+
+    #[test]
+    fn request_debug_omits_query_and_body() {
+        let mut req = HttpRequest::new("POST", "/login?token=s3cret");
+        req.body = Bytes::from_static(b"password=hunter2");
+        let dbg = format!("{req:?}");
+        assert!(!dbg.contains("s3cret"), "{dbg}");
+        assert!(!dbg.contains("hunter2"), "{dbg}");
+        assert!(dbg.contains("/login"));
     }
 
     #[test]

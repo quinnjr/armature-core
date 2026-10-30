@@ -260,12 +260,28 @@ impl<const INDEX: usize> std::ops::Deref for PathParam<INDEX> {
 }
 
 /// Extract a single header by name.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct Header {
     /// Header name.
     pub name: String,
     /// Header value (None if not found).
     pub value: Option<String>,
+}
+
+impl std::fmt::Debug for Header {
+    // A credential header's value is redacted, matching `HeaderMap`'s `Debug`.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let value = match &self.value {
+            Some(_) if crate::headers::is_sensitive_header(&self.name) => {
+                Some(crate::headers::REDACTED)
+            }
+            other => other.as_deref(),
+        };
+        f.debug_struct("Header")
+            .field("name", &self.name)
+            .field("value", &value)
+            .finish()
+    }
 }
 
 impl Header {
@@ -323,8 +339,17 @@ impl ContentType {
 }
 
 /// Extract Authorization header.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct Authorization(pub Option<String>);
+
+impl std::fmt::Debug for Authorization {
+    // The value is a credential; only whether one was present is printed.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_tuple("Authorization")
+            .field(&self.0.as_ref().map(|_| crate::headers::REDACTED))
+            .finish()
+    }
+}
 
 impl Extract for Authorization {
     #[inline]
@@ -594,7 +619,9 @@ where
     fn call(&self, req: HttpRequest) -> Self::Future {
         let inner = self.inner.clone();
         let method = req.method.clone();
-        let path = req.path.clone();
+        // Path without the query string: queries routinely carry tokens and
+        // other secrets that must not reach INFO-level logs.
+        let path = req.path_only().to_string();
 
         MIDDLEWARE_STATS.record_call();
 
@@ -727,9 +754,12 @@ where
         MIDDLEWARE_STATS.record_call();
 
         // Generate request ID if not present
+        // A client-supplied ID is reflected into the response, so it is only
+        // reused when well-formed; anything else is replaced with a fresh one.
         let request_id = req
             .headers
             .get("x-request-id")
+            .filter(|id| crate::headers::is_valid_request_id(id))
             .map(str::to_owned)
             .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
 

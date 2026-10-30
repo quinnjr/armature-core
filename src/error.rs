@@ -266,7 +266,7 @@ impl Error {
         match self {
             e if e.status_code() >= 500 => "Internal Server Error".to_string(),
             Error::Deserialization(_) => {
-                "Request body could not be deserialized. Check that it matches the expected format."
+                "Request data could not be deserialized. Check that it matches the expected format."
                     .to_string()
             }
             e => e.to_string(),
@@ -291,9 +291,12 @@ impl Error {
     pub fn to_client_response(&self) -> HttpResponse {
         let status = self.status_code();
         let message = self.client_message();
-        if matches!(self, Error::Deserialization(_)) {
-            // The detail the client no longer sees still reaches the logs.
-            tracing::debug!(error = %self, "request body deserialization failed");
+        if let Error::Deserialization(detail) = self {
+            // Only the shape of the failure is logged. serde's message quotes
+            // the offending input (`invalid type: string "hunter2"`), which
+            // would put request-body values -- possibly secrets -- into logs.
+            let (kind, line, column) = deserialization_log_fields(detail);
+            tracing::debug!(kind, line, column, "request body deserialization failed");
         }
         let body = serde_json::json!({
             "error": message,
@@ -398,9 +401,47 @@ impl Error {
     }
 }
 
+/// Reduce a serde error message to fields safe to log: the leading error
+/// category (text before any `:`, backtick or quote, which is where serde
+/// starts quoting input) and the trailing `line N column M` position.
+fn deserialization_log_fields(detail: &str) -> (&str, Option<u64>, Option<u64>) {
+    let kind = detail
+        .split([':', '`', '"', '\''])
+        .next()
+        .unwrap_or("")
+        .trim();
+    let (line, column) = match detail.rsplit_once(" at line ") {
+        Some((_, pos)) => {
+            let mut parts = pos.split_whitespace();
+            let line = parts.next().and_then(|n| n.parse().ok());
+            let column = match (parts.next(), parts.next()) {
+                (Some("column"), Some(n)) => n.parse().ok(),
+                _ => None,
+            };
+            (line, column)
+        }
+        None => (None, None),
+    };
+    (kind, line, column)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_deserialization_log_fields_drop_input_values() {
+        let (kind, line, column) = deserialization_log_fields(
+            "invalid type: string \"hunter2\", expected u32 at line 1 column 17",
+        );
+        assert_eq!(kind, "invalid type");
+        assert_eq!(line, Some(1));
+        assert_eq!(column, Some(17));
+
+        let (kind, line, column) = deserialization_log_fields("unknown variant `Admin`");
+        assert_eq!(kind, "unknown variant");
+        assert_eq!((line, column), (None, None));
+    }
 
     #[test]
     fn test_internal_error_status() {

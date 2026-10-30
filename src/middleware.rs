@@ -318,9 +318,12 @@ pub struct RequestIdMiddleware;
 impl Middleware for RequestIdMiddleware {
     async fn handle(&self, mut req: HttpRequest, next: Next) -> Result<HttpResponse, Error> {
         // Generate or use existing request ID
+        // A client-supplied ID is reflected into the response, so it is only
+        // reused when well-formed; anything else is replaced with a fresh one.
         let request_id = req
             .headers
             .get("x-request-id")
+            .filter(|id| crate::headers::is_valid_request_id(id))
             .map(str::to_owned)
             .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
 
@@ -441,9 +444,39 @@ impl Middleware for SecurityHeadersMiddleware {
 /// survives. Small bodies, bodies that are already content-encoded, and
 /// clients that do not accept gzip are passed through unchanged (but still
 /// gain `Vary`).
+///
+/// # BREACH
+///
+/// Compressing a response that reflects attacker-influenced input next to a
+/// secret (a CSRF token, a session ID) lets an attacker who can observe
+/// ciphertext lengths recover the secret byte by byte (BREACH). By default
+/// this middleware therefore leaves uncompressed any response that looks
+/// secret-bearing: one that sets a cookie (`Set-Cookie`) or is marked
+/// `Cache-Control: no-store` or `private`. Override the decision with
+/// [`skip_when`](Self::skip_when); routes that echo user input alongside
+/// secrets in an ordinary cacheable response still need application-level
+/// mitigation (e.g. per-response masking of CSRF tokens).
 pub struct CompressionMiddleware {
     min_size: usize,
     level: crate::micro::CompressionLevel,
+    skip: CompressionSkip,
+}
+
+type CompressionSkip = Arc<dyn Fn(&HttpResponse) -> bool + Send + Sync>;
+
+/// The default BREACH heuristic: skip responses that carry a cookie or are
+/// marked non-shareable, which is where per-user secrets live.
+pub fn is_likely_secret_bearing(response: &HttpResponse) -> bool {
+    response.headers.iter().any(|(name, value)| {
+        if name.eq_ignore_ascii_case("set-cookie") {
+            return true;
+        }
+        name.eq_ignore_ascii_case("cache-control")
+            && value.split(',').any(|directive| {
+                let d = directive.trim();
+                d.eq_ignore_ascii_case("no-store") || d.eq_ignore_ascii_case("private")
+            })
+    })
 }
 
 impl CompressionMiddleware {
@@ -451,7 +484,19 @@ impl CompressionMiddleware {
         Self {
             min_size: 1024, // Only compress responses > 1KB
             level: crate::micro::CompressionLevel::Default,
+            skip: Arc::new(is_likely_secret_bearing),
         }
+    }
+
+    /// Replace the predicate that decides which responses are left
+    /// uncompressed (default: [`is_likely_secret_bearing`]). Return `true`
+    /// to skip compression for that response.
+    pub fn skip_when<F>(mut self, predicate: F) -> Self
+    where
+        F: Fn(&HttpResponse) -> bool + Send + Sync + 'static,
+    {
+        self.skip = Arc::new(predicate);
+        self
     }
 
     pub fn with_min_size(mut self, size: usize) -> Self {
@@ -486,7 +531,11 @@ impl Middleware for CompressionMiddleware {
         crate::micro::add_vary_accept_encoding(&mut response);
 
         let already_encoded = response.headers.contains_key("Content-Encoding");
-        if client_accepts_gzip && !already_encoded && response.body_ref().len() > self.min_size {
+        if client_accepts_gzip
+            && !already_encoded
+            && response.body_ref().len() > self.min_size
+            && !(self.skip)(&response)
+        {
             response = crate::micro::apply_gzip_offload(response, self.level).await;
         }
 
@@ -500,6 +549,12 @@ impl Middleware for CompressionMiddleware {
 /// Logs include method, path, status code, duration, and optional request/response bodies.
 /// The path is logged without its query string, which routinely carries secrets
 /// (reset codes, OAuth `code`, API keys).
+///
+/// Body logging is off by default. When enabled, bodies pass through the same
+/// best-effort redaction the error transformer uses (password/secret/token/
+/// API-key fields, bearer tokens, card/SSN-like numbers) before they are
+/// logged. That redaction is pattern-based and cannot recognize every secret a
+/// payload might carry, so leave body logging off in production.
 ///
 /// # Examples
 ///
@@ -547,6 +602,17 @@ impl LoggingMiddleware {
     }
 }
 
+/// A truncated, redacted, lossily-decoded view of `body` for logging.
+fn body_log_preview(body: &[u8], max: usize) -> String {
+    let shown = String::from_utf8_lossy(&body[..body.len().min(max)]);
+    let redacted = crate::error_transform::redact_sensitive(&shown);
+    if body.len() > max {
+        format!("{redacted}... ({} bytes)", body.len())
+    } else {
+        redacted
+    }
+}
+
 impl Default for LoggingMiddleware {
     fn default() -> Self {
         Self::new()
@@ -565,15 +631,7 @@ impl Middleware for LoggingMiddleware {
 
         // Log request
         if self.log_request_body && !req.body.is_empty() {
-            let body_preview = if req.body.len() > self.max_body_size {
-                format!(
-                    "{}... ({} bytes)",
-                    String::from_utf8_lossy(&req.body[..self.max_body_size]),
-                    req.body.len()
-                )
-            } else {
-                String::from_utf8_lossy(&req.body).to_string()
-            };
+            let body_preview = body_log_preview(&req.body, self.max_body_size);
 
             crate::logging::info!(
                 method = %method,
@@ -597,15 +655,7 @@ impl Middleware for LoggingMiddleware {
         match &result {
             Ok(response) => {
                 if self.log_response_body && !response.body.is_empty() {
-                    let body_preview = if response.body.len() > self.max_body_size {
-                        format!(
-                            "{}... ({} bytes)",
-                            String::from_utf8_lossy(&response.body[..self.max_body_size]),
-                            response.body.len()
-                        )
-                    } else {
-                        String::from_utf8_lossy(&response.body).to_string()
-                    };
+                    let body_preview = body_log_preview(&response.body, self.max_body_size);
 
                     crate::logging::info!(
                         method = %method,
@@ -644,6 +694,102 @@ impl Middleware for LoggingMiddleware {
 mod tests {
     use super::*;
     use bytes::Bytes;
+
+    #[tokio::test]
+    async fn compression_skips_secret_bearing_responses_by_default() {
+        fn gzip_req() -> HttpRequest {
+            let mut req = HttpRequest::new("GET", "/".to_string());
+            req.headers.insert("accept-encoding", "gzip");
+            req
+        }
+        let big = vec![b'a'; 4096];
+
+        let body = big.clone();
+        let next: Next = Box::new(move |_req| {
+            Box::pin(async move {
+                let mut r = HttpResponse::ok().with_body(body);
+                r.headers
+                    .insert("Set-Cookie".to_string(), "sid=1".to_string());
+                Ok(r)
+            })
+        });
+        let resp = CompressionMiddleware::new()
+            .handle(gzip_req(), next)
+            .await
+            .unwrap();
+        assert!(!resp.headers.contains_key("Content-Encoding"));
+
+        let body = big.clone();
+        let next: Next = Box::new(move |_req| {
+            Box::pin(async move {
+                let mut r = HttpResponse::ok().with_body(body);
+                r.headers.insert(
+                    "cache-control".to_string(),
+                    "max-age=0, Private".to_string(),
+                );
+                Ok(r)
+            })
+        });
+        let resp = CompressionMiddleware::new()
+            .handle(gzip_req(), next)
+            .await
+            .unwrap();
+        assert!(!resp.headers.contains_key("Content-Encoding"));
+
+        let body = big.clone();
+        let next: Next =
+            Box::new(move |_req| Box::pin(async move { Ok(HttpResponse::ok().with_body(body)) }));
+        let resp = CompressionMiddleware::new()
+            .handle(gzip_req(), next)
+            .await
+            .unwrap();
+        assert!(resp.headers.contains_key("Content-Encoding"));
+
+        let body = big.clone();
+        let next: Next =
+            Box::new(move |_req| Box::pin(async move { Ok(HttpResponse::ok().with_body(body)) }));
+        let resp = CompressionMiddleware::new()
+            .skip_when(|_| true)
+            .handle(gzip_req(), next)
+            .await
+            .unwrap();
+        assert!(!resp.headers.contains_key("Content-Encoding"));
+    }
+
+    #[tokio::test]
+    async fn request_id_middleware_replaces_malformed_inbound_id() {
+        let mut req = HttpRequest::new("GET", "/".to_string());
+        req.headers.insert("x-request-id", "bad id<script>");
+        let next: Next = Box::new(|_req| Box::pin(async { Ok(HttpResponse::ok()) }));
+        let response = RequestIdMiddleware.handle(req, next).await.unwrap();
+        let echoed = response.headers.get("x-request-id").unwrap();
+        assert_ne!(echoed, "bad id<script>");
+        assert!(crate::headers::is_valid_request_id(echoed));
+
+        let mut req = HttpRequest::new("GET", "/".to_string());
+        req.headers.insert("x-request-id", "req-42");
+        let next: Next = Box::new(|_req| Box::pin(async { Ok(HttpResponse::ok()) }));
+        let response = RequestIdMiddleware.handle(req, next).await.unwrap();
+        assert_eq!(
+            response.headers.get("x-request-id").map(String::as_str),
+            Some("req-42")
+        );
+    }
+
+    #[test]
+    fn logged_bodies_are_redacted() {
+        let body = br#"{"user":"a","password":"hunter2","api_key":"k-1"}"#;
+        let out = body_log_preview(body, 1024);
+        assert!(!out.contains("hunter2"), "{out}");
+        assert!(!out.contains("k-1"), "{out}");
+        assert!(out.contains(r#""user":"a""#));
+
+        let out = body_log_preview(b"token=abc&x=1", 1024);
+        assert!(!out.contains("abc"), "{out}");
+
+        let out = body_log_preview(&[b'a'; 10], 4);
+        assert_eq!(out, "aaaa... (10 bytes)");
+    }
 
     /// H7: the legacy CORS middleware never pairs `*` with credentials.
     #[tokio::test]

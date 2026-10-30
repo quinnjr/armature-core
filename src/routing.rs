@@ -261,7 +261,12 @@ impl Router {
     /// inlined by the compiler.
     #[inline]
     pub async fn route(&self, mut request: HttpRequest) -> Result<HttpResponse, Error> {
-        debug!("Routing request: {} {}", request.method, request.path);
+        // Path only: the query string may carry secrets.
+        debug!(
+            "Routing request: {} {}",
+            request.method,
+            request.path_only()
+        );
 
         // Match on the path alone; the query is parsed on demand by
         // `HttpRequest::query`, and only if a handler asks for it.

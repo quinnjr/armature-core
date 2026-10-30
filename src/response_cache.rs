@@ -402,6 +402,15 @@ impl fmt::Display for CacheControl {
 pub struct CacheKey {
     /// HTTP method
     pub method: crate::Method,
+    /// Normalized request authority: the `Host` header lowercased, with a
+    /// default port (`:80`/`:443`) removed. `None` when the request has no
+    /// `Host` (HTTP/1.0, or a hand-built request).
+    ///
+    /// Without it, two virtual hosts served by one application share every
+    /// entry for a path, and a request whose `Host` names a site the
+    /// attacker controls (or one that renders the host into the body, e.g.
+    /// absolute links) poisons what the real site's visitors are served.
+    pub authority: Option<String>,
     /// Request path
     pub path: crate::ByteStr,
     /// Canonicalized query string: the decoded pairs sorted by name, each key
@@ -446,16 +455,15 @@ impl CacheKey {
             let _ = write!(query, "{}:{}={}:{}&", k.len(), k, v.len(), v);
         }
 
-        // Collect Vary header values
+        // Collect Vary header values. Every field line counts, not just the
+        // first: HTTP/2 clients routinely split `Cookie` into one line per
+        // cookie, and keying on the first alone would put two users who share
+        // only their first cookie on one variant.
         let mut vary_values: Vec<(String, String)> = vary_headers
             .iter()
             .filter_map(|header| {
-                // One lookup: header names intern case-insensitively, so the
-                // lowercased retry was always redundant.
-                request
-                    .headers
-                    .get(header)
-                    .map(|v| (header.to_lowercase(), v.to_owned()))
+                let values = request.headers.get_all(header);
+                (!values.is_empty()).then(|| (header.to_lowercase(), values.join(", ")))
             })
             .collect();
         vary_values.sort_by(|a, b| a.0.cmp(&b.0));
@@ -473,6 +481,7 @@ impl CacheKey {
 
         Self {
             method,
+            authority: request.headers.get("host").map(normalize_authority),
             // The path alone: `query` is a separate, sorted field, so folding
             // the raw query in here would key the same request two ways.
             path: crate::ByteStr::from(request.path_only()),
@@ -494,7 +503,13 @@ impl CacheKey {
     pub fn to_string_key(&self) -> String {
         use fmt::Write as _;
         let mut out = String::with_capacity(16 + self.path.len() + self.query.len());
-        let _ = write!(out, "{}:{}:{}", self.method, self.path.len(), self.path);
+        let _ = write!(out, "{}:", self.method);
+        // `@` never begins the path's length prefix (a digit), so a key with
+        // an authority can't render the same as one without.
+        if let Some(authority) = &self.authority {
+            let _ = write!(out, "@{}:{}:", authority.len(), authority);
+        }
+        let _ = write!(out, "{}:{}", self.path.len(), self.path);
         if !self.query.is_empty() {
             let _ = write!(out, "?{}", self.query);
         }
@@ -512,6 +527,31 @@ impl CacheKey {
         }
         out
     }
+}
+
+/// Normalize a `Host` value for the cache key: trimmed, lowercased (host
+/// names are case-insensitive), and without a default port, so `Example.com`,
+/// `example.com:80` and `example.com` are one site.
+///
+/// The request does not record its scheme, so both `:80` and `:443` are
+/// treated as default. That can only merge `http://h:443` with `http://h`,
+/// i.e. the same host named two ways, never two different hosts.
+pub(crate) fn normalize_authority(host: &str) -> String {
+    let host = host.trim().to_ascii_lowercase();
+    match host
+        .strip_suffix(":80")
+        .or_else(|| host.strip_suffix(":443"))
+    {
+        Some(stripped) => stripped.to_string(),
+        None => host,
+    }
+}
+
+/// Whether the request carries more than one `Host` line. Which one the
+/// application acted on is then a guess, so the cache neither serves nor
+/// stores for it rather than key on a host the response may not be for.
+fn has_ambiguous_host(request: &HttpRequest) -> bool {
+    request.headers.get_unique("host").is_err()
 }
 
 impl fmt::Display for CacheKey {
@@ -583,16 +623,10 @@ impl CachedResponse {
     pub fn new(response: &HttpResponse, ttl: Duration) -> Self {
         let now = Instant::now();
 
-        let etag = response.headers.get("ETag").cloned();
-        let last_modified = response
-            .headers
-            .get("Last-Modified")
+        let etag = response_header(response, "etag").cloned();
+        let last_modified = response_header(response, "last-modified")
             .and_then(|s| httpdate::parse_http_date(s).ok());
-        let vary = response
-            .headers
-            .get("Vary")
-            .map(|v| v.split(',').map(|s| s.trim().to_lowercase()).collect())
-            .unwrap_or_default();
+        let vary = response_vary(response);
 
         Self {
             response: CachedResponseData {
@@ -664,6 +698,30 @@ impl CachedResponse {
 
         response
     }
+}
+
+/// Every field name listed in the response's `Vary`, lowercased and
+/// de-duplicated.
+///
+/// Gathered from *every* key that is `Vary` case-insensitively — the response
+/// map is keyed as the handler spelled the name, so `vary: Cookie` and a
+/// separate `Vary: Accept` are both part of the one field. Missing either
+/// stores a per-user variant under a key that every user shares.
+fn response_vary(response: &HttpResponse) -> Vec<String> {
+    let mut names: Vec<String> = Vec::new();
+    for (_, value) in response
+        .headers
+        .iter()
+        .filter(|(k, _)| k.eq_ignore_ascii_case("vary"))
+    {
+        for name in value.split(',').map(str::trim).filter(|s| !s.is_empty()) {
+            let name = name.to_ascii_lowercase();
+            if !names.contains(&name) {
+                names.push(name);
+            }
+        }
+    }
+    names
 }
 
 /// Case-insensitive response header lookup. Response headers are a plain
@@ -879,7 +937,10 @@ impl Default for ResponseCacheConfig {
             max_entries: 1000,
             default_ttl: Duration::from_secs(300), // 5 minutes
             max_body_size: 1024 * 1024,            // 1MB
-            cacheable_status_codes: vec![200, 203, 204, 206, 300, 301, 404, 405, 410, 414, 501],
+            // No 206: a partial response is one slice of a representation and
+            // `Range` is not part of the key, so storing it would answer a
+            // later full (or differently-ranged) request with that slice.
+            cacheable_status_codes: vec![200, 203, 204, 300, 301, 404, 405, 410, 414, 501],
             cacheable_methods: vec![
                 "GET".to_string(),
                 "HEAD".to_string(),
@@ -938,6 +999,9 @@ impl ResponseCache {
     /// response was stored are looked up by base key first, then used to
     /// build the full (Vary-aware) cache key from the request's headers.
     pub async fn get(&self, request: &HttpRequest) -> Option<HttpResponse> {
+        if has_ambiguous_host(request) {
+            return None;
+        }
         let base_key = CacheKey::from_request(request).to_string_key();
         let vary_headers = {
             let vary_index = self.vary_index.read().await;
@@ -953,6 +1017,9 @@ impl ResponseCache {
         request: &HttpRequest,
         vary_headers: &[&str],
     ) -> Option<HttpResponse> {
+        if has_ambiguous_host(request) {
+            return None;
+        }
         let key = CacheKey::from_request_with_vary(request, vary_headers);
         let key_str = key.to_string_key();
 
@@ -1018,11 +1085,8 @@ impl ResponseCache {
         }
 
         // Get Vary headers from response
-        let vary_headers: Vec<&str> = response
-            .headers
-            .get("Vary")
-            .map(|v| v.split(',').map(|s| s.trim()).collect())
-            .unwrap_or_default();
+        let vary_names = response_vary(response);
+        let vary_headers: Vec<&str> = vary_names.iter().map(String::as_str).collect();
 
         let key = CacheKey::from_request_with_vary(request, &vary_headers);
         let key_str = key.to_string_key();
@@ -1105,6 +1169,20 @@ impl ResponseCache {
             return false;
         }
 
+        // Two `Host` lines: the key would name one site while the response
+        // may be for the other (see `has_ambiguous_host`).
+        if has_ambiguous_host(request) {
+            return false;
+        }
+
+        // RFC 9111 section 4.1: `Vary: *` always fails to match, so storing it
+        // is pointless — and here it was worse than pointless, since `*` was
+        // keyed as a request header no request carries, i.e. one variant for
+        // everyone.
+        if response_vary(response).iter().any(|name| name == "*") {
+            return false;
+        }
+
         // Check response Cache-Control (RFC 9111): this is a shared cache,
         // so no-store, private, and no-cache responses must not be stored.
         let cache_control =
@@ -1117,16 +1195,18 @@ impl ResponseCache {
 
         // RFC 9111 §3.5: responses to requests with an Authorization header
         // must not be stored in a shared cache unless the response explicitly
-        // allows it (public, s-maxage, or must-revalidate).
-        let has_authorization = request
-            .headers
-            .get("Authorization")
-            .or_else(|| request.headers.get("authorization"))
-            .is_some();
+        // allows it. The RFC also accepts `must-revalidate`, on the premise
+        // that the cache revalidates with the origin — which re-checks the
+        // credential — before every reuse once stale. This cache never
+        // revalidates and does not key on the credential, so a
+        // `must-revalidate` entry would be replayed to other callers verbatim
+        // while fresh. Only `public` and `s-maxage`, which state the response
+        // is fit for a shared cache, are accepted.
+        let has_authorization = request.headers.contains("authorization");
         if has_authorization {
-            let explicitly_allowed = cache_control.as_ref().is_some_and(|cc| {
-                cc.is_public() || cc.get_s_maxage().is_some() || cc.is_must_revalidate()
-            });
+            let explicitly_allowed = cache_control
+                .as_ref()
+                .is_some_and(|cc| cc.is_public() || cc.get_s_maxage().is_some());
             if !explicitly_allowed {
                 return false;
             }
@@ -2188,5 +2268,149 @@ mod tests {
             "Accept-Encoding variant lost after second store",
         );
         assert_eq!(hit_enc.unwrap().body, Bytes::from_static(b"gzip-body"));
+    }
+
+    // ---- Security hardening ------------------------------------------------
+
+    /// A `vary` header spelled in lowercase must key variants exactly like
+    /// `Vary`: response headers are a case-sensitive map, so a
+    /// `headers.get("Vary")` lookup ignored it and stored one variant for
+    /// every caller.
+    #[tokio::test]
+    async fn test_lowercase_vary_cookie_keys_variants() {
+        let cache = ResponseCache::new();
+
+        let mut alice = HttpRequest::new("GET", "/dash".to_string());
+        alice.headers.insert("Cookie", "session=alice".to_string());
+        let mut response = fresh();
+        response
+            .headers
+            .insert("vary".to_string(), "Cookie".to_string());
+        response.body = Bytes::from_static(b"alice's page");
+        cache.store(&alice, &response).await;
+        assert!(cache.get(&alice).await.is_some());
+
+        let mut bob = HttpRequest::new("GET", "/dash".to_string());
+        bob.headers.insert("Cookie", "session=bob".to_string());
+        assert!(
+            cache.get(&bob).await.is_none(),
+            "a lowercase `vary: Cookie` must keep Bob off Alice's variant"
+        );
+    }
+
+    /// Two `Vary` keys that differ only in case are one field; both lists
+    /// must feed the key.
+    #[test]
+    fn test_cached_response_collects_vary_from_every_casing() {
+        let mut response = fresh();
+        response
+            .headers
+            .insert("Vary".to_string(), "Accept".to_string());
+        response
+            .headers
+            .insert("vary".to_string(), "Cookie".to_string());
+        let mut vary = CachedResponse::new(&response, Duration::from_secs(1)).vary;
+        vary.sort();
+        assert_eq!(vary, vec!["accept".to_string(), "cookie".to_string()]);
+    }
+
+    /// RFC 9111 section 4.1: `Vary: *` never matches, so such a response
+    /// must not be stored (it used to be keyed on a header named `*`, which
+    /// no request carries, i.e. shared by everyone).
+    #[tokio::test]
+    async fn test_vary_star_not_stored() {
+        let cache = ResponseCache::new();
+        let request = HttpRequest::new("GET", "/star".to_string());
+        for vary in ["*", "Accept, *"] {
+            let mut response = fresh();
+            response
+                .headers
+                .insert("Vary".to_string(), vary.to_string());
+            cache.store(&request, &response).await;
+            assert!(cache.get(&request).await.is_none(), "Vary: {vary}");
+        }
+    }
+
+    /// `must-revalidate` alone does not let an authenticated response into
+    /// this cache: it never revalidates and the key carries no credential.
+    #[tokio::test]
+    async fn test_authorization_with_must_revalidate_not_stored() {
+        let cache = ResponseCache::new();
+        let mut request = HttpRequest::new("GET", "/api/me".to_string());
+        request
+            .headers
+            .insert("Authorization", "Bearer user-a".to_string());
+        let response = HttpResponse::ok().with_cache_control(
+            CacheControl::new()
+                .max_age(Duration::from_secs(60))
+                .must_revalidate(),
+        );
+        cache.store(&request, &response).await;
+        assert!(cache.get(&request).await.is_none());
+
+        // `s-maxage` is still an explicit shared-cache grant.
+        let response = HttpResponse::ok()
+            .with_cache_control(CacheControl::new().s_maxage(Duration::from_secs(60)));
+        cache.store(&request, &response).await;
+        assert!(cache.get(&request).await.is_some());
+    }
+
+    /// Two virtual hosts serving the same path must not share an entry.
+    #[tokio::test]
+    async fn test_cache_key_includes_host() {
+        let cache = ResponseCache::new();
+        let mut a = HttpRequest::new("GET", "/".to_string());
+        a.headers.insert("Host", "a.example".to_string());
+        let mut response = fresh();
+        response.body = Bytes::from_static(b"site a");
+        cache.store(&a, &response).await;
+
+        let mut b = HttpRequest::new("GET", "/".to_string());
+        b.headers.insert("Host", "b.example".to_string());
+        assert!(cache.get(&b).await.is_none(), "Host must be in the key");
+
+        // Case and the default port do not make a different authority.
+        let mut a_again = HttpRequest::new("GET", "/".to_string());
+        a_again.headers.insert("Host", "A.Example:80".to_string());
+        assert_eq!(
+            cache.get(&a_again).await.map(|r| r.body),
+            Some(Bytes::from_static(b"site a"))
+        );
+    }
+
+    /// A request carrying two `Host` lines is ambiguous about which site it
+    /// is for; it must neither read from nor write to the cache.
+    #[tokio::test]
+    async fn test_duplicate_host_bypasses_cache() {
+        let cache = ResponseCache::new();
+        let mut single = HttpRequest::new("GET", "/".to_string());
+        single.headers.insert("Host", "a.example".to_string());
+        cache.store(&single, &fresh()).await;
+
+        let mut dup = HttpRequest::new("GET", "/".to_string());
+        dup.headers.append("Host", "a.example");
+        dup.headers.append("Host", "evil.example");
+        assert!(cache.get(&dup).await.is_none(), "lookup must be bypassed");
+
+        cache.clear().await;
+        cache.store(&dup, &fresh()).await;
+        assert_eq!(
+            cache.stats().await.total_entries,
+            0,
+            "store must be bypassed"
+        );
+    }
+
+    /// A 206 is one slice of a representation, and `Range` is not in the
+    /// key, so storing it would answer full-body requests with a fragment.
+    #[tokio::test]
+    async fn test_partial_content_not_stored() {
+        let cache = ResponseCache::new();
+        let mut request = HttpRequest::new("GET", "/video".to_string());
+        request.headers.insert("Range", "bytes=0-9".to_string());
+        let mut response = fresh();
+        response.status = 206;
+        cache.store(&request, &response).await;
+        assert!(cache.get(&request).await.is_none());
     }
 }

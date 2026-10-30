@@ -24,7 +24,9 @@ matchit = "0.9"  # High-performance router (same as Axum)
 # HTTPS listeners hand it a rustls config; hyper still serves HTTP/2.
 armature-h1 = { version = "0.6", features = ["tls"] }
 tokio = { version = "1.53", features = ["rt", "rt-multi-thread", "macros", "sync", "time", "net", "io-util", "fs", "signal"] }
-hyper = { version = "1.11", features = ["full"] }
+# Server-side only: the HTTP client is a test concern (see [dev-dependencies]),
+# and compiling it into the library only widens what every server ships.
+hyper = { version = "1.11", features = ["server", "http1", "http2"] }
 hyper-util = { version = "0.1", features = ["server", "http1", "http2", "tokio"] }
 http-body-util = "0.1"
 http = "1.5"
@@ -55,7 +57,7 @@ brotli = "9.0"
 zstd = "0.14"
 uuid = { version = "1.26", features = ["v4"] }
 thiserror = "2.0"
-tokio-tungstenite = { version = "0.30", default-features = false, features = ["connect", "handshake"] }
+tokio-tungstenite = { version = "0.30", default-features = false, features = ["handshake"] }
 futures-util = "0.3"
 tokio-stream = "0.1"
 regex = "1.13"
@@ -75,14 +77,20 @@ tracing-subscriber = { version = "0.3.23", features = ["json", "env-filter"] }
 tracing-appender = "0.2"
 
 # TLS/HTTPS support
-rustls = { version = "0.23.45", features = ["ring"] }
-tokio-rustls = "0.26"
+# Default features off: rustls and tokio-rustls default to the aws-lc provider,
+# which would build a second C crypto library that is never called — every TLS
+# entry point names ring explicitly (`src/tls.rs`). `deny.toml` bans aws-lc-sys
+# so a dependency's defaults cannot bring it back unnoticed.
+rustls = { version = "0.23.45", default-features = false, features = ["ring", "std", "tls12", "logging"] }
+tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12", "logging"] }
 # PEM parsing via `PemObject` (replaces the unmaintained `rustls-pemfile`).
 rustls-pki-types = { version = "1.12", features = ["std"] }
 rcgen = { version = "0.14", optional = true }
 
 # HTTP/3 (QUIC) support - optional
-quinn = { version = "0.11", optional = true }
+# Server endpoint only: quinn's default `platform-verifier` is client-side
+# OS trust-store code this crate never uses.
+quinn = { version = "0.11", optional = true, default-features = false, features = ["log", "runtime-tokio", "rustls-ring"] }
 h3 = { version = "0.0.8", optional = true }
 h3-quinn = { version = "0.0.10", optional = true }
 
@@ -118,8 +126,12 @@ http3 = ["quinn", "h3", "h3-quinn"]
 io-uring = ["dep:io-uring"]
 
 [dev-dependencies]
-cargo-husky = { version = "1.5", default-features = false, features = ["user-hooks"] }
 tokio-test = "0.4"
+# The client halves of hyper and tungstenite, for the tests that drive a real
+# server from the outside. Kept out of [dependencies] so the published library
+# compiles server code only.
+hyper = { version = "1.11", features = ["client", "http1", "http2"] }
+tokio-tungstenite = { version = "0.30", default-features = false, features = ["connect", "handshake"] }
 criterion = { version = "0.8", features = ["html_reports", "async_tokio"] }
 
 # Explicit bench targets only: a stray file under benches/ should not silently
@@ -163,4 +175,3 @@ harness = false
 [[bench]]
 name = "internal_overhead"
 harness = false
-

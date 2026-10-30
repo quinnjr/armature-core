@@ -135,7 +135,8 @@ impl BoxedHandler {
         &self,
         req: HttpRequest,
     ) -> Pin<Box<dyn Future<Output = Result<HttpResponse, Error>> + Send>> {
-        trace!(path = %req.path, method = %req.method, "Handler dispatch");
+        // Path only: the query string may carry secrets.
+        trace!(path = %req.path_only(), method = %req.method, "Handler dispatch");
         self.inner.call(req)
     }
 }

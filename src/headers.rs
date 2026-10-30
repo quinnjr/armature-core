@@ -113,31 +113,88 @@ impl Header {
 }
 
 /// Header names whose values are credentials and must never reach a log
-/// through `Debug`: `authorization`, `proxy-authorization`, `cookie`,
-/// `set-cookie` and `x-api-key`. Compared case-insensitively.
+/// through `Debug`. Compared case-insensitively.
+///
+/// This is the exact-name list; [`is_sensitive_header`] additionally treats
+/// any name containing one of [`SENSITIVE_HEADER_FRAGMENTS`] as sensitive, so
+/// application-specific headers such as `x-session-token` are covered too.
 pub const SENSITIVE_HEADERS: &[&str] = &[
     "authorization",
     "proxy-authorization",
     "cookie",
     "set-cookie",
     "x-api-key",
+    "x-auth-token",
+    "x-access-token",
+    "x-csrf-token",
+    "x-xsrf-token",
+    "x-amz-security-token",
+    "x-goog-api-key",
+    "x-hub-signature",
+    "x-hub-signature-256",
+    "authentication-info",
+    "proxy-authentication-info",
+];
+
+/// Substrings that mark a header name as sensitive wherever they appear in it
+/// (case-insensitively).
+pub const SENSITIVE_HEADER_FRAGMENTS: &[&str] = &[
+    "token",
+    "secret",
+    "api-key",
+    "apikey",
+    "signature",
+    "password",
 ];
 
 /// What `Debug` prints in place of a sensitive header's value.
 pub const REDACTED: &str = "<redacted>";
 
-/// Whether `name` is one of [`SENSITIVE_HEADERS`] (case-insensitively).
+/// Whether `name` is one of [`SENSITIVE_HEADERS`], or contains one of
+/// [`SENSITIVE_HEADER_FRAGMENTS`] (case-insensitively).
 ///
 /// ```
 /// use armature_core::headers::is_sensitive_header;
 /// assert!(is_sensitive_header("Authorization"));
+/// assert!(is_sensitive_header("X-Session-Token"));
 /// assert!(!is_sensitive_header("content-type"));
 /// ```
 #[inline]
 pub fn is_sensitive_header(name: &str) -> bool {
-    SENSITIVE_HEADERS
+    if SENSITIVE_HEADERS
         .iter()
         .any(|s| s.eq_ignore_ascii_case(name))
+    {
+        return true;
+    }
+    // Only reached from `Debug` impls, so the allocation is off the hot path.
+    let lower = name.to_ascii_lowercase();
+    SENSITIVE_HEADER_FRAGMENTS
+        .iter()
+        .any(|frag| lower.contains(frag))
+}
+
+/// Whether an inbound request/correlation ID is safe to adopt and echo back.
+///
+/// IDs taken from `X-Request-ID`, `X-Correlation-ID` and similar headers are
+/// chosen by the client. Reflecting them unchecked lets a caller plant
+/// arbitrary text (control characters, log-forging payloads, oversized
+/// values) in response headers and logs. Only `^[A-Za-z0-9._-]{1,128}$` is
+/// accepted; callers generate a fresh ID for anything else.
+///
+/// ```
+/// use armature_core::headers::is_valid_request_id;
+/// assert!(is_valid_request_id("req-123_abc.DEF"));
+/// assert!(!is_valid_request_id(""));
+/// assert!(!is_valid_request_id("a b"));
+/// assert!(!is_valid_request_id("x\r\nSet-Cookie: y"));
+/// ```
+#[inline]
+pub fn is_valid_request_id(id: &str) -> bool {
+    (1..=128).contains(&id.len())
+        && id
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-'))
 }
 
 impl fmt::Debug for Header {
@@ -920,6 +977,41 @@ impl From<HeaderMap> for HashMap<String, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn sensitive_header_list_and_fragments() {
+        for name in [
+            "X-Auth-Token",
+            "x-csrf-token",
+            "X-Amz-Security-Token",
+            "x-goog-api-key",
+            "X-Hub-Signature-256",
+            "Authentication-Info",
+            "X-Session-Token",
+            "X-Client-Secret",
+            "X-Service-ApiKey",
+            "X-Db-Password",
+        ] {
+            assert!(is_sensitive_header(name), "{name} must be redacted");
+        }
+        for name in ["content-type", "accept", "x-request-id", "user-agent"] {
+            assert!(!is_sensitive_header(name), "{name} is not a credential");
+        }
+
+        let mut map = HeaderMap::new();
+        map.insert("x-session-token", "s3cret");
+        assert!(!format!("{map:?}").contains("s3cret"));
+    }
+
+    #[test]
+    fn request_id_validation() {
+        assert!(is_valid_request_id("abc-123"));
+        assert!(is_valid_request_id(&"a".repeat(128)));
+        assert!(!is_valid_request_id(&"a".repeat(129)));
+        assert!(!is_valid_request_id(""));
+        assert!(!is_valid_request_id("abc\r\nx: y"));
+        assert!(!is_valid_request_id("<script>"));
+    }
 
     /// H27: credentials never reach a log through `{:?}`.
     #[test]

@@ -55,6 +55,11 @@ pub struct Http2Config {
 
     /// Maximum concurrent streams per connection
     /// Default: 100 - balance between parallelism and resource usage
+    ///
+    /// Kept at the RFC 9113 recommended minimum rather than lowered: what made
+    /// a high stream count dangerous was each stream buffering a whole body,
+    /// and that is bounded per connection by
+    /// [`max_buffered_body_bytes`](Self::max_buffered_body_bytes) instead.
     pub max_concurrent_streams: u32,
 
     /// Maximum frame size (bytes)
@@ -86,6 +91,20 @@ pub struct Http2Config {
     /// Enable adaptive flow control window sizing
     /// Default: true
     pub adaptive_window: bool,
+
+    /// Most request-body bytes one connection may hold buffered at once,
+    /// summed across all of its concurrent streams; `None` (the default) means
+    /// twice the application's body cap
+    /// ([`Application::with_max_body_size`](crate::Application::with_max_body_size)).
+    ///
+    /// Every request body is buffered whole before its handler runs, so
+    /// without this an HTTP/2 connection could hold `max_concurrent_streams`
+    /// bodies of up to the body cap each — a gigabyte per connection at the
+    /// defaults — where an HTTP/1.1 connection holds one. A stream whose body
+    /// would push the connection past the budget is answered `503` and the
+    /// bytes it had buffered are released; the client may retry it once its
+    /// other uploads finish.
+    pub max_buffered_body_bytes: Option<usize>,
 }
 
 impl Default for Http2Config {
@@ -101,6 +120,7 @@ impl Default for Http2Config {
             keep_alive_timeout: Duration::from_secs(10),
             max_send_buffer_size: 1024 * 1024, // 1MB
             adaptive_window: true,
+            max_buffered_body_bytes: None,
         }
     }
 }
@@ -124,6 +144,7 @@ impl Http2Config {
             keep_alive_timeout: Duration::from_secs(15),
             max_send_buffer_size: 4 * 1024 * 1024, // 4MB
             adaptive_window: true,
+            max_buffered_body_bytes: None,
         }
     }
 
@@ -140,6 +161,7 @@ impl Http2Config {
             keep_alive_timeout: Duration::from_secs(5),
             max_send_buffer_size: 256 * 1024, // 256KB
             adaptive_window: false,
+            max_buffered_body_bytes: None,
         }
     }
 
@@ -156,6 +178,7 @@ impl Http2Config {
             keep_alive_timeout: Duration::from_secs(20),
             max_send_buffer_size: 128 * 1024, // 128KB
             adaptive_window: false,
+            max_buffered_body_bytes: None,
         }
     }
 }
@@ -224,6 +247,13 @@ impl Http2ConfigBuilder {
     /// Enable or disable adaptive window sizing
     pub fn adaptive_window(mut self, enable: bool) -> Self {
         self.config.adaptive_window = enable;
+        self
+    }
+
+    /// Set the per-connection budget for buffered request bodies (see
+    /// [`Http2Config::max_buffered_body_bytes`]).
+    pub fn max_buffered_body_bytes(mut self, bytes: Option<usize>) -> Self {
+        self.config.max_buffered_body_bytes = bytes;
         self
     }
 
@@ -434,6 +464,272 @@ impl Default for Http2Builder {
     }
 }
 
+impl Http2Builder {
+    /// Everything needed to serve one connection with this builder's tuning
+    /// and the connection-lifetime deadlines below.
+    ///
+    /// `pipeline` supplies the two deadlines HTTP/2 shares with HTTP/1.1 —
+    /// `keep_alive_timeout` (how long a connection may sit with no request in
+    /// flight) and `write_timeout` (how long one write may stall) — so a
+    /// deployment configures idleness once for every TCP listener.
+    /// `max_body_size` is the application's body cap, from which the
+    /// per-connection body budget defaults.
+    pub(crate) fn connection_server(
+        &self,
+        pipeline: &crate::pipeline::PipelineConfig,
+        max_body_size: usize,
+    ) -> H2ConnectionServer {
+        H2ConnectionServer {
+            builder: self.configure_hyper_builder(),
+            stats: Arc::clone(&self.stats),
+            limits: H2ConnectionLimits {
+                handshake_timeout: crate::pipeline::HEADER_READ_TIMEOUT,
+                idle_timeout: pipeline.keep_alive_timeout,
+                shutdown_grace: crate::pipeline::HEADER_READ_TIMEOUT,
+                write_timeout: pipeline.write_timeout,
+                body_budget: self
+                    .config
+                    .max_buffered_body_bytes
+                    .unwrap_or_else(|| max_body_size.saturating_mul(2))
+                    // At least one maximal body must fit, or a lone upload the
+                    // application accepts over HTTP/1.1 is refused here.
+                    .max(max_body_size),
+            },
+        }
+    }
+}
+
+// ============================================================================
+// Bounded connection serving
+// ============================================================================
+
+/// The deadlines and budgets one hyper-served HTTP/2 connection runs under.
+///
+/// hyper's HTTP/2 driver has none of its own: no deadline for the client
+/// preface, and no idle timeout — its keep-alive PINGs only detect a *dead*
+/// peer, and a live one that answers them while opening no streams holds the
+/// connection, its slot in the accept loop's connection limit (or in an
+/// `armature-h1` worker's), and its buffers forever. A few thousand of those
+/// exhaust the limit and the server stops accepting.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct H2ConnectionLimits {
+    /// From accept to the first request: covers the client preface, the
+    /// SETTINGS exchange and the first HEADERS frame.
+    pub(crate) handshake_timeout: Duration,
+    /// How long the connection may have no stream in flight before it is
+    /// closed (`GOAWAY`, then a close once the peer acknowledges).
+    pub(crate) idle_timeout: Duration,
+    /// How long a graceful shutdown may take before the connection is simply
+    /// dropped: a peer that never answers the `GOAWAY` handshake must not turn
+    /// "closing" into a new way to hold a slot.
+    pub(crate) shutdown_grace: Duration,
+    /// How long one socket write may stall (see
+    /// [`WriteDeadline`](crate::pipeline::WriteDeadline)).
+    pub(crate) write_timeout: Option<Duration>,
+    /// Request-body bytes the connection may buffer at once across streams.
+    pub(crate) body_budget: usize,
+}
+
+/// Serves HTTP/2 connections through hyper under [`H2ConnectionLimits`].
+///
+/// The one place every hyper HTTP/2 connection is driven — `listen_h2c`, the
+/// hyper `listen_https_h2`, and the `armature-h1` ALPN fallback — so the
+/// deadlines cannot be present on one listener and missing on another.
+#[derive(Clone)]
+pub(crate) struct H2ConnectionServer {
+    builder: hyper::server::conn::http2::Builder<hyper_util::rt::TokioExecutor>,
+    stats: Arc<Http2Stats>,
+    limits: H2ConnectionLimits,
+}
+
+impl H2ConnectionServer {
+    /// The limits this server applies.
+    #[cfg(test)]
+    pub(crate) fn limits(&self) -> H2ConnectionLimits {
+        self.limits
+    }
+
+    /// The same server with different limits, for tests that need deadlines
+    /// short enough to wait out.
+    #[cfg(test)]
+    pub(crate) fn with_limits(mut self, limits: H2ConnectionLimits) -> Self {
+        self.limits = limits;
+        self
+    }
+
+    /// Serve `io` as one HTTP/2 connection with `state`, until the peer closes
+    /// it, it fails, or a deadline closes it.
+    ///
+    /// Not `Send`-bounded on `io`: the `armature-h1` fallback hands over a
+    /// `Box<dyn Transport>` on a `current_thread` worker, and the accept loops
+    /// that do spawn this onto a multi-threaded runtime pass a `Send` stream,
+    /// which makes the future `Send` for them.
+    pub(crate) async fn serve<T>(
+        &self,
+        io: T,
+        state: crate::application::ServeState,
+    ) -> Result<(), hyper::Error>
+    where
+        T: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + 'static,
+    {
+        use hyper::body::Incoming as IncomingBody;
+        use hyper::service::service_fn;
+
+        let limits = self.limits;
+        let tracker = Arc::new(StreamTracker::new());
+        // One budget per connection, shared by its streams through the state
+        // every one of them is served with.
+        let state = state.with_body_budget(limits.body_budget);
+        let stats = Arc::clone(&self.stats);
+        stats.connection_opened();
+
+        let service = {
+            let tracker = Arc::clone(&tracker);
+            let stats = Arc::clone(&stats);
+            service_fn(move |req: hyper::Request<IncomingBody>| {
+                // Taken before the handler future exists, released when it
+                // completes or is dropped (a reset stream): the idle clock
+                // runs only while nothing is in flight.
+                let active = tracker.begin();
+                stats.request_processed();
+                let state = state.clone();
+                async move {
+                    let _active = active;
+                    crate::application::handle_request(req, state).await
+                }
+            })
+        };
+
+        let io = hyper_util::rt::TokioIo::new(crate::pipeline::WriteDeadline::new(
+            io,
+            limits.write_timeout,
+        ));
+        let conn = self.builder.serve_connection(io, service);
+        let mut conn = std::pin::pin!(conn);
+
+        let mut deadline = tracker.started + limits.handshake_timeout;
+        let served = loop {
+            tokio::select! {
+                served = conn.as_mut() => break Some(served),
+                () = tokio::time::sleep_until(deadline) => {
+                    match tracker.next_deadline(
+                        tokio::time::Instant::now(),
+                        limits.idle_timeout,
+                    ) {
+                        Some(next) => deadline = next,
+                        None => break None,
+                    }
+                }
+            }
+        };
+
+        let served = match served {
+            Some(served) => served,
+            None => {
+                crate::logging::debug!(
+                    seen_request = tracker.seen(),
+                    "closing an HTTP/2 connection that is idle past its deadline"
+                );
+                stats.goaway_sent();
+                // `GOAWAY` and let in-flight work (there is none) finish; a
+                // connection still mid-handshake is closed as soon as the
+                // handshake completes, which for a silent peer is never — so
+                // the grace bound below is what actually ends it.
+                conn.as_mut().graceful_shutdown();
+                tokio::time::timeout(limits.shutdown_grace, conn.as_mut())
+                    .await
+                    .unwrap_or(Ok(()))
+            }
+        };
+        stats.connection_closed();
+        served
+    }
+}
+
+/// Counts a connection's in-flight streams and remembers when it last went
+/// idle, so a watcher can tell an idle connection from a busy one without
+/// being woken per request. Shared by [`H2ConnectionServer::serve`] and the
+/// HTTP/3 server, which has the same problem: a peer that keeps a connection
+/// alive at the transport level (PING frames) while opening no streams.
+///
+/// The watcher sleeps until the earliest moment the connection *could* be
+/// over its deadline, then asks [`next_deadline`](Self::next_deadline): one
+/// timer per idle period rather than one per request, and two atomic updates
+/// on the request path.
+pub(crate) struct StreamTracker {
+    /// When the connection was accepted; the first-request deadline counts
+    /// from here.
+    pub(crate) started: tokio::time::Instant,
+    active: AtomicUsize,
+    /// Streams ever begun; non-zero once the handshake deadline is satisfied.
+    begun: AtomicU64,
+    /// When `active` last fell to zero, as nanoseconds since `started`.
+    idle_since_nanos: AtomicU64,
+}
+
+impl StreamTracker {
+    pub(crate) fn new() -> Self {
+        Self {
+            started: tokio::time::Instant::now(),
+            active: AtomicUsize::new(0),
+            begun: AtomicU64::new(0),
+            idle_since_nanos: AtomicU64::new(0),
+        }
+    }
+
+    /// Whether any stream has begun.
+    pub(crate) fn seen(&self) -> bool {
+        self.begun.load(Ordering::Acquire) > 0
+    }
+
+    /// Count one stream in flight until the returned guard drops.
+    pub(crate) fn begin(self: &Arc<Self>) -> ActiveStream {
+        self.active.fetch_add(1, Ordering::AcqRel);
+        self.begun.fetch_add(1, Ordering::AcqRel);
+        ActiveStream(Arc::clone(self))
+    }
+
+    /// When the watcher should look again, or `None` to close the connection.
+    ///
+    /// Called when the previous deadline fires; the first one is `started`
+    /// plus the first-request timeout, so a connection that has never begun a
+    /// stream by then is closed.
+    pub(crate) fn next_deadline(
+        &self,
+        now: tokio::time::Instant,
+        idle_timeout: Duration,
+    ) -> Option<tokio::time::Instant> {
+        if !self.seen() {
+            // The first-request deadline has passed without a single request.
+            return None;
+        }
+        if self.active.load(Ordering::Acquire) > 0 {
+            return Some(now + idle_timeout);
+        }
+        let idle_since =
+            self.started + Duration::from_nanos(self.idle_since_nanos.load(Ordering::Acquire));
+        let expires = idle_since + idle_timeout;
+        (expires > now).then_some(expires)
+    }
+}
+
+/// One in-flight stream; dropping it may start the connection's idle clock.
+pub(crate) struct ActiveStream(Arc<StreamTracker>);
+
+impl Drop for ActiveStream {
+    fn drop(&mut self) {
+        let tracker = &self.0;
+        // Stamp before decrementing, so a watcher that sees `active == 0` also
+        // sees an idle-since no older than the moment it became true.
+        let since = tokio::time::Instant::now().saturating_duration_since(tracker.started);
+        tracker.idle_since_nanos.store(
+            u64::try_from(since.as_nanos()).unwrap_or(u64::MAX),
+            Ordering::Release,
+        );
+        tracker.active.fetch_sub(1, Ordering::AcqRel);
+    }
+}
+
 // ============================================================================
 // Protocol Detection
 // ============================================================================
@@ -560,5 +856,190 @@ mod tests {
             config.max_concurrent_streams
         );
         assert_eq!(builder.stats().active_connections(), 0);
+    }
+
+    // ---- Connection deadlines -------------------------------------------
+
+    use crate::application::ServeState;
+    use crate::route_cache::OptimizedRouter;
+    use crate::{Error, HttpRequest, HttpResponse, Router};
+    use bytes::Bytes;
+    use http_body_util::{BodyExt, Empty};
+    use std::time::Instant;
+
+    async fn hello(_req: HttpRequest) -> Result<HttpResponse, Error> {
+        Ok(HttpResponse::ok().with_body(b"hello".to_vec()))
+    }
+
+    async fn slow(_req: HttpRequest) -> Result<HttpResponse, Error> {
+        tokio::time::sleep(Duration::from_millis(600)).await;
+        Ok(HttpResponse::ok().with_body(b"slow".to_vec()))
+    }
+
+    fn state() -> ServeState {
+        let mut router = Router::new();
+        router.get("/hello", hello);
+        router.get("/slow", slow);
+        ServeState::for_test(
+            Arc::new(OptimizedRouter::from_router(&router)),
+            crate::DEFAULT_MAX_BODY_SIZE,
+        )
+    }
+
+    /// Deadlines short enough for a test to wait out.
+    fn short(stats: Arc<Http2Stats>) -> H2ConnectionServer {
+        let limits = H2ConnectionLimits {
+            handshake_timeout: Duration::from_millis(200),
+            idle_timeout: Duration::from_millis(300),
+            shutdown_grace: Duration::from_millis(200),
+            write_timeout: Some(Duration::from_secs(5)),
+            body_budget: 1024,
+        };
+        Http2Builder::with_stats(Http2Config::default(), stats)
+            .connection_server(&crate::pipeline::PipelineConfig::default(), 1024)
+            .with_limits(limits)
+    }
+
+    /// Serve one connection on a fresh loopback socket; returns the client end
+    /// and a handle that resolves when the server lets the connection go.
+    async fn serve_one(
+        server: H2ConnectionServer,
+    ) -> (tokio::net::TcpStream, tokio::task::JoinHandle<Instant>) {
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .unwrap();
+        let addr = listener.local_addr().unwrap();
+        let client = tokio::net::TcpStream::connect(addr).await.unwrap();
+        let (stream, _) = listener.accept().await.unwrap();
+        let done = tokio::spawn(async move {
+            let _ = server.serve(stream, state()).await;
+            Instant::now()
+        });
+        (client, done)
+    }
+
+    #[test]
+    fn connection_server_takes_its_limits_from_the_pipeline_config() {
+        let pipeline = crate::pipeline::PipelineConfig {
+            keep_alive_timeout: Duration::from_secs(7),
+            write_timeout: Some(Duration::from_secs(9)),
+            ..crate::pipeline::PipelineConfig::default()
+        };
+        let limits = Http2Builder::new()
+            .connection_server(&pipeline, 1000)
+            .limits();
+        assert_eq!(limits.idle_timeout, Duration::from_secs(7));
+        assert_eq!(limits.write_timeout, Some(Duration::from_secs(9)));
+        assert_eq!(
+            limits.handshake_timeout,
+            crate::pipeline::HEADER_READ_TIMEOUT
+        );
+        assert_eq!(limits.body_budget, 2000, "twice the body cap by default");
+
+        // An explicit budget is honoured, but never below one maximal body.
+        let config = Http2Config::builder()
+            .max_buffered_body_bytes(Some(10))
+            .build();
+        let limits = Http2Builder::with_config(config)
+            .connection_server(&pipeline, 1000)
+            .limits();
+        assert_eq!(limits.body_budget, 1000);
+    }
+
+    /// The finding: a peer that connects and sends nothing — not even the
+    /// preface — used to hold the connection forever.
+    #[tokio::test]
+    async fn a_silent_peer_is_dropped_after_the_handshake_deadline() {
+        let stats = Arc::new(Http2Stats::new());
+        let started = Instant::now();
+        let (_client, done) = serve_one(short(Arc::clone(&stats))).await;
+        let ended = tokio::time::timeout(Duration::from_secs(3), done)
+            .await
+            .expect("a silent connection must not be held past its deadlines")
+            .unwrap();
+        // Handshake deadline plus the shutdown grace, with slack.
+        assert!(ended - started < Duration::from_secs(2));
+        assert_eq!(stats.active_connections(), 0);
+        assert_eq!(stats.total_goaway_sent(), 1);
+    }
+
+    /// A peer that completes the handshake and keeps the connection alive at
+    /// the transport level (answering PINGs) but never opens a stream is
+    /// closed at the first-request deadline.
+    #[tokio::test]
+    async fn a_handshake_with_no_request_is_closed() {
+        let (client, done) = serve_one(short(Arc::new(Http2Stats::new()))).await;
+        let mut builder =
+            hyper::client::conn::http2::Builder::new(hyper_util::rt::TokioExecutor::new());
+        builder
+            .timer(hyper_util::rt::TokioTimer::new())
+            .keep_alive_interval(Duration::from_millis(50))
+            .keep_alive_while_idle(true);
+        let (_sender, conn) = builder
+            .handshake::<_, Empty<Bytes>>(hyper_util::rt::TokioIo::new(client))
+            .await
+            .expect("h2 handshake");
+        let client_conn = tokio::spawn(conn);
+
+        tokio::time::timeout(Duration::from_secs(3), done)
+            .await
+            .expect("a pinging-but-idle connection must still be closed")
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(3), client_conn)
+            .await
+            .expect("the client sees the close")
+            .unwrap()
+            .ok();
+    }
+
+    /// After serving requests, a connection with nothing in flight for the
+    /// idle timeout is closed with a GOAWAY; a request still running is not
+    /// cut off by it.
+    #[tokio::test]
+    async fn an_idle_connection_is_closed_but_an_in_flight_request_is_not() {
+        let (client, done) = serve_one(short(Arc::new(Http2Stats::new()))).await;
+        let (mut sender, conn) = hyper::client::conn::http2::handshake(
+            hyper_util::rt::TokioExecutor::new(),
+            hyper_util::rt::TokioIo::new(client),
+        )
+        .await
+        .expect("h2 handshake");
+        tokio::spawn(conn);
+
+        // Outlasts both the handshake and the idle deadline while in flight.
+        let request = hyper::Request::get("http://localhost/slow")
+            .body(Empty::<Bytes>::new())
+            .unwrap();
+        let response = sender.send_request(request).await.expect("served");
+        assert_eq!(response.status(), 200);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        assert_eq!(&body[..], b"slow");
+
+        let request = hyper::Request::get("http://localhost/hello")
+            .body(Empty::<Bytes>::new())
+            .unwrap();
+        assert_eq!(sender.send_request(request).await.unwrap().status(), 200);
+
+        let idle_from = Instant::now();
+        let ended = tokio::time::timeout(Duration::from_secs(3), done)
+            .await
+            .expect("an idle connection must be closed")
+            .unwrap();
+        assert!(ended - idle_from >= Duration::from_millis(250));
+    }
+
+    #[tokio::test]
+    async fn the_tracker_reports_idle_only_with_nothing_in_flight() {
+        let tracker = Arc::new(StreamTracker::new());
+        let idle = Duration::from_secs(10);
+        let now = tokio::time::Instant::now();
+        assert_eq!(tracker.next_deadline(now, idle), None, "no request yet");
+
+        let active = tracker.begin();
+        assert_eq!(tracker.next_deadline(now, idle), Some(now + idle));
+        drop(active);
+        let next = tracker.next_deadline(now, idle).expect("not idle long yet");
+        assert!(next > now);
+        assert_eq!(tracker.next_deadline(next, idle), None);
     }
 }

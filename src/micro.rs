@@ -666,7 +666,10 @@ impl Middleware for Logger {
         next: Next,
     ) -> Pin<Box<dyn Future<Output = Result<HttpResponse, Error>> + Send>> {
         let method = req.method.clone();
-        let path = req.path.clone();
+        // The path alone: `req.path` is the whole target, query included, and
+        // query strings carry tokens, reset codes and API keys often enough
+        // that writing them into INFO-level logs is a credential leak.
+        let path = req.path_only().to_owned();
 
         Box::pin(async move {
             let start = std::time::Instant::now();
@@ -880,6 +883,10 @@ impl Middleware for Cors {
 /// a pre-existing `Vary` (e.g. `Vary: Origin` from CORS middleware upstream)
 /// survives. Responses that already carry a `Content-Encoding` or have an
 /// empty body are passed through untouched (but still gain `Vary`).
+///
+/// As a BREACH mitigation, responses that set a cookie or carry
+/// `Cache-Control: no-store` / `private` are not compressed either; see
+/// `breach_sensitive` for what that does and does not protect.
 pub struct Compress {
     level: CompressionLevel,
 }
@@ -1078,6 +1085,43 @@ pub(crate) async fn apply_gzip_offload(
     response
 }
 
+/// Whether a response is one compression should leave alone as a BREACH
+/// mitigation.
+///
+/// BREACH recovers a secret from an HTTPS response by watching how its
+/// compressed length changes as attacker-chosen text reflected into the same
+/// body is varied: the guess that matches the secret compresses better. It
+/// needs a secret and reflected input in one compressed body, which no
+/// middleware can see; what it can see is the signal that a response is
+/// per-user and sensitive. So compression is skipped when the response sets a
+/// cookie (it is minting or refreshing a session, and often embeds a CSRF
+/// token beside it) or forbids shared caching with `Cache-Control: no-store`
+/// or `private` (the application has already said the body is not for anyone
+/// else). Static assets and public API responses — the bulk of what is worth
+/// compressing — carry neither and are unaffected.
+///
+/// This narrows the attack, it does not close it: a page that reflects input
+/// next to a secret without either marker is still exposed. Keep secrets out
+/// of compressed bodies that reflect request data, or mask them per response.
+///
+/// Header names are matched case-insensitively: `HttpResponse` stores them as
+/// the handler spelled them.
+pub(crate) fn breach_sensitive(response: &HttpResponse) -> bool {
+    if !response.cookies.is_empty() {
+        return true;
+    }
+    response.headers.iter().any(|(name, value)| {
+        if name.eq_ignore_ascii_case("set-cookie") {
+            return true;
+        }
+        name.eq_ignore_ascii_case("cache-control")
+            && value.split(',').any(|directive| {
+                let name = directive.split('=').next().unwrap_or("").trim();
+                name.eq_ignore_ascii_case("no-store") || name.eq_ignore_ascii_case("private")
+            })
+    })
+}
+
 /// Add `Accept-Encoding` to the response's `Vary` header, *merging* with any
 /// existing value instead of clobbering it — e.g. `Vary: Origin` set upstream
 /// by CORS middleware must survive compression adding its own dimension.
@@ -1123,9 +1167,14 @@ impl Middleware for Compress {
             add_vary_accept_encoding(&mut response);
 
             // Only compress when the client accepts gzip, the body is non-empty,
-            // and it is not already content-encoded.
+            // it is not already content-encoded, and it is not a response that
+            // looks like it carries a secret (see `breach_sensitive`).
             let already_encoded = response.headers.contains_key("Content-Encoding");
-            if client_accepts_gzip && !already_encoded && !response.body_ref().is_empty() {
+            if client_accepts_gzip
+                && !already_encoded
+                && !response.body_ref().is_empty()
+                && !breach_sensitive(&response)
+            {
                 response = apply_gzip_offload(response, level).await;
             }
 
@@ -1272,6 +1321,27 @@ async fn handle_micro_request(
         None => path.clone(),
     };
 
+    // The same authority rules as `Application`'s serve paths: an
+    // absolute-form target is refused, and an authority that disagrees with
+    // `Host` is a `400` rather than two answers to "which host is this for".
+    let host_from_authority = match crate::application::reconcile_authority(
+        req.version(),
+        req.method() == hyper::Method::CONNECT,
+        req.uri().authority().map(|a| a.as_str()),
+        req.headers()
+            .get_all(hyper::header::HOST)
+            .iter()
+            .map(|v| v.as_bytes()),
+    ) {
+        Ok(host) => host.map(str::to_owned),
+        Err(rejection) => {
+            tracing::warn!(method = %method, reason = rejection, "Rejected a request authority");
+            return Ok(to_hyper_response(
+                Error::BadRequest(rejection.to_string()).to_client_response(),
+            ));
+        }
+    };
+
     let mut http_req = HttpRequest::new(method.clone(), target).with_peer(peer);
 
     // Copy headers, keeping every occurrence of a repeated field.
@@ -1279,6 +1349,9 @@ async fn handle_micro_request(
         http_req
             .headers
             .append(name.as_str(), Bytes::copy_from_slice(value.as_bytes()));
+    }
+    if let Some(host) = host_from_authority {
+        http_req.headers.append("host", Bytes::from(host));
     }
 
     // Fast-path rejection: a declared Content-Length over the limit is
@@ -1336,6 +1409,11 @@ async fn handle_micro_request(
                     .to_client_response(),
             ));
         }
+        // Never produced here: the micro server serves HTTP/1.1, one request
+        // per connection at a time, and reads without a connection budget.
+        Err(BodyReadError::Overloaded) => {
+            return Ok(to_hyper_response(HttpResponse::new(503)));
+        }
         // Any other body-read error (malformed chunked framing, a dropped
         // connection mid-body) is a genuine failure to receive the request as
         // sent; substituting an empty body would let the handler act on a body
@@ -1386,7 +1464,12 @@ async fn serve(listener: tokio::net::TcpListener, app: Arc<BuiltApp>) -> std::io
             .await
             .expect("connection-limit semaphore is never closed");
         let (stream, client_addr) = listener.accept().await?;
-        let io = TokioIo::new(stream);
+        // The same stalled-reader bound as `Application`'s hyper listeners,
+        // at `PipelineConfig`'s default.
+        let io = TokioIo::new(crate::pipeline::WriteDeadline::new(
+            stream,
+            crate::pipeline::PipelineConfig::default().write_timeout,
+        ));
         let app = app.clone();
 
         tokio::spawn(async move {
@@ -2137,5 +2220,137 @@ mod tests {
             "expected echoed body length {}, got: {response:?}",
             body.len()
         );
+    }
+
+    fn next_with(build: fn() -> HttpResponse) -> Next {
+        Box::new(move |_req: HttpRequest| Box::pin(async move { Ok(build()) }))
+    }
+
+    fn gzip_request() -> HttpRequest {
+        let mut req = HttpRequest::new("GET", "/");
+        req.headers.insert("accept-encoding", "gzip");
+        req
+    }
+
+    /// BREACH: a response that sets a cookie is not compressed, whichever way
+    /// the cookie was attached, but still advertises `Vary`.
+    #[tokio::test]
+    async fn test_compress_skips_responses_that_set_cookies() {
+        let mw = Compress::new(CompressionLevel::Best);
+        for build in [
+            (|| {
+                let mut resp = HttpResponse::ok().with_body(vec![b'a'; 8192]);
+                resp.cookies.push("session=abc; HttpOnly".to_string());
+                resp
+            }) as fn() -> HttpResponse,
+            || {
+                let mut resp = HttpResponse::ok().with_body(vec![b'a'; 8192]);
+                resp.headers
+                    .insert("set-cookie".to_string(), "csrf=xyz".to_string());
+                resp
+            },
+        ] {
+            let resp = mw.call(gzip_request(), next_with(build)).await.unwrap();
+            assert!(resp.headers.get("Content-Encoding").is_none());
+            assert_eq!(resp.body_ref().len(), 8192);
+            assert_eq!(
+                resp.headers.get("Vary").map(String::as_str),
+                Some("Accept-Encoding")
+            );
+        }
+    }
+
+    /// BREACH: `Cache-Control: no-store` / `private` mark a per-user body,
+    /// which stays uncompressed; a public one is still compressed.
+    #[tokio::test]
+    async fn test_compress_skips_private_and_no_store_responses() {
+        let mw = Compress::new(CompressionLevel::Best);
+        for (cache_control, compressed) in [
+            ("no-store", false),
+            ("max-age=0, Private", false),
+            ("private=\"set-cookie\"", false),
+            ("public, max-age=60", true),
+        ] {
+            let mut resp = HttpResponse::ok().with_body(vec![b'a'; 8192]);
+            resp.headers
+                .insert("Cache-Control".to_string(), cache_control.to_string());
+            assert_eq!(breach_sensitive(&resp), !compressed, "{cache_control}");
+        }
+        let resp = mw
+            .call(
+                gzip_request(),
+                next_with(|| {
+                    let mut resp = HttpResponse::ok().with_body(vec![b'a'; 8192]);
+                    resp.headers
+                        .insert("cache-control".to_string(), "no-store".to_string());
+                    resp
+                }),
+            )
+            .await
+            .unwrap();
+        assert!(resp.headers.get("Content-Encoding").is_none());
+    }
+
+    /// The logger records the path, never the query string, which routinely
+    /// carries tokens.
+    #[tokio::test]
+    async fn test_logger_does_not_log_the_query_string() {
+        use std::sync::Mutex;
+
+        #[derive(Clone, Default)]
+        struct Captured(Arc<Mutex<Vec<u8>>>);
+        impl std::io::Write for Captured {
+            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().unwrap().extend_from_slice(buf);
+                Ok(buf.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+
+        let captured = Captured::default();
+        let writer = captured.clone();
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(move || writer.clone())
+            .with_ansi(false)
+            .finish();
+        let _guard = tracing::subscriber::set_default(subscriber);
+
+        let req = HttpRequest::new("GET", "/reset?token=s3cr3t");
+        Logger::default()
+            .call(req, body_next(b"ok".to_vec()))
+            .await
+            .unwrap();
+
+        let logged = String::from_utf8(captured.0.lock().unwrap().clone()).unwrap();
+        assert!(logged.contains("/reset"), "{logged}");
+        assert!(
+            !logged.contains("s3cr3t"),
+            "query leaked into logs: {logged}"
+        );
+    }
+
+    /// An absolute-form target is refused, as `armature-h1` refuses it, rather
+    /// than served with a `Host` the target contradicts.
+    #[tokio::test]
+    async fn test_serve_rejects_absolute_form_targets() {
+        let app = App::new()
+            .with_max_body_size(1024)
+            .route("/", post(body_len_handler))
+            .build();
+        let addr = spawn_test_server(app).await;
+
+        let response = send_raw_request(
+            addr,
+            b"POST http://other.example/ HTTP/1.1\r\n\
+              Host: test\r\n\
+              Content-Length: 0\r\n\
+              Connection: close\r\n\
+              \r\n",
+        )
+        .await;
+        let status_line = response.lines().next().unwrap_or_default();
+        assert!(status_line.contains("400"), "{response:?}");
     }
 }

@@ -62,6 +62,8 @@ use std::time::Duration;
 
 #[cfg(feature = "http3")]
 use std::net::SocketAddr;
+#[cfg(feature = "http3")]
+use std::sync::atomic::AtomicBool;
 
 /// HTTP/3 server configuration
 ///
@@ -92,13 +94,27 @@ pub struct Http3Config {
     /// Default: 30 seconds
     pub max_idle_timeout: Duration,
 
-    /// Keep-alive interval (QUIC PING frames)
-    /// Default: 15 seconds
+    /// Keep-alive interval (QUIC PING frames sent by the server)
+    ///
+    /// Default: `None`. A server that pings at an interval shorter than
+    /// `max_idle_timeout` keeps every connection alive forever, including ones
+    /// whose client has gone quiet and will never send another request — the
+    /// idle timeout then never fires. Keep-alive is the client's call; set this
+    /// only for a deployment that needs NAT bindings held open from the server
+    /// side, and know that it makes idle connections permanent.
     pub keep_alive_interval: Option<Duration>,
 
     /// Enable 0-RTT (early data) for faster connection establishment
-    /// **Security note**: 0-RTT data is replayable. Only enable for idempotent requests.
-    /// Default: false
+    ///
+    /// **Security note**: 0-RTT data is replayable — anyone who captured it can
+    /// send it again, and the server cannot tell. With this enabled, a request
+    /// that arrives before the handshake is confirmed is served only if its
+    /// method is safe (`GET`, `HEAD`, `OPTIONS`), and is marked with an
+    /// `Early-Data: 1` request header (RFC 8470) so a handler can decline it;
+    /// any other method is answered `425 Too Early`, which tells the client to
+    /// retry once the handshake completes.
+    ///
+    /// Default: `false`, in every preset.
     pub enable_0rtt: bool,
 
     /// Maximum UDP payload size
@@ -122,7 +138,18 @@ pub struct Http3Config {
     /// Requests with larger bodies are rejected with 413 Payload Too Large
     /// Default: 10MB
     pub max_request_body_size: usize,
+
+    /// Largest request header section (bytes, as QPACK-decoded field lines)
+    /// the server accepts; a larger one is refused before it is buffered.
+    ///
+    /// `h3`'s own default is unlimited, which lets one request make the
+    /// server hold an arbitrarily large header block. Default: 16 KiB, the
+    /// same as HTTP/2's `max_header_list_size` and `armature-h1`'s head cap.
+    pub max_field_section_size: u64,
 }
+
+/// Default for [`Http3Config::max_field_section_size`].
+pub const DEFAULT_MAX_FIELD_SECTION_SIZE: u64 = 16 * 1024;
 
 impl Default for Http3Config {
     fn default() -> Self {
@@ -132,13 +159,14 @@ impl Default for Http3Config {
             initial_stream_receive_window: 1024 * 1024, // 1MB
             initial_connection_receive_window: 10 * 1024 * 1024, // 10MB
             max_idle_timeout: Duration::from_secs(30),
-            keep_alive_interval: Some(Duration::from_secs(15)),
+            keep_alive_interval: None,
             enable_0rtt: false,
             max_udp_payload_size: 1350,
             enable_datagram: false,
             qpack_max_table_capacity: 4096,
             qpack_blocked_streams: 16,
             max_request_body_size: 10 * 1024 * 1024, // 10MB
+            max_field_section_size: DEFAULT_MAX_FIELD_SECTION_SIZE,
         }
     }
 }
@@ -157,13 +185,16 @@ impl Http3Config {
             initial_stream_receive_window: 4 * 1024 * 1024, // 4MB
             initial_connection_receive_window: 50 * 1024 * 1024, // 50MB
             max_idle_timeout: Duration::from_secs(60),
-            keep_alive_interval: Some(Duration::from_secs(20)),
-            enable_0rtt: true,
+            // See the field docs: server-side pings make idle connections
+            // permanent, and 0-RTT requests are replayable.
+            keep_alive_interval: None,
+            enable_0rtt: false,
             max_udp_payload_size: 1452, // Larger for better throughput
             enable_datagram: false,
             qpack_max_table_capacity: 16384,
             qpack_blocked_streams: 32,
             max_request_body_size: 50 * 1024 * 1024, // 50MB for large transfers
+            max_field_section_size: DEFAULT_MAX_FIELD_SECTION_SIZE,
         }
     }
 
@@ -175,13 +206,16 @@ impl Http3Config {
             initial_stream_receive_window: 256 * 1024, // 256KB
             initial_connection_receive_window: 2 * 1024 * 1024, // 2MB
             max_idle_timeout: Duration::from_secs(15),
-            keep_alive_interval: Some(Duration::from_secs(5)),
-            enable_0rtt: true,          // Faster connection establishment
+            // See the field docs: server-side pings make idle connections
+            // permanent, and 0-RTT requests are replayable.
+            keep_alive_interval: None,
+            enable_0rtt: false,
             max_udp_payload_size: 1200, // Smaller for faster delivery
             enable_datagram: true,      // For real-time data
             qpack_max_table_capacity: 2048,
             qpack_blocked_streams: 8,
             max_request_body_size: 10 * 1024 * 1024, // 10MB
+            max_field_section_size: DEFAULT_MAX_FIELD_SECTION_SIZE,
         }
     }
 
@@ -194,13 +228,16 @@ impl Http3Config {
             initial_stream_receive_window: 512 * 1024, // 512KB
             initial_connection_receive_window: 4 * 1024 * 1024, // 4MB
             max_idle_timeout: Duration::from_secs(120), // Longer for mobile networks
-            keep_alive_interval: Some(Duration::from_secs(30)),
-            enable_0rtt: true,
+            // See the field docs: server-side pings make idle connections
+            // permanent, and 0-RTT requests are replayable.
+            keep_alive_interval: None,
+            enable_0rtt: false,
             max_udp_payload_size: 1200, // Conservative for mobile networks
             enable_datagram: false,
             qpack_max_table_capacity: 4096,
             qpack_blocked_streams: 16,
             max_request_body_size: 10 * 1024 * 1024, // 10MB
+            max_field_section_size: DEFAULT_MAX_FIELD_SECTION_SIZE,
         }
     }
 }
@@ -250,8 +287,9 @@ impl Http3ConfigBuilder {
 
     /// Enable or disable 0-RTT early data
     ///
-    /// **Security warning**: 0-RTT data is replayable.
-    /// Only enable for idempotent requests.
+    /// **Security warning**: 0-RTT data is replayable. When enabled, requests
+    /// arriving before the handshake is confirmed are limited to safe methods
+    /// and marked `Early-Data: 1`; see [`Http3Config::enable_0rtt`].
     pub fn enable_0rtt(mut self, enable: bool) -> Self {
         self.config.enable_0rtt = enable;
         self
@@ -272,6 +310,13 @@ impl Http3ConfigBuilder {
     /// Set maximum request body size in bytes
     pub fn max_request_body_size(mut self, size: usize) -> Self {
         self.config.max_request_body_size = size;
+        self
+    }
+
+    /// Set the largest request header section accepted (see
+    /// [`Http3Config::max_field_section_size`])
+    pub fn max_field_section_size(mut self, bytes: u64) -> Self {
+        self.config.max_field_section_size = bytes;
         self
     }
 
@@ -447,6 +492,8 @@ mod server {
         config: Http3Config,
         stats: Arc<Http3Stats>,
         state: ServeState,
+        /// Connections served at once; see [`Http3Server::listen`].
+        max_connections: usize,
     }
 
     impl Http3Server {
@@ -462,17 +509,26 @@ mod server {
                 config,
                 stats: Arc::new(Http3Stats::new()),
                 state,
+                max_connections: crate::pipeline::DEFAULT_MAX_CONNECTIONS,
             }
         }
 
         /// A server sharing an application's serve state. The body cap is the
-        /// smaller of the application's and `config.max_request_body_size`.
-        pub(crate) fn from_state(config: Http3Config, state: ServeState) -> Self {
+        /// smaller of the application's and `config.max_request_body_size`;
+        /// `max_connections` is the application's TCP connection cap
+        /// ([`PipelineConfig::max_connections`](crate::pipeline::PipelineConfig::max_connections)),
+        /// so QUIC is not a way around it.
+        pub(crate) fn from_state(
+            config: Http3Config,
+            state: ServeState,
+            max_connections: usize,
+        ) -> Self {
             let state = state.with_max_body_size_at_most(config.max_request_body_size);
             Self {
                 config,
                 stats: Arc::new(Http3Stats::new()),
                 state,
+                max_connections: max_connections.max(1),
             }
         }
 
@@ -482,33 +538,44 @@ mod server {
         }
 
         /// Configure QUIC server from TLS config
+        ///
+        /// The caller's `tls_config` is shared behind an `Arc` (the TCP
+        /// listeners of a dual-stack server use the same one), so it is cloned
+        /// before anything below changes it.
         pub fn configure_quinn(
             &self,
             tls_config: Arc<rustls::ServerConfig>,
         ) -> Result<quinn::ServerConfig, Error> {
-            // Create QUIC crypto config from TLS config.
-            //
+            let mut tls = (*tls_config).clone();
+            tls.alpn_protocols = h3_alpn(&tls_config);
             // 0-RTT (early data) is enabled by advertising a non-zero
-            // `max_early_data_size` on the rustls server config. The caller's
-            // `tls_config` is shared behind an `Arc`, so clone it before
-            // mutating to avoid affecting other consumers (e.g. the HTTP/2
-            // listener sharing the same certificates).
-            let crypto = if self.config.enable_0rtt {
-                let mut tls = (*tls_config).clone();
+            // `max_early_data_size`; QUIC requires exactly `u32::MAX` when
+            // enabled. Off, it is left at rustls' default of zero and clients
+            // never send early data at all.
+            if self.config.enable_0rtt {
                 tls.max_early_data_size = u32::MAX;
-                quinn::crypto::rustls::QuicServerConfig::try_from(Arc::new(tls))
-            } else {
-                quinn::crypto::rustls::QuicServerConfig::try_from(tls_config)
             }
-            .map_err(|e| Error::Internal(format!("Failed to create QUIC crypto: {}", e)))?;
+            let crypto = quinn::crypto::rustls::QuicServerConfig::try_from(Arc::new(tls))
+                .map_err(|e| Error::Internal(format!("Failed to create QUIC crypto: {}", e)))?;
 
             let mut server_config = quinn::ServerConfig::with_crypto(Arc::new(crypto));
             server_config.transport_config(Arc::new(build_transport(&self.config)));
+            // Bound the handshakes quinn will hold queued for `accept`, by the
+            // same cap as established connections: past it, quinn refuses new
+            // ones itself instead of buffering them.
+            server_config.max_incoming(self.max_connections.min(1 << 16));
 
             Ok(server_config)
         }
 
         /// Start listening for HTTP/3 connections
+        ///
+        /// At most `max_connections` connections are served at once — the
+        /// application's TCP cap when started from `Application`, otherwise
+        /// [`DEFAULT_MAX_CONNECTIONS`](crate::pipeline::DEFAULT_MAX_CONNECTIONS).
+        /// Unlike a TCP listener, which can stop accepting and let the
+        /// kernel's backlog absorb a burst, a QUIC endpoint has no backlog to
+        /// lean on, so a connection attempt over the cap is refused outright.
         pub async fn listen(
             self,
             addr: SocketAddr,
@@ -521,19 +588,61 @@ mod server {
 
             info!(address = %addr, "HTTP/3 server listening (QUIC/UDP)");
 
+            self.serve_endpoint(endpoint).await;
+            Ok(())
+        }
+
+        /// The accept loop behind [`listen`](Self::listen), over an already
+        /// bound endpoint so tests can serve an ephemeral port.
+        pub(crate) async fn serve_endpoint(self, endpoint: quinn::Endpoint) {
+            let limit = Arc::new(tokio::sync::Semaphore::new(
+                self.max_connections
+                    .clamp(1, tokio::sync::Semaphore::MAX_PERMITS),
+            ));
+            let options = ConnectionOptions {
+                enable_0rtt: self.config.enable_0rtt,
+                idle_timeout: self.config.max_idle_timeout,
+                max_field_section_size: self.config.max_field_section_size,
+            };
+
             while let Some(incoming) = endpoint.accept().await {
+                let Ok(permit) = Arc::clone(&limit).try_acquire_owned() else {
+                    debug!(
+                        client = %incoming.remote_address(),
+                        "HTTP/3 connection refused: at the connection limit"
+                    );
+                    incoming.refuse();
+                    continue;
+                };
                 let stats = Arc::clone(&self.stats);
                 let state = self.state.clone();
 
                 tokio::spawn(async move {
-                    if let Err(e) = handle_connection(incoming, state, stats).await {
+                    let _permit = permit;
+                    if let Err(e) = handle_connection(incoming, state, stats, options).await {
                         error!(error = %e, "HTTP/3 connection error");
                     }
                 });
             }
-
-            Ok(())
         }
+    }
+
+    /// The ALPN list the QUIC listener offers, whatever `tls` offers.
+    ///
+    /// QUIC refuses a handshake whose ALPN does not name the application
+    /// protocol, and `TlsConfig` offers `h2` and `http/1.1` — the TCP
+    /// protocols — so passing its list through made every HTTP/3 handshake
+    /// fail. This listener speaks `h3` and nothing else.
+    pub(super) fn h3_alpn(_tls: &rustls::ServerConfig) -> Vec<Vec<u8>> {
+        vec![b"h3".to_vec()]
+    }
+
+    /// Per-connection settings [`handle_connection`] needs from the config.
+    #[derive(Debug, Clone, Copy)]
+    struct ConnectionOptions {
+        enable_0rtt: bool,
+        idle_timeout: std::time::Duration,
+        max_field_section_size: u64,
     }
 
     /// Build the quinn transport config from an [`Http3Config`], applying every
@@ -561,9 +670,9 @@ mod server {
                     .unwrap_or(quinn::IdleTimeout::from(quinn::VarInt::from_u32(30_000))),
             ));
 
-        if let Some(interval) = config.keep_alive_interval {
-            transport.keep_alive_interval(Some(interval));
-        }
+        // Explicitly `None` when unset rather than left at quinn's default, so
+        // the "no server-side keep-alive" default cannot drift with quinn's.
+        transport.keep_alive_interval(config.keep_alive_interval);
 
         if config.enable_datagram {
             transport.datagram_receive_buffer_size(Some(65536));
@@ -578,40 +687,100 @@ mod server {
         incoming: quinn::Incoming,
         state: ServeState,
         stats: Arc<Http3Stats>,
+        options: ConnectionOptions,
     ) -> Result<(), Error> {
-        // Accept the connection. When the server config advertises early data
-        // (0-RTT enabled), `into_0rtt` succeeds and lets the peer send early
-        // data before the handshake completes; the returned future resolves to
-        // whether that early data was ultimately accepted (not replay-rejected),
-        // which is what we count. When 0-RTT is disabled, `into_0rtt` returns
-        // the `Connecting` back and we complete the handshake normally.
         let connecting = incoming
             .accept()
             .map_err(|e| Error::Internal(format!("Accept failed: {}", e)))?;
-        let conn = match connecting.into_0rtt() {
-            Ok((conn, zero_rtt_accepted)) => {
-                let stats_0rtt = Arc::clone(&stats);
-                tokio::spawn(async move {
-                    if zero_rtt_accepted.await {
-                        stats_0rtt.zero_rtt_accepted();
-                    }
-                });
-                conn
+
+        // Whether the handshake is confirmed — the client has proven it holds
+        // the keys, so what it sends cannot be a replay of someone else's
+        // packets. Requests that arrive before then are early data.
+        let confirmed = Arc::new(AtomicBool::new(false));
+        let conn = if options.enable_0rtt {
+            // `into_0rtt` always succeeds on the server, and its future
+            // resolves when the handshake completes — `true` when the client's
+            // early data was accepted, which is what the statistic counts.
+            match connecting.into_0rtt() {
+                Ok((conn, zero_rtt_accepted)) => {
+                    let stats_0rtt = Arc::clone(&stats);
+                    let confirmed = Arc::clone(&confirmed);
+                    tokio::spawn(async move {
+                        let accepted = zero_rtt_accepted.await;
+                        confirmed.store(true, Ordering::Release);
+                        if accepted {
+                            stats_0rtt.zero_rtt_accepted();
+                        }
+                    });
+                    conn
+                }
+                Err(connecting) => {
+                    let conn = connecting
+                        .await
+                        .map_err(|e| Error::Internal(format!("Connection failed: {}", e)))?;
+                    confirmed.store(true, Ordering::Release);
+                    conn
+                }
             }
-            Err(connecting) => connecting
+        } else {
+            // No early data: wait for the full handshake before serving a
+            // byte, so nothing below ever runs on an unconfirmed connection.
+            let conn = connecting
                 .await
-                .map_err(|e| Error::Internal(format!("Connection failed: {}", e)))?,
+                .map_err(|e| Error::Internal(format!("Connection failed: {}", e)))?;
+            confirmed.store(true, Ordering::Release);
+            conn
         };
 
         stats.connection_opened();
         let remote_addr = conn.remote_address();
         debug!(client = %remote_addr, "HTTP/3 connection established");
         // Known here and nowhere downstream: QUIC gives the address on the
-        // connection, and a stream has no notion of one.
-        let state = state.for_peer(remote_addr);
+        // connection, and a stream has no notion of one. The body budget is
+        // per connection for the same reason HTTP/2's is: up to
+        // `max_concurrent_bidi_streams` bodies may be buffering at once.
+        let state = state.for_peer(remote_addr).with_default_body_budget();
 
-        // Create HTTP/3 connection
-        let mut h3_conn = h3::server::Connection::new(h3_quinn::Connection::new(conn))
+        // QUIC's own idle timeout only fires when *no packets* flow, so a
+        // client that keeps pinging holds a connection with zero streams
+        // forever. Close one that has had no request in flight for the idle
+        // timeout, or none at all within the first-request deadline — from a
+        // watcher, so the accept loop below is never cancelled mid-poll.
+        let tracker = Arc::new(crate::http2::StreamTracker::new());
+        let watcher = {
+            let tracker = Arc::clone(&tracker);
+            let conn = conn.clone();
+            tokio::spawn(async move {
+                // The first request is due within the head deadline every TCP
+                // transport uses, or the idle timeout if that is shorter.
+                let mut deadline = tracker.started
+                    + crate::pipeline::HEADER_READ_TIMEOUT.min(options.idle_timeout);
+                loop {
+                    tokio::select! {
+                        _ = conn.closed() => return,
+                        () = tokio::time::sleep_until(deadline) => {
+                            match tracker.next_deadline(
+                                tokio::time::Instant::now(),
+                                options.idle_timeout,
+                            ) {
+                                Some(next) => deadline = next,
+                                None => {
+                                    // H3_NO_ERROR: a clean close, not a fault.
+                                    conn.close(quinn::VarInt::from_u32(0x100), b"idle");
+                                    return;
+                                }
+                            }
+                        }
+                    }
+                }
+            })
+        };
+
+        // Create HTTP/3 connection. `h3`'s default field-section limit is
+        // unbounded; see `Http3Config::max_field_section_size`.
+        let mut h3_conn = h3::server::builder()
+            .max_field_section_size(options.max_field_section_size)
+            .build(h3_quinn::Connection::new(conn))
             .await
             .map_err(|e| Error::Internal(format!("H3 connection failed: {}", e)))?;
 
@@ -620,11 +789,16 @@ mod server {
             match h3_conn.accept().await {
                 Ok(Some(resolver)) => {
                     stats.stream_created();
+                    let active = tracker.begin();
                     let state = state.clone();
                     let stats = Arc::clone(&stats);
+                    let confirmed = Arc::clone(&confirmed);
 
                     tokio::spawn(async move {
-                        if let Err(e) = handle_request_resolver(resolver, state, stats).await {
+                        let _active = active;
+                        if let Err(e) =
+                            handle_request_resolver(resolver, state, stats, &confirmed).await
+                        {
                             error!(error = %e, "HTTP/3 request error");
                         }
                     });
@@ -640,6 +814,7 @@ mod server {
             }
         }
 
+        watcher.abort();
         stats.connection_closed();
         debug!(client = %remote_addr, "HTTP/3 connection closed");
 
@@ -653,10 +828,27 @@ mod server {
     ///
     /// Split out from [`handle_request_resolver`] so the conversion is
     /// unit-testable without a live QUIC connection.
+    ///
+    /// The `:authority` pseudo-header is settled against `Host` the same way
+    /// as on HTTP/2 (see `application::reconcile_authority`): a mismatch is
+    /// the `Err` reason for a `400`, and an absent `Host` is filled in from it.
     pub(super) fn build_armature_request(
         request: &http::Request<()>,
         peer: Option<SocketAddr>,
-    ) -> HttpRequest {
+    ) -> Result<HttpRequest, &'static str> {
+        let host_from_authority = crate::application::reconcile_authority(
+            // Every request on this path is HTTP/3, whatever the version field
+            // says (`h3` sets it, a hand-built request may not).
+            http::Version::HTTP_3,
+            request.method() == http::Method::CONNECT,
+            request.uri().authority().map(|a| a.as_str()),
+            request
+                .headers()
+                .get_all(http::header::HOST)
+                .iter()
+                .map(|v| v.as_bytes()),
+        )?;
+
         // `Method::from` matches the token against the well-known set, so the
         // common case is a unit variant rather than a per-request `String`.
         let method = crate::Method::from(request.method().as_str());
@@ -682,8 +874,44 @@ mod server {
                 .headers
                 .append(name.as_str(), Bytes::copy_from_slice(value.as_bytes()));
         }
+        if let Some(host) = host_from_authority {
+            armature_req
+                .headers
+                .append("host", Bytes::copy_from_slice(host.as_bytes()));
+        }
 
-        armature_req
+        Ok(armature_req)
+    }
+
+    /// Whether a request may be served from early (0-RTT) data: only the
+    /// methods RFC 9110 defines as safe, which a replay cannot turn into a
+    /// second state change.
+    pub(super) fn safe_for_early_data(method: &http::Method) -> bool {
+        matches!(
+            *method,
+            http::Method::GET | http::Method::HEAD | http::Method::OPTIONS
+        )
+    }
+
+    /// A bodyless response with `status`.
+    fn plain_response(status: u16) -> Response<http_body_util::Full<Bytes>> {
+        let mut response = Response::new(http_body_util::Full::new(Bytes::new()));
+        *response.status_mut() =
+            http::StatusCode::from_u16(status).unwrap_or(http::StatusCode::BAD_REQUEST);
+        response
+    }
+
+    /// An [`HttpResponse`](crate::HttpResponse) rejection as a wire response,
+    /// for the few answers given before the request reaches the pipeline.
+    fn to_wire(response: crate::HttpResponse) -> Response<http_body_util::Full<Bytes>> {
+        let mut wire = plain_response(response.status);
+        if let Some(ct) = response.headers.get("Content-Type")
+            && let Ok(value) = http::HeaderValue::from_str(ct)
+        {
+            wire.headers_mut().insert(http::header::CONTENT_TYPE, value);
+        }
+        *wire.body_mut() = http_body_util::Full::new(response.into_body_bytes());
+        wire
     }
 
     /// Every byte of a received DATA chunk.
@@ -702,6 +930,7 @@ mod server {
         resolver: h3::server::RequestResolver<h3_quinn::Connection, Bytes>,
         state: ServeState,
         stats: Arc<Http3Stats>,
+        confirmed: &AtomicBool,
     ) -> Result<(), Error> {
         // Resolve the request to get the request and stream
         let (request, mut stream) = resolver
@@ -711,23 +940,47 @@ mod server {
 
         stats.request_processed();
 
-        let armature_req = build_armature_request(&request, state.peer());
+        // Read once, here: a request is early data if the handshake was not
+        // confirmed when its head arrived. A replayed copy of someone else's
+        // 0-RTT packets never confirms, so it is always caught by this.
+        let early = !confirmed.load(Ordering::Acquire);
 
-        // The shared pipeline: canonical path, preflight, declared length,
-        // early 404, body read under the cap and the slow-body policy, then
-        // middleware → guards → route, with the same response rules (CORS,
-        // fail-closed headers) as the TCP transports.
-        let response = dispatch_via_h3(
-            armature_req,
-            |cx| match stream.poll_recv_data(cx) {
-                Poll::Pending => Poll::Pending,
-                Poll::Ready(Ok(Some(buf))) => Poll::Ready(Some(Ok(buf_to_bytes(buf)))),
-                Poll::Ready(Ok(None)) => Poll::Ready(None),
-                Poll::Ready(Err(e)) => Poll::Ready(Some(Err(e))),
-            },
-            &state,
-        )
-        .await;
+        let response = if early && !safe_for_early_data(request.method()) {
+            // RFC 8470 §5.2: the client retries once the handshake completes.
+            plain_response(425)
+        } else {
+            match build_armature_request(&request, state.peer()) {
+                Err(reason) => {
+                    debug!(reason, "Rejected an HTTP/3 request authority");
+                    to_wire(Error::BadRequest(reason.to_string()).to_client_response())
+                }
+                Ok(mut armature_req) => {
+                    if early {
+                        // RFC 8470 §5.1: tell the application, which may
+                        // still answer 425 itself.
+                        armature_req
+                            .headers
+                            .insert("early-data", Bytes::from_static(b"1"));
+                    }
+                    // The shared pipeline: canonical path, preflight, declared
+                    // length, early 404, body read under the cap and the
+                    // slow-body policy, then middleware → guards → route, with
+                    // the same response rules (CORS, fail-closed headers) as
+                    // the TCP transports.
+                    dispatch_via_h3(
+                        armature_req,
+                        |cx| match stream.poll_recv_data(cx) {
+                            Poll::Pending => Poll::Pending,
+                            Poll::Ready(Ok(Some(buf))) => Poll::Ready(Some(Ok(buf_to_bytes(buf)))),
+                            Poll::Ready(Ok(None)) => Poll::Ready(None),
+                            Poll::Ready(Err(e)) => Poll::Ready(Some(Err(e))),
+                        },
+                        &state,
+                    )
+                    .await
+                }
+            }
+        };
 
         let (parts, body) = response.into_parts();
         let body = match body.collect().await {
@@ -825,14 +1078,14 @@ mod tests {
     fn test_high_throughput_config() {
         let config = Http3Config::high_throughput();
         assert_eq!(config.max_concurrent_bidi_streams, 250);
-        assert!(config.enable_0rtt);
+        assert!(!config.enable_0rtt);
         assert_eq!(config.initial_connection_receive_window, 50 * 1024 * 1024);
     }
 
     #[test]
     fn test_low_latency_config() {
         let config = Http3Config::low_latency();
-        assert!(config.enable_0rtt);
+        assert!(!config.enable_0rtt);
         assert!(config.enable_datagram);
         assert_eq!(config.max_udp_payload_size, 1200);
     }
@@ -841,7 +1094,7 @@ mod tests {
     fn test_mobile_optimized_config() {
         let config = Http3Config::mobile_optimized();
         assert_eq!(config.max_idle_timeout, Duration::from_secs(120));
-        assert!(config.enable_0rtt);
+        assert!(!config.enable_0rtt);
     }
 
     #[test]
@@ -964,7 +1217,8 @@ mod tests {
             .header("x-forwarded-for", "203.0.113.7")
             .body(())
             .unwrap();
-        let armature_req = super::server::build_armature_request(&request, None);
+        let armature_req =
+            super::server::build_armature_request(&request, None).expect("no authority conflict");
         assert_eq!(armature_req.headers.get_all("x-forwarded-for").len(), 2);
     }
 
@@ -983,7 +1237,8 @@ mod tests {
             .body(())
             .unwrap();
 
-        let armature_req = super::server::build_armature_request(&request, None);
+        let armature_req =
+            super::server::build_armature_request(&request, None).expect("no authority conflict");
 
         assert_eq!(armature_req.method, "GET");
         assert_eq!(armature_req.path_only(), "/search");
@@ -1001,7 +1256,8 @@ mod tests {
             .body(())
             .unwrap();
 
-        let armature_req = super::server::build_armature_request(&request, None);
+        let armature_req =
+            super::server::build_armature_request(&request, None).expect("no authority conflict");
 
         assert!(armature_req.query().is_empty());
         assert_eq!(armature_req.query_string(), None);
@@ -1022,7 +1278,8 @@ mod tests {
 
         assert_eq!(request.uri().query(), Some(""));
 
-        let armature_req = super::server::build_armature_request(&request, None);
+        let armature_req =
+            super::server::build_armature_request(&request, None).expect("no authority conflict");
 
         assert_eq!(armature_req.path_only(), "/search");
         assert!(armature_req.query().is_empty());
@@ -1040,13 +1297,240 @@ mod tests {
             .body(())
             .unwrap();
 
-        let armature_req = super::server::build_armature_request(&request, None);
+        let armature_req =
+            super::server::build_armature_request(&request, None).expect("no authority conflict");
 
         assert_eq!(armature_req.query().len(), 2);
         assert_eq!(armature_req.query_param("a"), Some("1"));
         assert_eq!(
             armature_req.query().get_all("a").collect::<Vec<_>>(),
             vec!["1", "2"]
+        );
+    }
+
+    /// No preset turns on replayable 0-RTT or server-side keep-alive (which
+    /// would hold idle connections open forever), and every one bounds the
+    /// header section.
+    #[test]
+    fn test_presets_are_safe_by_default() {
+        for (name, config) in [
+            ("default", Http3Config::default()),
+            ("high_throughput", Http3Config::high_throughput()),
+            ("low_latency", Http3Config::low_latency()),
+            ("mobile_optimized", Http3Config::mobile_optimized()),
+        ] {
+            assert!(!config.enable_0rtt, "{name}: 0-RTT is opt-in");
+            assert_eq!(config.keep_alive_interval, None, "{name}");
+            assert_eq!(
+                config.max_field_section_size, DEFAULT_MAX_FIELD_SECTION_SIZE,
+                "{name}"
+            );
+        }
+        let config = Http3Config::builder().max_field_section_size(4096).build();
+        assert_eq!(config.max_field_section_size, 4096);
+    }
+
+    /// Only safe methods may be answered from replayable early data.
+    #[cfg(feature = "http3")]
+    #[test]
+    fn test_only_safe_methods_are_served_from_early_data() {
+        use http::Method;
+        for method in [Method::GET, Method::HEAD, Method::OPTIONS] {
+            assert!(super::server::safe_for_early_data(&method), "{method}");
+        }
+        for method in [Method::POST, Method::PUT, Method::DELETE, Method::PATCH] {
+            assert!(!super::server::safe_for_early_data(&method), "{method}");
+        }
+    }
+
+    /// `:authority` reaches the request as `Host`, and a contradicting `Host`
+    /// is refused, exactly as over HTTP/2.
+    #[cfg(feature = "http3")]
+    #[test]
+    fn test_build_armature_request_reconciles_authority_and_host() {
+        let request = http::Request::builder()
+            .version(http::Version::HTTP_3)
+            .uri("https://tenant.example/")
+            .body(())
+            .unwrap();
+        let armature_req = super::server::build_armature_request(&request, None).unwrap();
+        assert_eq!(armature_req.headers.get("host"), Some("tenant.example"));
+
+        let request = http::Request::builder()
+            .version(http::Version::HTTP_3)
+            .uri("https://tenant.example/")
+            .header("host", "admin.example")
+            .body(())
+            .unwrap();
+        assert!(super::server::build_armature_request(&request, None).is_err());
+    }
+
+    /// The QUIC listener negotiates `h3` whatever ALPN list the shared TLS
+    /// config carries (it offers `h2`/`http/1.1` for the TCP listeners), and
+    /// does so without touching the caller's config.
+    #[cfg(all(feature = "http3", feature = "self-signed-certs"))]
+    #[test]
+    fn test_configure_quinn_negotiates_h3_only() {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let tls = crate::TlsConfig::self_signed(&["localhost"]).expect("cert");
+        let shared = tls.server_config.clone();
+        let router = std::sync::Arc::new(crate::route_cache::OptimizedRouter::from_router(
+            &crate::Router::new(),
+        ));
+        let server = Http3Server::new(Http3Config::default(), router);
+        let _ = server
+            .configure_quinn(tls.server_config)
+            .expect("quinn config");
+        assert!(
+            shared.alpn_protocols.iter().all(|p| p.as_slice() != b"h3"),
+            "the caller's TLS config must not be mutated"
+        );
+    }
+
+    /// A cert, its TLS config for the server, and a QUIC client trusting it.
+    #[cfg(all(feature = "http3", feature = "self-signed-certs"))]
+    fn quic_pair() -> (crate::TlsConfig, quinn::ClientConfig) {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let key = rcgen::KeyPair::generate().unwrap();
+        let cert = rcgen::CertificateParams::new(vec!["localhost".to_string()])
+            .unwrap()
+            .self_signed(&key)
+            .unwrap();
+        let tls =
+            crate::TlsConfig::from_pem_bytes(cert.pem().as_bytes(), key.serialize_pem().as_bytes())
+                .unwrap();
+        let mut roots = rustls::RootCertStore::empty();
+        roots.add(cert.der().clone()).unwrap();
+        let mut client = rustls::ClientConfig::builder()
+            .with_root_certificates(roots)
+            .with_no_client_auth();
+        client.alpn_protocols = vec![b"h3".to_vec()];
+        let client = quinn::ClientConfig::new(std::sync::Arc::new(
+            quinn::crypto::rustls::QuicClientConfig::try_from(client).unwrap(),
+        ));
+        (tls, client)
+    }
+
+    /// Serve `config` for a router with `/hello` on an ephemeral UDP port.
+    #[cfg(all(feature = "http3", feature = "self-signed-certs"))]
+    fn spawn_h3(config: Http3Config, tls: &crate::TlsConfig, max_connections: usize) -> SocketAddr {
+        async fn hello(req: crate::HttpRequest) -> Result<crate::HttpResponse, crate::Error> {
+            let host = req.headers.get("host").unwrap_or_default().to_owned();
+            Ok(crate::HttpResponse::ok().with_body(host.into_bytes()))
+        }
+        let mut router = crate::Router::new();
+        router.get("/hello", hello);
+        let state = crate::application::ServeState::for_test(
+            std::sync::Arc::new(crate::route_cache::OptimizedRouter::from_router(&router)),
+            crate::DEFAULT_MAX_BODY_SIZE,
+        );
+        let server = Http3Server::from_state(config, state, max_connections);
+        let quinn_config = server.configure_quinn(tls.server_config.clone()).unwrap();
+        let endpoint =
+            quinn::Endpoint::server(quinn_config, "127.0.0.1:0".parse().unwrap()).unwrap();
+        let addr = endpoint.local_addr().unwrap();
+        tokio::spawn(server.serve_endpoint(endpoint));
+        addr
+    }
+
+    #[cfg(all(feature = "http3", feature = "self-signed-certs"))]
+    async fn connect(client: &quinn::ClientConfig, addr: SocketAddr) -> quinn::Connection {
+        let mut endpoint = quinn::Endpoint::client("127.0.0.1:0".parse().unwrap()).unwrap();
+        endpoint.set_default_client_config(client.clone());
+        tokio::time::timeout(
+            Duration::from_secs(5),
+            endpoint.connect(addr, "localhost").unwrap(),
+        )
+        .await
+        .expect("handshake in time")
+        .expect("the QUIC handshake must succeed")
+    }
+
+    /// The ALPN regression end to end: a real QUIC client offering `h3` must
+    /// complete the handshake against a `TlsConfig` that offers `h2` and
+    /// `http/1.1`, and be served — with `:authority` reaching the handler as
+    /// `Host`.
+    #[cfg(all(feature = "http3", feature = "self-signed-certs"))]
+    #[tokio::test]
+    async fn test_a_real_h3_client_is_served() {
+        use bytes::Buf;
+        let (tls, client) = quic_pair();
+        assert!(
+            tls.server_config
+                .alpn_protocols
+                .iter()
+                .all(|p| p.as_slice() != b"h3"),
+            "the premise: the shared TLS config does not offer h3"
+        );
+        let addr = spawn_h3(Http3Config::default(), &tls, 16);
+        let conn = connect(&client, addr).await;
+
+        let (mut driver, mut send) = h3::client::new(h3_quinn::Connection::new(conn))
+            .await
+            .unwrap();
+        tokio::spawn(async move {
+            let _ = std::future::poll_fn(|cx| driver.poll_close(cx)).await;
+        });
+        let mut stream = send
+            .send_request(
+                http::Request::get("https://localhost/hello")
+                    .body(())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        stream.finish().await.unwrap();
+        let response = stream.recv_response().await.unwrap();
+        assert_eq!(response.status(), 200);
+        let mut body = Vec::new();
+        while let Some(mut chunk) = stream.recv_data().await.unwrap() {
+            let n = chunk.remaining();
+            body.extend_from_slice(&chunk.copy_to_bytes(n));
+        }
+        assert_eq!(&body[..], b"localhost");
+    }
+
+    /// QUIC connections count against the same cap as TCP ones; past it a
+    /// connection attempt is refused rather than served.
+    #[cfg(all(feature = "http3", feature = "self-signed-certs"))]
+    #[tokio::test]
+    async fn test_h3_connections_are_capped() {
+        let (tls, client) = quic_pair();
+        let addr = spawn_h3(Http3Config::default(), &tls, 1);
+        let _held = connect(&client, addr).await;
+
+        let mut endpoint = quinn::Endpoint::client("127.0.0.1:0".parse().unwrap()).unwrap();
+        endpoint.set_default_client_config(client.clone());
+        let second = tokio::time::timeout(
+            Duration::from_secs(5),
+            endpoint.connect(addr, "localhost").unwrap(),
+        )
+        .await
+        .expect("refused promptly, not left hanging");
+        assert!(second.is_err(), "a connection over the cap must be refused");
+    }
+
+    /// A QUIC connection that never opens a request stream is closed at the
+    /// first-request deadline even though QUIC itself would keep it alive
+    /// (here: client keep-alive pings well inside the idle timeout).
+    #[cfg(all(feature = "http3", feature = "self-signed-certs"))]
+    #[tokio::test]
+    async fn test_h3_idle_connection_is_closed() {
+        let (tls, mut client) = quic_pair();
+        let mut transport = quinn::TransportConfig::default();
+        transport.keep_alive_interval(Some(Duration::from_millis(100)));
+        client.transport_config(std::sync::Arc::new(transport));
+        let config = Http3Config::builder()
+            .max_idle_timeout(Duration::from_secs(1))
+            .build();
+        let addr = spawn_h3(config, &tls, 16);
+        let conn = connect(&client, addr).await;
+        let reason = tokio::time::timeout(Duration::from_secs(5), conn.closed())
+            .await
+            .expect("an idle connection must be closed by the server");
+        assert!(
+            matches!(reason, quinn::ConnectionError::ApplicationClosed(_)),
+            "{reason:?}"
         );
     }
 }

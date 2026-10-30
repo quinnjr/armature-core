@@ -15,6 +15,7 @@ jobs:
   test:
     name: test
     runs-on: ubuntu-latest
+    timeout-minutes: 45
     steps:
       - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
         with:
@@ -23,11 +24,12 @@ jobs:
         with:
           toolchain: stable
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
-      - run: cargo test --all-features
+      - run: cargo test --locked --all-features
 
   msrv:
     name: MSRV 1.94.1
     runs-on: ubuntu-latest
+    timeout-minutes: 45
     steps:
       - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
         with:
@@ -40,4 +42,4 @@ jobs:
           key: msrv
       # `--all-targets` without `--all-features`: the MSRV claim is about the
       # crate as published with its defaults, not about every optional feature.
-      - run: cargo check --all-targets
+      - run: cargo check --locked --all-targets

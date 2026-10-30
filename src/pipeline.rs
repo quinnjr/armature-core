@@ -39,6 +39,16 @@
 //! the caller (`Application`) calls `TcpStream::set_nodelay` on the accepted
 //! socket itself.
 //!
+//! ### Wired on both paths
+//!
+//! - `write_timeout` -> `armature_h1::Limits::write_timeout`, and a
+//!   `WriteDeadline` around every socket hyper serves (HTTP/1.1 with the
+//!   feature off, HTTP/2 always).
+//! - `keep_alive_timeout` -> the idle deadline of every HTTP/2 connection
+//!   (see `http2::H2ConnectionServer`). On the hyper HTTP/1.1 path an idle
+//!   keep-alive connection is instead bounded by [`HEADER_READ_TIMEOUT`],
+//!   because hyper runs its head timer while waiting for the next request.
+//!
 //! ### Wired on neither path
 //!
 //! `mode`, `max_concurrent`, `max_buffered_requests`,
@@ -74,6 +84,7 @@
 //!     .build();
 //! ```
 
+use std::future::Future as _;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::time::Duration;
@@ -163,11 +174,17 @@ pub struct PipelineConfig {
     /// `Limits::idle_timeout` — the deadline for the next request to begin on
     /// an idle keep-alive connection, which is what this field always meant.
     ///
-    /// Not wired on the hyper path: hyper's H1 builder only exposes
-    /// `keep_alive(bool)` (used, hardcoded `true`) and a header-read timeout
-    /// with different semantics — which is applied, at
-    /// [`HEADER_READ_TIMEOUT`], by every hyper HTTP/1.1 builder this crate
-    /// creates.
+    /// **Wired for HTTP/2** on every listener (hyper's driver, under either
+    /// backend): an HTTP/2 connection with no stream in flight for this long is
+    /// closed with a `GOAWAY`.
+    ///
+    /// Not wired for HTTP/1.1 on the hyper path: hyper's H1 builder only
+    /// exposes `keep_alive(bool)` (used, hardcoded `true`) and a header-read
+    /// timeout, applied at [`HEADER_READ_TIMEOUT`] by every hyper HTTP/1.1
+    /// builder this crate creates. hyper starts that timer whenever it waits
+    /// for a request head — including on an idle keep-alive connection — so
+    /// on that path an idle connection is closed after [`HEADER_READ_TIMEOUT`],
+    /// whatever this field says. It is bounded, just not by this value.
     pub keep_alive_timeout: Duration,
 
     /// How long a handler may run before the connection answers `503` and
@@ -190,15 +207,17 @@ pub struct PipelineConfig {
     /// How long a single response write may take before the connection is torn
     /// down, or `None` for no limit.
     ///
-    /// **Wired on the `h1-backend` path**, to `armature-h1`'s
-    /// `Limits::write_timeout`.
+    /// **Wired on every TCP serve path**: to `armature-h1`'s
+    /// `Limits::write_timeout` on the `h1-backend` path, and as a per-write
+    /// stall deadline (`WriteDeadline`) around every socket hyper serves —
+    /// HTTP/1.1 with the feature off, and HTTP/2 always.
     ///
     /// Unlike [`request_timeout`](Self::request_timeout) this defaults to a
     /// finite value, because the failure it prevents is not a slow handler but
-    /// a peer that stops reading: `armature-h1` caps neither connection count
-    /// nor write duration, so an unbounded write deadline lets a client hold a
-    /// worker's connection slot, its file descriptor and its full response
-    /// buffer indefinitely by shrinking its receive window to zero. Five
+    /// a peer that stops reading: neither `armature-h1` nor hyper bounds write
+    /// duration on its own, so an unbounded write deadline lets a client hold
+    /// a connection slot, its file descriptor and its full response buffer
+    /// indefinitely by shrinking its receive window to zero. Five
     /// minutes is generous enough for a large response over a slow link and
     /// finite enough that the hold is not free.
     pub write_timeout: Option<Duration>,
@@ -290,6 +309,122 @@ pub(crate) fn hardened_http1_builder() -> hyper::server::conn::http1::Builder {
         .timer(hyper_util::rt::TokioTimer::new())
         .header_read_timeout(HEADER_READ_TIMEOUT);
     builder
+}
+
+/// A transport whose writes may not stall for longer than a deadline.
+///
+/// hyper's connection drivers have no write timeout: a peer that stops reading
+/// — a zero receive window, never ACKing — leaves a `poll_write` pending
+/// forever, and with it the connection task, its slot in the accept loop's
+/// connection limit, its file descriptor and the response buffered behind the
+/// write. `armature-h1` bounds this with its own `Limits::write_timeout`; this
+/// is the same bound for the connections hyper serves, driven by the same
+/// [`PipelineConfig::write_timeout`].
+///
+/// The deadline runs only while a write (or flush, or shutdown) is *pending*,
+/// and resets the moment one makes progress, so it bounds a stall rather than
+/// the length of a large response over a slow link. A write that completes
+/// immediately — the overwhelmingly common case — never touches the timer: the
+/// `Sleep` is allocated on the first `Pending` and only then.
+pub(crate) struct WriteDeadline<T> {
+    inner: T,
+    timeout: Option<Duration>,
+    stalled: Option<std::pin::Pin<Box<tokio::time::Sleep>>>,
+}
+
+impl<T> WriteDeadline<T> {
+    /// `inner`, with every write stall bounded by `timeout` (`None`: unbounded,
+    /// and the wrapper is a pass-through).
+    pub(crate) fn new(inner: T, timeout: Option<Duration>) -> Self {
+        Self {
+            inner,
+            timeout,
+            stalled: None,
+        }
+    }
+
+    /// Fold a write-side poll result into the deadline: progress disarms it, a
+    /// stall arms it (once) and fails with `TimedOut` when it expires.
+    fn guard<R>(
+        &mut self,
+        cx: &mut std::task::Context<'_>,
+        polled: std::task::Poll<std::io::Result<R>>,
+    ) -> std::task::Poll<std::io::Result<R>> {
+        use std::task::Poll;
+        match polled {
+            Poll::Ready(r) => {
+                self.stalled = None;
+                Poll::Ready(r)
+            }
+            Poll::Pending => {
+                let Some(timeout) = self.timeout else {
+                    return Poll::Pending;
+                };
+                let sleep = self
+                    .stalled
+                    .get_or_insert_with(|| Box::pin(tokio::time::sleep(timeout)));
+                match sleep.as_mut().poll(cx) {
+                    Poll::Ready(()) => Poll::Ready(Err(std::io::Error::new(
+                        std::io::ErrorKind::TimedOut,
+                        "write stalled past the configured write timeout",
+                    ))),
+                    Poll::Pending => Poll::Pending,
+                }
+            }
+        }
+    }
+}
+
+impl<T: tokio::io::AsyncRead + Unpin> tokio::io::AsyncRead for WriteDeadline<T> {
+    fn poll_read(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &mut tokio::io::ReadBuf<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        std::pin::Pin::new(&mut self.inner).poll_read(cx, buf)
+    }
+}
+
+impl<T: tokio::io::AsyncWrite + Unpin> tokio::io::AsyncWrite for WriteDeadline<T> {
+    fn poll_write(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &[u8],
+    ) -> std::task::Poll<std::io::Result<usize>> {
+        let polled = std::pin::Pin::new(&mut self.inner).poll_write(cx, buf);
+        self.guard(cx, polled)
+    }
+
+    fn poll_flush(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        let polled = std::pin::Pin::new(&mut self.inner).poll_flush(cx);
+        self.guard(cx, polled)
+    }
+
+    fn poll_shutdown(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        let polled = std::pin::Pin::new(&mut self.inner).poll_shutdown(cx);
+        self.guard(cx, polled)
+    }
+
+    // Forwarded rather than defaulted, so hyper keeps handing a vectored-capable
+    // socket its frame slices instead of coalescing them into a scratch buffer.
+    fn is_write_vectored(&self) -> bool {
+        self.inner.is_write_vectored()
+    }
+
+    fn poll_write_vectored(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        bufs: &[std::io::IoSlice<'_>],
+    ) -> std::task::Poll<std::io::Result<usize>> {
+        let polled = std::pin::Pin::new(&mut self.inner).poll_write_vectored(cx, bufs);
+        self.guard(cx, polled)
+    }
 }
 
 impl Default for PipelineConfig {

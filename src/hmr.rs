@@ -81,7 +81,11 @@ pub enum HmrEventKind {
 /// HMR configuration
 #[derive(Clone, Debug)]
 pub struct HmrConfig {
-    /// Enable HMR (typically only in development)
+    /// Enable HMR (typically only in development).
+    ///
+    /// Defaults to `cfg!(debug_assertions)`: on in debug builds, off in
+    /// release builds, so a default config cannot inject the client script
+    /// (which embeds the connection token) into production pages.
     pub enabled: bool,
 
     /// Paths to watch for changes
@@ -115,7 +119,7 @@ pub struct HmrConfig {
 impl Default for HmrConfig {
     fn default() -> Self {
         Self {
-            enabled: true,
+            enabled: cfg!(debug_assertions),
             watch_paths: vec![PathBuf::from("src"), PathBuf::from("public")],
             watch_extensions: vec![
                 "js".to_string(),
@@ -215,6 +219,11 @@ fn release_gate(allow_in_release: bool, is_release_build: bool) -> Result<(), Er
 
 /// Whether `origin` is a loopback origin: `http`/`https` with host
 /// `localhost`, `127.0.0.1` or `[::1]`, and an optional port.
+///
+/// Any loopback port is accepted, so another local web app (a different dev
+/// server on the same machine) passes this check. That is acceptable because
+/// the origin is not the gate on its own: [`upgrade_allowed`] also requires
+/// the per-process token, which only pages served by this process receive.
 fn is_loopback_origin(origin: &str) -> bool {
     let Some(rest) = origin
         .strip_prefix("http://")
@@ -703,9 +712,19 @@ impl Drop for HmrManager {
     }
 }
 
+/// Whether the client script may be injected under `config` in a build whose
+/// profile is `is_release_build`.
+fn should_inject(config: &HmrConfig, is_release_build: bool) -> bool {
+    config.enabled && release_gate(config.allow_in_release, is_release_build).is_ok()
+}
+
 /// HMR middleware for injecting client script
+///
+/// Does nothing when HMR is disabled, or in a release build unless
+/// [`HmrConfig::allow_in_release`] is set: the script carries the connection
+/// token and must not reach production pages.
 pub async fn inject_hmr_script(html: String, hmr_manager: &HmrManager) -> String {
-    if !hmr_manager.config.enabled {
+    if !should_inject(&hmr_manager.config, !cfg!(debug_assertions)) {
         return html;
     }
 
@@ -1001,9 +1020,26 @@ mod tests {
         assert!(script.contains("HMR Client initialized"));
     }
 
+    #[test]
+    fn test_hmr_injection_release_gate() {
+        assert_eq!(HmrConfig::default().enabled, cfg!(debug_assertions));
+
+        let mut config = HmrConfig::new();
+        config.enabled = true;
+        assert!(should_inject(&config, false));
+        assert!(
+            !should_inject(&config, true),
+            "release builds must not inject unless explicitly allowed"
+        );
+        assert!(should_inject(&config.clone().allow_in_release(true), true));
+        config.enabled = false;
+        assert!(!should_inject(&config, false));
+    }
+
     #[tokio::test]
     async fn test_inject_hmr_script() {
-        let config = HmrConfig::new();
+        let mut config = test_config();
+        config.enabled = true;
         let manager = HmrManager::new(config);
 
         let html = "<html><body><h1>Hello</h1></body></html>".to_string();
@@ -1016,7 +1052,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_inject_hmr_script_no_body() {
-        let config = HmrConfig::new();
+        let mut config = test_config();
+        config.enabled = true;
         let manager = HmrManager::new(config);
 
         let html = "<html><div>Content</div></html>".to_string();

@@ -197,6 +197,20 @@ fn find_quality_param(s: &str) -> Option<usize> {
         .position(|w| w[0] == b';' && w[1].eq_ignore_ascii_case(&b'q') && w[2] == b'=')
 }
 
+/// Parse a `q` weight, clamped to `0.0..=1.0`.
+///
+/// Rust's float parser accepts `NaN` and `inf`, which RFC 9110's `qvalue`
+/// grammar does not. A NaN in particular survives `clamp` and has no place in a
+/// total order, which broke the preference sort (and `sort_by` may panic on an
+/// inconsistent comparator). Non-finite values are invalid and get the same
+/// default as any other unparseable weight.
+fn parse_qvalue(q: &str) -> f32 {
+    match q.trim().parse::<f32>() {
+        Ok(q) if q.is_finite() => q.clamp(0.0, 1.0),
+        _ => 1.0,
+    }
+}
+
 // ============================================================================
 // Accept Header
 // ============================================================================
@@ -252,9 +266,9 @@ impl Accept {
         // Sort by quality (highest first), then by specificity
         media_types.sort_by(|a, b| {
             // First compare by quality
-            match b.1.partial_cmp(&a.1) {
-                Some(Ordering::Equal) | None => {}
-                Some(ord) => return ord,
+            match b.1.total_cmp(&a.1) {
+                Ordering::Equal => {}
+                ord => return ord,
             }
 
             // Then by specificity (more specific = higher priority)
@@ -274,12 +288,7 @@ impl Accept {
             let q_part = &s[q_pos + 3..];
 
             // Parse quality value
-            let quality = q_part
-                .split(';')
-                .next()
-                .and_then(|q| q.trim().parse::<f32>().ok())
-                .unwrap_or(1.0)
-                .clamp(0.0, 1.0);
+            let quality = parse_qvalue(q_part.split(';').next().unwrap_or(""));
 
             (media_part, quality)
         } else {
@@ -461,7 +470,7 @@ impl AcceptLanguage {
             .collect();
 
         // Sort by quality (highest first)
-        languages.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(Ordering::Equal));
+        languages.sort_by(|a, b| b.1.total_cmp(&a.1));
 
         Self { languages }
     }
@@ -471,7 +480,7 @@ impl AcceptLanguage {
             let lang_part = &s[..q_pos];
             let q_part = &s[q_pos + 3..];
 
-            let quality = q_part.trim().parse::<f32>().unwrap_or(1.0).clamp(0.0, 1.0);
+            let quality = parse_qvalue(q_part);
 
             (lang_part, quality)
         } else {
@@ -601,7 +610,7 @@ impl AcceptEncoding {
             .collect();
 
         // Sort by quality (highest first)
-        encodings.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(Ordering::Equal));
+        encodings.sort_by(|a, b| b.1.total_cmp(&a.1));
 
         Self { encodings }
     }
@@ -611,7 +620,7 @@ impl AcceptEncoding {
             let enc_part = &s[..q_pos];
             let q_part = &s[q_pos + 3..];
 
-            let quality = q_part.trim().parse::<f32>().unwrap_or(1.0).clamp(0.0, 1.0);
+            let quality = parse_qvalue(q_part);
 
             (enc_part, quality)
         } else {
@@ -688,7 +697,7 @@ impl AcceptCharset {
             .collect();
 
         // Sort by quality (highest first)
-        charsets.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(Ordering::Equal));
+        charsets.sort_by(|a, b| b.1.total_cmp(&a.1));
 
         Self { charsets }
     }
@@ -698,7 +707,7 @@ impl AcceptCharset {
             let charset_part = &s[..q_pos];
             let q_part = &s[q_pos + 3..];
 
-            let quality = q_part.trim().parse::<f32>().unwrap_or(1.0).clamp(0.0, 1.0);
+            let quality = parse_qvalue(q_part);
 
             (charset_part, quality)
         } else {
@@ -1227,5 +1236,29 @@ mod tests {
 
         assert!(request.prefers_json());
         assert!(!request.prefers_html());
+    }
+
+    #[test]
+    fn nan_and_infinite_q_values_are_invalid() {
+        assert_eq!(parse_qvalue("NaN"), 1.0);
+        assert_eq!(parse_qvalue("inf"), 1.0);
+        assert_eq!(parse_qvalue("-inf"), 1.0);
+        assert_eq!(parse_qvalue("0.5"), 0.5);
+        assert_eq!(parse_qvalue("7"), 1.0);
+
+        // Many NaN entries used to feed `sort_by` a comparator with no total
+        // order; every parsed quality must now be a real number.
+        let header: String = (0..64)
+            .map(|i| format!("a/t{i};q=NaN, b/t{i};q=0.{}", i % 10))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let accept = Accept::parse(&header);
+        assert!(accept.media_types.iter().all(|(_, q)| q.is_finite()));
+        let enc = AcceptEncoding::parse("gzip;q=NaN, br;q=0.5, zstd;q=nan");
+        assert!(enc.encodings.iter().all(|(_, q)| q.is_finite()));
+        let lang = AcceptLanguage::parse("en;q=NaN, fr;q=0.5");
+        assert!(lang.languages.iter().all(|(_, q)| q.is_finite()));
+        let cs = AcceptCharset::parse("utf-8;q=NaN, latin1;q=0.2");
+        assert!(cs.charsets.iter().all(|(_, q)| q.is_finite()));
     }
 }

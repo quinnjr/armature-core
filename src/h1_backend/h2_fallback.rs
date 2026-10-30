@@ -19,11 +19,9 @@
 //! ahead of the transport hands hyper a stream missing its opening frames.
 
 use crate::application::ServeState;
+use crate::http2::H2ConnectionServer;
 use armature_h1::{H2Fallback, Transport};
 use bytes::Bytes;
-use hyper::body::Incoming as IncomingBody;
-use hyper::service::service_fn;
-use hyper_util::rt::{TokioExecutor, TokioIo};
 use std::future::Future;
 use std::io::IoSlice;
 use std::net::SocketAddr;
@@ -127,18 +125,24 @@ impl AsyncWrite for Replay {
 ///
 /// Holds a [`ServeState`] rather than a reference: it is created once per
 /// worker thread and lives as long as the worker does.
+///
+/// The connection is driven by [`H2ConnectionServer`], not by a bare hyper
+/// builder, and that matters more here than anywhere: `armature-h1` awaits
+/// this future in the worker that accepted the socket, holding one of that
+/// worker's connection slots until it resolves. hyper's HTTP/2 driver has no
+/// preface or idle deadline of its own, so without the connection server's a
+/// peer that negotiates `h2` and then sends nothing — or answers keep-alive
+/// PINGs forever while opening no streams — would hold the slot for the life
+/// of the process.
 pub(crate) struct HyperH2 {
     state: ServeState,
-    builder: hyper::server::conn::http2::Builder<TokioExecutor>,
+    server: H2ConnectionServer,
 }
 
 impl HyperH2 {
-    /// An HTTP/2 fallback serving `state` with `builder`'s tuning.
-    pub(crate) fn new(
-        state: ServeState,
-        builder: hyper::server::conn::http2::Builder<TokioExecutor>,
-    ) -> Self {
-        Self { state, builder }
+    /// An HTTP/2 fallback serving `state` with `server`'s tuning and limits.
+    pub(crate) fn new(state: ServeState, server: H2ConnectionServer) -> Self {
+        Self { state, server }
     }
 }
 
@@ -160,14 +164,9 @@ impl H2Fallback for HyperH2 {
             Some(peer) => self.state.for_peer(peer),
             None => self.state.clone(),
         };
-        let builder = self.builder.clone();
+        let server = self.server.clone();
         Box::pin(async move {
-            let io = TokioIo::new(Replay::wrap(io, buffered));
-            let service = service_fn(move |req: hyper::Request<IncomingBody>| {
-                let state = state.clone();
-                async move { crate::application::handle_request(req, state).await }
-            });
-            if let Err(err) = builder.serve_connection(io, service).await {
+            if let Err(err) = server.serve(Replay::wrap(io, buffered), state).await {
                 crate::logging::error!(error = %err, "Error serving HTTP/2 connection");
             }
         })

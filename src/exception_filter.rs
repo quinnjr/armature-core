@@ -90,7 +90,11 @@ pub struct ExceptionContext {
     pub request_id: Option<String>,
     /// User ID (if authenticated)
     pub user_id: Option<String>,
-    /// The path that was being accessed
+    /// The path that was being accessed, without its query string.
+    ///
+    /// Filters echo this into error bodies; the query routinely carries
+    /// secrets (reset codes, OAuth `code`, API keys) that must not be
+    /// reflected or logged. The full target is still on `request.path`.
     pub path: crate::ByteStr,
     /// The HTTP method
     pub method: crate::Method,
@@ -103,9 +107,19 @@ pub struct ExceptionContext {
 impl ExceptionContext {
     /// Create a new exception context from an HTTP request.
     pub fn from_request(request: HttpRequest) -> Self {
-        let request_id = request.headers.get("x-request-id").map(str::to_owned);
+        // A client-chosen request ID is only adopted when it is well-formed;
+        // it is echoed into the response body.
+        let request_id = request
+            .headers
+            .get("x-request-id")
+            .filter(|id| crate::headers::is_valid_request_id(id))
+            .map(str::to_owned);
 
-        let path = request.path.clone();
+        let path = if request.path.contains('?') {
+            crate::ByteStr::from(request.path_only())
+        } else {
+            request.path.clone()
+        };
         let method = request.method.clone();
 
         Self {
@@ -406,9 +420,13 @@ impl ExceptionFilter for HttpExceptionFilter {
             .error_type(error_type)
             .path(ctx.path.as_str());
 
-        // Add message
+        // Add message. In production, client errors go through
+        // `client_message()`, which keeps the actionable text but replaces
+        // detail that must not reach clients (e.g. serde's echo of the body).
         if self.production_mode && error.is_server_error() {
             response = response.message("An internal server error occurred");
+        } else if self.production_mode {
+            response = response.message(error.client_message());
         } else {
             response = response.message(error.to_string());
         }
@@ -871,6 +889,32 @@ mod tests {
         assert_eq!(ctx.method, "GET");
         assert_eq!(ctx.user_id, Some("user-123".to_string()));
         assert!(!ctx.production_mode);
+    }
+
+    #[tokio::test]
+    async fn test_exception_context_drops_query_and_bad_request_id() {
+        let mut request = HttpRequest::new("GET", "/reset?token=s3cret".to_string());
+        request.headers.insert("x-request-id", "bad id\u{7f}");
+        let ctx = ExceptionContext::from_request(request);
+        assert_eq!(ctx.path, "/reset");
+        assert_eq!(ctx.request_id, None);
+
+        let filter = HttpExceptionFilter::new();
+        let response = filter
+            .catch(&Error::BadRequest("x".into()), &ctx)
+            .await
+            .unwrap();
+        assert!(!String::from_utf8_lossy(&response.body).contains("s3cret"));
+    }
+
+    #[tokio::test]
+    async fn test_http_exception_filter_redacts_client_error_detail_in_production() {
+        let filter = HttpExceptionFilter::new();
+        let error = Error::Deserialization("invalid type: string \"hunter2\"".to_string());
+        let ctx = ExceptionContext::from_request(HttpRequest::new("POST", "/x".to_string()));
+        let response = filter.catch(&error, &ctx).await.unwrap();
+        let body = String::from_utf8_lossy(&response.body);
+        assert!(!body.contains("hunter2"), "{body}");
     }
 
     #[tokio::test]

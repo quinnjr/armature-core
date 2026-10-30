@@ -63,10 +63,20 @@ impl VerifiedIdentity {
 }
 
 /// Whether an authentication layer has attached verified credentials to this
-/// request: a [`VerifiedIdentity`] or a [`RequestRoles`].
+/// request: a [`VerifiedIdentity`], or a non-empty [`RequestRoles`].
+///
+/// An empty `RequestRoles` (`RequestRoles::default()`) is not evidence of
+/// anything: a layer that attaches roles to every request, with none for an
+/// anonymous caller, would otherwise make every anonymous request look
+/// authenticated. `armature-auth`'s `JwtAuthMiddleware` attaches a
+/// `VerifiedIdentity` alongside the roles, so a verified caller with no
+/// roles still passes.
 fn is_verified(request: &HttpRequest) -> bool {
     request.extensions.get::<VerifiedIdentity>().is_some()
-        || request.extensions.get::<RequestRoles>().is_some()
+        || request
+            .extensions
+            .get::<RequestRoles>()
+            .is_some_and(|roles| !roles.0.is_empty())
 }
 
 /// Whether the response to `request` may be specific to the caller, so a
@@ -296,6 +306,25 @@ mod tests {
     use super::*;
     use bytes::Bytes;
     use std::collections::HashMap;
+
+    #[tokio::test]
+    async fn empty_request_roles_are_not_authentication() {
+        let mut anonymous = HttpRequest::new("GET", "/test".to_string());
+        anonymous.extensions.insert(RequestRoles::default());
+        let context = GuardContext::new(anonymous);
+        assert!(!matches!(
+            AuthenticationGuard.can_activate(&context).await,
+            Ok(true)
+        ));
+
+        let mut with_roles = HttpRequest::new("GET", "/test".to_string());
+        with_roles.extensions.insert(RequestRoles::new(["user"]));
+        let context = GuardContext::new(with_roles);
+        assert!(matches!(
+            AuthenticationGuard.can_activate(&context).await,
+            Ok(true)
+        ));
+    }
 
     #[tokio::test]
     async fn test_authentication_guard() {

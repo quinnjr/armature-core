@@ -124,11 +124,25 @@ static SENSITIVE_PATTERNS: LazyLock<Vec<(regex::Regex, &'static str)>> = LazyLoc
         (form_delimited, "$1=[FILTERED]"),
         // Card numbers: 13-19 digits (every real PAN length, Amex's 15 and
         // the 19-digit ranges included), optionally split by single spaces or
-        // dashes in any grouping. Matches are Luhn-checked before replacement
-        // (see `redact_card_run`), so order ids and timestamps survive.
-        (r"\b\d(?:[ -]?\d){12,18}\b".into(), CARD_FILTERED),
+        // dashes in any grouping. The pattern takes the whole run of digit
+        // groups, however long, and `redact_card_run` finds the cards inside
+        // it: a match capped at 19 digits could end inside a card that other
+        // digits precede (`12 34 4111-1111-1111-1111`) and let it through.
+        // Cards are Luhn-checked, so order ids and timestamps survive.
+        // Digits are ASCII or fullwidth (`card_digit`), the forms a person
+        // types a card in; this class and `redact_card_run` agree on them.
+        // Groups may be split by one or two spaces, dashes, dots or
+        // non-breaking spaces.
+        // No `\b` at the start, so a card glued to a letter or `_`
+        // (`ref4111...`, `cc_4111...`) is still a run; the one preceding
+        // non-digit is consumed and copied back untouched.
+        (
+            r"(?:^|[^0-9\x{FF10}-\x{FF19}])[0-9\x{FF10}-\x{FF19}]+(?:[ \-.\x{A0}]{1,2}[0-9\x{FF10}-\x{FF19}]+)*"
+                .into(),
+            CARD_FILTERED,
+        ),
         // SSN
-        (r"\b\d{3}[- ]?\d{2}[- ]?\d{4}\b".into(), "[SSN FILTERED]"),
+        (r"\b(?-u:\d){3}[- ]?(?-u:\d){2}[- ]?(?-u:\d){4}\b".into(), "[SSN FILTERED]"),
     ];
 
     patterns
@@ -148,75 +162,99 @@ static SENSITIVE_PATTERNS: LazyLock<Vec<(regex::Regex, &'static str)>> = LazyLoc
 /// outright.
 const CARD_FILTERED: &str = "[CARD FILTERED]";
 
-/// Luhn checksum over the ASCII digits of `digits` (anything else skipped).
+/// The value of a digit a card number can be written in: ASCII or fullwidth
+/// (`４１１１`), as the card pattern matches them.
+fn card_digit(c: char) -> Option<u32> {
+    match c {
+        '0'..='9' => Some(c as u32 - '0' as u32),
+        '\u{FF10}'..='\u{FF19}' => Some(c as u32 - 0xFF10),
+        _ => None,
+    }
+}
+
+/// Luhn checksum over the card digits of `digits` (anything else skipped).
 fn luhn_valid(digits: &str) -> bool {
     let sum: u32 = digits
-        .bytes()
-        .filter(u8::is_ascii_digit)
+        .chars()
+        .filter_map(card_digit)
         .rev()
         .enumerate()
-        .map(|(i, b)| {
-            let d = u32::from(b - b'0');
-            match (i % 2 == 1, d * 2) {
-                (false, _) => d,
-                (true, doubled) if doubled > 9 => doubled - 9,
-                (true, doubled) => doubled,
-            }
+        .map(|(i, d)| match (i % 2 == 1, d * 2) {
+            (false, _) => d,
+            (true, doubled) if doubled > 9 => doubled - 9,
+            (true, doubled) => doubled,
         })
         .sum();
     sum.is_multiple_of(10)
 }
 
-/// `run` (digits with single space/dash separators, as the card pattern
-/// matches it) with any card number inside replaced by [`CARD_FILTERED`].
+/// `run` (digit groups joined by single spaces or dashes, as the card
+/// pattern matches it) with every card number inside replaced by
+/// [`CARD_FILTERED`].
 ///
-/// The whole run is not necessarily one number: the pattern also swallows a
-/// neighbouring group (`qty 2 4111 1111 1111 1111`, `... 1111 12 units`), and
-/// Luhn over the joined digits then fails, which would let the card through.
-/// So every run of whole groups with 13-19 digits is tried, the longest
-/// Luhn-valid one wins (a real card over an accidental 13-digit prefix), and
-/// what is left on either side is checked the same way.
+/// The run is not necessarily one number: dates, phone numbers, quantities
+/// and ids sit next to cards (`qty 2 4111 1111 1111 1111`, `2026-10-30 4111
+/// ...`), and Luhn over the joined digits then fails. So every window of
+/// whole groups holding 13-19 digits is checked, and every group inside any
+/// Luhn-valid window is redacted — over-redacting a neighbouring group is the
+/// price of never letting part of a card through.
 fn redact_card_run(run: &str) -> String {
-    let mut groups = Vec::new();
-    let mut start = None;
-    for (i, b) in run.bytes().enumerate() {
-        match (b.is_ascii_digit(), start) {
-            (true, None) => start = Some(i),
-            (false, Some(s)) => {
-                groups.push((s, i));
-                start = None;
+    // (start byte, end byte, digit count) of each digit group.
+    let mut groups: Vec<(usize, usize, usize)> = Vec::new();
+    let mut open: Option<(usize, usize)> = None;
+    for (i, c) in run.char_indices() {
+        match (card_digit(c).is_some(), open) {
+            (true, None) => open = Some((i, 1)),
+            (true, Some((s, n))) => open = Some((s, n + 1)),
+            (false, Some((s, n))) => {
+                groups.push((s, i, n));
+                open = None;
             }
-            _ => {}
+            (false, None) => {}
         }
     }
-    if let Some(s) = start {
-        groups.push((s, run.len()));
+    if let Some((s, n)) = open {
+        groups.push((s, run.len(), n));
     }
 
-    let mut best: Option<(usize, usize, usize)> = None;
+    let mut covered = vec![false; groups.len()];
     for i in 0..groups.len() {
         let mut digits = 0;
         for j in i..groups.len() {
-            digits += groups[j].1 - groups[j].0;
+            digits += groups[j].2;
             if digits > 19 {
                 break;
             }
-            if digits >= 13
-                && best.is_none_or(|(longest, _, _)| digits > longest)
-                && luhn_valid(&run[groups[i].0..groups[j].1])
-            {
-                best = Some((digits, i, j));
+            if digits >= 13 && luhn_valid(&run[groups[i].0..groups[j].1]) {
+                covered[i..=j].iter_mut().for_each(|c| *c = true);
             }
         }
     }
-    match best {
-        Some((_, i, j)) => format!(
-            "{}{CARD_FILTERED}{}",
-            redact_card_run(&run[..groups[i].0]),
-            redact_card_run(&run[groups[j].1..])
-        ),
-        None => run.to_string(),
+    if !covered.contains(&true) {
+        return run.to_string();
     }
+
+    // Each stretch of covered groups (with the separators between them)
+    // becomes one marker; uncovered groups and their separators stay.
+    let mut out = String::with_capacity(run.len());
+    let mut copied = 0;
+    let mut i = 0;
+    while i < groups.len() {
+        if !covered[i] {
+            i += 1;
+            continue;
+        }
+        let mut j = i;
+        while j + 1 < groups.len() && covered[j + 1] {
+            j += 1;
+        }
+        out.push_str(&run[copied..groups[i].0]);
+        out.push_str(CARD_FILTERED);
+        copied = groups[j].1;
+        i = j + 1;
+    }
+    out.push_str(&run[copied..]);
+    out
 }
 
 /// `key` as lowercase segments joined by single `_`s: a word boundary is any
@@ -285,7 +323,10 @@ pub(crate) fn is_sensitive_key(key: &str) -> bool {
         // A final `key` segment is key material (`accessKey`, `signingKey`,
         // `master_key`, a bare `key`); only as a whole segment, so `monkey`
         // and `keyboard` stay readable.
-        let pattern = format!("(?:{substring})|(?:^|_)(?:{segment}|{code})(?:_|$)|(?:^|_)key$");
+        // `key` as a whole segment anywhere (`signing_key_pem`,
+        // `key_material`, `hmac_key_hex`), not as part of a word (`monkey`,
+        // `keyboard`).
+        let pattern = format!("(?:{substring})|(?:^|_)(?:{segment}|{code}|key)(?:_|$)");
         let re = regex::Regex::new(&pattern);
         debug_assert!(re.is_ok(), "bad sensitive-key pattern: {re:?}");
         re.ok()
@@ -328,7 +369,14 @@ pub(crate) fn redact_sensitive(s: &str) -> Cow<'_, str> {
         } else {
             regex.replace_all(&result, *replacement)
         };
-        if let Cow::Owned(replaced) = replaced {
+        // The card pattern matches every digit run and its closure hands
+        // most of them back unchanged; `replace_all` still reports those as
+        // `Owned`. Only a real change counts, so callers that read `Owned` as
+        // "something was redacted" (and digit-bearing text that needs no
+        // redaction) keep the borrowed, unchanged input.
+        if let Cow::Owned(replaced) = replaced
+            && replaced != *result
+        {
             result = Cow::Owned(replaced);
         }
     }
@@ -2076,6 +2124,49 @@ mod tests {
         ] {
             assert_eq!(redact_sensitive(benign), benign);
         }
+        // Digits before a grouped card (a date, a phone number, an id) must
+        // not let any of it through.
+        for (input, card_tail) in [
+            ("12 34 4111-1111-1111-1111", "1111-1111"),
+            ("+1 555 4111 1111 1111 1111", "1111 1111"),
+            ("id 1234 4111 1111 1111 1111", "1111 1111"),
+            ("2026-10-30 4111 1111 1111 1111", "1111 1111"),
+            ("ref 7 8 9 3782 822463 10005", "822463"),
+            ("Order 98765 4111 1111 1111 1111 declined", "1111 1111"),
+            ("ref-2026-4111-1111-1111-1111", "1111-1111"),
+            ("10 20 4111 1111 1111 1111", "1111 1111"),
+            ("ref4111111111111111", "111111111111"),
+            ("cc_4111 1111 1111 1111", "1111 1111"),
+        ] {
+            let out = redact_sensitive(input);
+            assert!(out.contains("[CARD FILTERED]"), "{input} -> {out}");
+            assert!(!out.contains(card_tail), "{input} -> {out}");
+            assert!(!out.contains("4111"), "{input} -> {out}");
+        }
+        // Other separators people type.
+        for input in [
+            "4111.1111.1111.1111",
+            "4111  1111  1111  1111",
+            "4111\u{A0}1111\u{A0}1111\u{A0}1111",
+        ] {
+            assert!(!redact_sensitive(input).contains("1111"), "{input:?}");
+        }
+        // Text with digits but no card comes back borrowed, unchanged.
+        assert!(matches!(
+            redact_sensitive("order 1500 shipped on 2026-10-30"),
+            Cow::Borrowed(_)
+        ));
+        // A card typed in fullwidth digits is still a card.
+        let fullwidth: String = "4111 1111 1111 1111"
+            .chars()
+            .map(|c| match c {
+                '0'..='9' => char::from_u32(c as u32 - '0' as u32 + 0xFF10).unwrap(),
+                other => other,
+            })
+            .collect();
+        let input = format!("card {fullwidth}");
+        let out = redact_sensitive(&input);
+        assert_eq!(out, "card [CARD FILTERED]");
         // The surrounding text and a trailing non-card number survive.
         assert_eq!(
             redact_sensitive("qty 2 4111 1111 1111 1111 ok"),
@@ -2086,6 +2177,10 @@ mod tests {
     #[test]
     fn test_is_sensitive_key() {
         for key in [
+            "signing_key_pem",
+            "hmacKeyHex",
+            "master_key_b64",
+            "key_material",
             "password",
             "user.password",
             "user[password]",

@@ -3507,7 +3507,14 @@ async fn dispatch_request(
             resp
         }
         Err(err) => {
-            warn!(method = %method, path = %path, error = %err.log_display(), "Request handling failed");
+            // A client can produce 4xx at will (no credentials, a bad
+            // parameter, an unknown path); one `warn` per such request lets
+            // any peer flood the log. Server errors stay at `warn`.
+            if err.status_code() >= 500 {
+                warn!(method = %method, path = %path, error = %err.log_display(), "Request handling failed");
+            } else {
+                debug!(method = %method, path = %path, error = %err.log_display(), "Request rejected");
+            }
             respond_to_error(err, filter_ctx_request, state.filter_chain.clone()).await
         }
     };
@@ -3535,7 +3542,7 @@ async fn guarded_route(
     let request = match crate::routing::run_guards(guards, request).await? {
         Ok(request) => request,
         Err(forbidden) => {
-            warn!("Request rejected by a global guard");
+            debug!("Request rejected by a global guard");
             return Ok(forbidden);
         }
     };

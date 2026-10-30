@@ -1105,6 +1105,16 @@ mod tests {
     }
 
     #[test]
+    fn json_numbers_that_are_not_secrets_stay_numbers() {
+        let logged = body_log_preview(
+            Some("application/json"),
+            br#"{"amount":1500,"year":2026}"#,
+            1024,
+        );
+        assert_eq!(logged, r#"{"amount":1500,"year":2026}"#);
+    }
+
+    #[test]
     fn json_numbers_get_the_value_patterns_too() {
         let logged = body_log_preview(
             Some("application/json"),

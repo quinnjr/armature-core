@@ -367,6 +367,14 @@ impl Middleware for BodySizeLimitMiddleware {
 // Re-exported from crate::timeout::{TimeoutMiddleware, ConfigurableTimeoutMiddleware, TimeoutConfig}
 
 /// Security headers middleware
+///
+/// Sets `Strict-Transport-Security`, `X-Content-Type-Options: nosniff`,
+/// `X-Frame-Options: DENY` and `X-XSS-Protection: 0`.
+///
+/// `X-XSS-Protection` is sent as `0` (filter off), per OWASP: the legacy
+/// browser XSS auditor that `1; mode=block` switched on could itself be
+/// abused to detect or block page content cross-site (XS-leaks), and modern
+/// browsers have removed it. Use a `Content-Security-Policy` instead.
 pub struct SecurityHeadersMiddleware {
     hsts_enabled: bool,
     nosniff_enabled: bool,
@@ -422,7 +430,7 @@ impl Middleware for SecurityHeadersMiddleware {
         if self.xss_protection_enabled {
             response
                 .headers
-                .insert("X-XSS-Protection".to_string(), "1; mode=block".to_string());
+                .insert("X-XSS-Protection".to_string(), "0".to_string());
         }
 
         if let Some(frame_opts) = &self.frame_options {
@@ -559,11 +567,23 @@ impl Middleware for CompressionMiddleware {
 /// The path is logged without its query string, which routinely carries secrets
 /// (reset codes, OAuth `code`, API keys).
 ///
-/// Body logging is off by default. When enabled, bodies pass through the same
-/// best-effort redaction the error transformer uses (password/secret/token/
-/// API-key fields, bearer tokens, card/SSN-like numbers) before they are
-/// logged. That redaction is pattern-based and cannot recognize every secret a
-/// payload might carry, so leave body logging off in production.
+/// Body logging is off by default. When enabled, a body is redacted
+/// *structurally*, chosen by its `Content-Type`:
+///
+/// - JSON (`application/json`, `*+json`): parsed, and the whole value of any
+///   member whose key names a credential (`password`, `user.password`,
+///   `authToken`, `pin_code`, ... — object and array values included) is
+///   replaced with `"[FILTERED]"`, recursively, including JSON embedded in
+///   string values.
+/// - `application/x-www-form-urlencoded`: decoded pair by pair; a sensitive
+///   field name (`password`, `user[password]`, `user%5Bpassword%5D`, a bare
+///   OAuth `code`) has its value replaced.
+/// - `multipart/form-data`: only part names and sizes are logged.
+/// - Anything else, or a body that does not parse as its declared type, or
+///   one too large to parse: only `<N bytes>` is logged (fail closed).
+///
+/// Redaction is by field name and cannot recognize a secret in a field it
+/// has no reason to suspect, so leave body logging off in production.
 ///
 /// # Examples
 ///
@@ -611,21 +631,156 @@ impl LoggingMiddleware {
     }
 }
 
-/// How far past the preview limit a body is scanned for secrets before the
-/// preview is cut. Generous so a secret straddling the limit is still
-/// recognized whole, but bounded so logging a huge body doesn't mean
-/// regex-scanning all of it.
+/// How far past the preview limit a body may run and still be parsed for
+/// redaction. Structural redaction needs the whole body (a truncated JSON
+/// document does not parse), so this bounds the work logging one request
+/// can cost; a larger body logs as `<N bytes>`.
 const BODY_REDACTION_SLACK: usize = 64 * 1024;
 
-/// A truncated, redacted, lossily-decoded view of `body` for logging.
+/// How many levels of JSON-inside-a-JSON-string are unpacked and redacted.
+/// Deeper nesting is logged as `<N bytes>` rather than trusted.
+const EMBEDDED_JSON_DEPTH: usize = 4;
+
+/// The body shapes [`body_log_preview`] knows how to redact structurally.
+enum BodyKind<'a> {
+    Json,
+    Form,
+    /// Carries the full `Content-Type`, which holds the boundary.
+    Multipart(&'a str),
+}
+
+impl<'a> BodyKind<'a> {
+    fn of(content_type: Option<&'a str>) -> Option<Self> {
+        let content_type = content_type?;
+        let essence = content_type.split(';').next().unwrap_or("").trim();
+        let essence = essence.to_ascii_lowercase();
+        if essence == "application/json"
+            || (essence.starts_with("application/") && essence.ends_with("+json"))
+        {
+            Some(Self::Json)
+        } else if essence == "application/x-www-form-urlencoded" {
+            Some(Self::Form)
+        } else if essence == "multipart/form-data" {
+            Some(Self::Multipart(content_type))
+        } else {
+            None
+        }
+    }
+}
+
+/// Replace the value of every credential-named member of `value`, whatever
+/// its type, with `"[FILTERED]"`; recurse into everything else.
+fn redact_json_value(value: &mut serde_json::Value, depth: usize) {
+    use serde_json::Value;
+    match value {
+        Value::Object(map) => {
+            for (key, member) in map.iter_mut() {
+                if crate::error_transform::is_sensitive_key(key) {
+                    *member = Value::String("[FILTERED]".to_owned());
+                } else {
+                    redact_json_value(member, depth);
+                }
+            }
+        }
+        Value::Array(items) => items
+            .iter_mut()
+            .for_each(|item| redact_json_value(item, depth)),
+        Value::String(text) => *text = redact_json_string(text, depth),
+        _ => {}
+    }
+}
+
+/// A JSON string value as it may be logged. One that itself holds JSON
+/// (`"{\"password\":\"x\"}"`) is parsed and redacted structurally, up to
+/// [`EMBEDDED_JSON_DEPTH`] levels; past that, or for anything else, the text
+/// path catches `password=x`-style content.
+fn redact_json_string(text: &str, depth: usize) -> String {
+    let trimmed = text.trim_start();
+    if trimmed.starts_with('{') || trimmed.starts_with('[') {
+        let Some(depth) = depth.checked_sub(1) else {
+            return format!("<{} bytes>", text.len());
+        };
+        if let Ok(mut inner) = serde_json::from_str::<serde_json::Value>(text) {
+            redact_json_value(&mut inner, depth);
+            return inner.to_string();
+        }
+    }
+    crate::error_transform::redact_sensitive(text)
+}
+
+/// Whether a urlencoded field name names a credential. Besides the shared
+/// key test, a bare `code` (as the whole name or its last bracket segment) is
+/// the OAuth authorization code here, not an error code as it is in JSON.
+fn is_sensitive_form_key(key: &str) -> bool {
+    let last = key.rsplit('[').next().unwrap_or(key).trim_end_matches(']');
+    crate::error_transform::is_sensitive_key(key) || last.eq_ignore_ascii_case("code")
+}
+
+/// The full redacted rendering of `body`, or `None` if it cannot be shown
+/// safely (unknown type, or it does not parse as the declared one).
+fn redact_body(kind: BodyKind<'_>, body: &[u8]) -> Option<String> {
+    match kind {
+        BodyKind::Json => {
+            let mut value: serde_json::Value = serde_json::from_slice(body).ok()?;
+            redact_json_value(&mut value, EMBEDDED_JSON_DEPTH);
+            Some(value.to_string())
+        }
+        BodyKind::Form => {
+            // Same decoding the handler's `Form`/`Query` readers use, so the
+            // name tested is the name the application sees: `user%5Bpassword%5D`
+            // is `user[password]` here.
+            let text = std::str::from_utf8(body).ok()?;
+            let pairs = crate::query::parse(text);
+            let rendered: Vec<String> = pairs
+                .iter()
+                .map(|(key, value)| {
+                    let value = if is_sensitive_form_key(key) {
+                        "[FILTERED]".to_owned()
+                    } else {
+                        urlencoding::encode(&crate::error_transform::redact_sensitive(value))
+                            .into_owned()
+                    };
+                    format!("{}={value}", urlencoding::encode(key))
+                })
+                .collect();
+            Some(rendered.join("&"))
+        }
+        BodyKind::Multipart(content_type) => {
+            let parser = crate::form::MultipartParser::from_content_type(content_type).ok()?;
+            let mut parts = Vec::new();
+            for field in parser.parts(body) {
+                let field = field.ok()?;
+                let size = match (&field.file, &field.value) {
+                    (Some(file), _) => file.data.len(),
+                    (None, Some(value)) => value.len(),
+                    (None, None) => 0,
+                };
+                parts.push(format!(
+                    "{}=<{size} bytes>",
+                    urlencoding::encode(&field.name)
+                ));
+            }
+            Some(format!("multipart[{}]", parts.join(", ")))
+        }
+    }
+}
+
+/// A truncated, structurally redacted view of `body` for logging, chosen by
+/// its `Content-Type` (see [`LoggingMiddleware`]).
 ///
-/// Redacts first, then truncates. Truncating first cut a secret in half at
-/// the limit — `"password":"hunt` — and the redaction patterns, which need
-/// the whole token or its closing quote, then let the visible prefix through.
-fn body_log_preview(body: &[u8], max: usize) -> String {
-    let window = &body[..body.len().min(max.saturating_add(BODY_REDACTION_SLACK))];
-    let redacted = crate::error_transform::redact_sensitive(&String::from_utf8_lossy(window));
-    if body.len() > max || redacted.len() > max {
+/// Redacts first, then truncates: truncating first would leave a JSON body
+/// unparseable and cut a secret in half at the limit. A body too large to
+/// parse within the redaction budget, of an unrecognized type, or that fails
+/// to parse logs as `<N bytes>` only.
+fn body_log_preview(content_type: Option<&str>, body: &[u8], max: usize) -> String {
+    let withheld = || format!("<{} bytes>", body.len());
+    if body.len() > max.saturating_add(BODY_REDACTION_SLACK) {
+        return withheld();
+    }
+    let Some(redacted) = BodyKind::of(content_type).and_then(|kind| redact_body(kind, body)) else {
+        return withheld();
+    };
+    if redacted.len() > max {
         // Cut on a char boundary at or below `max`.
         let mut end = max.min(redacted.len());
         while !redacted.is_char_boundary(end) {
@@ -655,7 +810,13 @@ impl Middleware for LoggingMiddleware {
 
         // Log request
         if self.log_request_body && !req.body.is_empty() {
-            let body_preview = body_log_preview(&req.body, self.max_body_size);
+            // One unambiguous Content-Type, or the body is withheld: two
+            // lines leave which parser the application used a guess.
+            let content_type = match req.headers.get_all("content-type").as_slice() {
+                [one] => Some(*one),
+                _ => None,
+            };
+            let body_preview = body_log_preview(content_type, &req.body, self.max_body_size);
 
             crate::logging::info!(
                 method = %method,
@@ -679,7 +840,20 @@ impl Middleware for LoggingMiddleware {
         match &result {
             Ok(response) => {
                 if self.log_response_body && !response.body.is_empty() {
-                    let body_preview = body_log_preview(&response.body, self.max_body_size);
+                    // Response header names are case-sensitive map keys
+                    // here, so look across every casing; more than one line
+                    // withholds the body.
+                    let mut types = response
+                        .headers
+                        .iter()
+                        .filter(|(name, _)| name.eq_ignore_ascii_case("content-type"))
+                        .map(|(_, value)| value.as_str());
+                    let content_type = match (types.next(), types.next()) {
+                        (Some(one), None) => Some(one),
+                        _ => None,
+                    };
+                    let body_preview =
+                        body_log_preview(content_type, &response.body, self.max_body_size);
 
                     crate::logging::info!(
                         method = %method,
@@ -800,24 +974,25 @@ mod tests {
         );
     }
 
+    const JSON: Option<&str> = Some("application/json");
+    const FORM: Option<&str> = Some("application/x-www-form-urlencoded");
+
     #[test]
     fn logged_bodies_are_redacted() {
         let body = br#"{"user":"a","password":"hunter2","api_key":"k-1"}"#;
-        let out = body_log_preview(body, 1024);
+        let out = body_log_preview(JSON, body, 1024);
         assert!(!out.contains("hunter2"), "{out}");
         assert!(!out.contains("k-1"), "{out}");
-        assert!(out.contains(r#""user":"a""#));
+        assert!(out.contains(r#""user":"a""#), "{out}");
 
-        let out = body_log_preview(b"token=abc&x=1", 1024);
+        let out = body_log_preview(FORM, b"token=abc&x=1", 1024);
         assert!(!out.contains("abc"), "{out}");
-
-        let out = body_log_preview(&[b'a'; 10], 4);
-        assert_eq!(out, "aaaa... (10 bytes)");
+        assert!(out.contains("x=1"), "{out}");
 
         // A secret cut by the preview limit is still redacted: the whole
-        // member is seen (and filtered) before the cut.
+        // body is parsed (and filtered) before the cut.
         let body = br#"{"password":"hunter2-is-long"}"#;
-        let out = body_log_preview(body, 18);
+        let out = body_log_preview(JSON, body, 18);
         assert!(!out.contains("hun"), "{out}");
         assert!(
             out.ends_with(&format!("... ({} bytes)", body.len())),
@@ -825,8 +1000,105 @@ mod tests {
         );
 
         // Multi-byte text is cut on a char boundary, not mid-codepoint.
-        let out = body_log_preview("ééé".as_bytes(), 3);
-        assert_eq!(out, "é... (6 bytes)");
+        let out = body_log_preview(JSON, r#""ééé""#.as_bytes(), 3);
+        assert_eq!(out, "\"é... (8 bytes)");
+    }
+
+    /// Every round-4 bypass of the old regex-only redaction.
+    #[test]
+    fn json_bodies_are_redacted_structurally() {
+        for body in [
+            // Dotted / bracketed / camelCase keys.
+            r#"{"user.password":"s3cr3t"}"#,
+            r#"{"user[password]":"s3cr3t"}"#,
+            r#"{"authToken":"s3cr3t"}"#,
+            // Non-scalar values: the whole value goes.
+            r#"{"password":["s3cr3t"]}"#,
+            r#"{"token":{"value":"s3cr3t","kind":"bearer"}}"#,
+            r#"{"password":{"nested":["s3cr3t"]}}"#,
+            // Nested under an innocent key, and inside arrays.
+            r#"{"user":{"credentials":{"pw":"s3cr3t"}}}"#,
+            r#"[{"name":"a","secret":"s3cr3t"}]"#,
+            // Escaped JSON inside a string, and form text inside a string.
+            r#"{"payload":"{\"password\":\"s3cr3t\"}"}"#,
+            r#"{"payload":"{\"inner\":\"{\\\"token\\\":[\\\"s3cr3t\\\"]}\"}"}"#,
+            r#"{"note":"password = s3cr3t"}"#,
+            // The added key names.
+            r#"{"pass":"s3cr3t","passphrase":"s3cr3t","pw":"s3cr3t","auth":"s3cr3t"}"#,
+            r#"{"jwt":"s3cr3t","signature":"s3cr3t","cookie":"s3cr3t","pin_code":"s3cr3t"}"#,
+        ] {
+            let out = body_log_preview(JSON, body.as_bytes(), 4096);
+            assert!(!out.contains("s3cr3t"), "{body} -> {out}");
+            assert!(out.contains("[FILTERED]"), "{body} -> {out}");
+        }
+        // `+json` media types are JSON too.
+        let out = body_log_preview(
+            Some("application/vnd.api+json; charset=utf-8"),
+            br#"{"password":"s3cr3t"}"#,
+            4096,
+        );
+        assert!(!out.contains("s3cr3t"), "{out}");
+    }
+
+    #[test]
+    fn form_bodies_are_redacted_by_decoded_key() {
+        for body in [
+            "password=s3cr3t",
+            "user[password]=s3cr3t",
+            "user%5Bpassword%5D=s3cr3t",
+            "user[0][pin]=s3cr3t",
+            "code=s3cr3t&state=xyz",
+            "x[code]=s3cr3t",
+            "passphrase=s3cr3t&pw=s3cr3t&auth=s3cr3t&jwt=s3cr3t",
+            "signature=s3cr3t&cookie=s3cr3t&pin_code=s3cr3t&pass=s3cr3t",
+            "note=password+%3D+s3cr3t",
+        ] {
+            let out = body_log_preview(FORM, body.as_bytes(), 4096);
+            assert!(!out.contains("s3cr3t"), "{body} -> {out}");
+        }
+        let out = body_log_preview(FORM, b"name=alice&state=xyz", 4096);
+        assert_eq!(out, "name=alice&state=xyz");
+    }
+
+    #[test]
+    fn multipart_bodies_log_part_names_and_sizes_only() {
+        let ct = "multipart/form-data; boundary=XyZ";
+        let body = b"--XyZ\r\nContent-Disposition: form-data; name=\"username\"\r\n\r\nalice\r\n--XyZ\r\nContent-Disposition: form-data; name=\"password\"\r\n\r\ns3cr3t\r\n--XyZ--\r\n";
+        let out = body_log_preview(Some(ct), body, 4096);
+        assert!(!out.contains("s3cr3t") && !out.contains("alice"), "{out}");
+        assert!(out.contains("username=<5 bytes>"), "{out}");
+        assert!(out.contains("password=<6 bytes>"), "{out}");
+    }
+
+    /// Unknown or missing types, bodies that don't parse as their declared
+    /// type, and bodies too large to parse are withheld entirely.
+    #[test]
+    fn unparseable_or_unknown_bodies_fail_closed() {
+        let secret = b"password = s3cr3t";
+        for ct in [
+            None,
+            Some("text/plain"),
+            Some("application/octet-stream"),
+            JSON,
+        ] {
+            assert_eq!(body_log_preview(ct, secret, 4096), "<17 bytes>", "{ct:?}");
+        }
+        // Truncated JSON does not parse.
+        assert_eq!(
+            body_log_preview(JSON, br#"{"password":"s3cr"#, 4096),
+            "<17 bytes>"
+        );
+        // Malformed multipart.
+        assert_eq!(
+            body_log_preview(Some("multipart/form-data; boundary=XyZ"), secret, 4096),
+            "<17 bytes>"
+        );
+        // Over the parse budget.
+        let big = vec![b' '; BODY_REDACTION_SLACK + 11];
+        assert_eq!(
+            body_log_preview(JSON, &big, 10),
+            format!("<{} bytes>", big.len())
+        );
     }
 
     /// The BREACH heuristic sees cookies set through the cookie API (which
@@ -1052,6 +1324,11 @@ mod tests {
         let response = result.unwrap();
         assert!(response.headers.contains_key("X-Content-Type-Options"));
         assert!(response.headers.contains_key("X-Frame-Options"));
+        // The auditor is switched off, not into `mode=block` (XS-leaks).
+        assert_eq!(
+            response.headers.get("X-XSS-Protection").map(String::as_str),
+            Some("0")
+        );
     }
 
     #[tokio::test]

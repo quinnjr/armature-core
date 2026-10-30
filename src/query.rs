@@ -30,9 +30,20 @@ pub type QueryPairs = SmallVec<[(String, String); 8]>;
 /// `&str` into the request's memoized pairs, never copies of them. The pairs
 /// themselves are owned — percent-decoding has to produce new bytes — but they
 /// are built once, on first access, not per lookup.
-#[derive(Debug, Clone, Copy)]
+///
+/// `Debug` prints the key names and each value's length, not the values: a
+/// query routinely carries tokens and reset codes.
+#[derive(Clone, Copy)]
 pub struct QueryView<'a> {
     pairs: &'a [(String, String)],
+}
+
+impl std::fmt::Debug for QueryView<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("QueryView")
+            .field("pairs", &crate::headers::RedactedPairs(self.pairs))
+            .finish()
+    }
 }
 
 impl<'a> QueryView<'a> {
@@ -175,6 +186,31 @@ pub(crate) fn first_wins_urlencoded(input: &[u8]) -> Result<Cow<'_, [u8]>, Strin
 /// stray `%` would break clients for no security gain — nothing downstream
 /// trusts these bytes.
 pub(crate) fn parse(query: &str) -> QueryPairs {
+    parse_pairs(query)
+}
+
+/// The query string's `&`-separated segments exactly as sent, ordered by
+/// their (undecoded) name, for keying a cache.
+///
+/// Decoding is lossy — `%FF` and `%FE` both become U+FFFD, `+` and `%20` both
+/// a space — so a key built from decoded pairs merges requests that a handler
+/// reading [`HttpRequest::query_string`](crate::HttpRequest::query_string)
+/// tells apart, and one of them could be served the other's body. Raw
+/// segments never merge two requests that decode differently either: equal
+/// raw bytes decode equally. Only the order of differently named segments is
+/// normalized (`?a=1&b=2` and `?b=2&a=1` share an entry); the sort is stable,
+/// so repeated names keep their order and first-wins reads stay the same.
+/// Empty segments (`a=1&&b=2`) carry nothing for any reader and are dropped.
+pub(crate) fn raw_segments_sorted(query: &str) -> Vec<&str> {
+    let mut segments: Vec<&str> = query.split('&').filter(|s| !s.is_empty()).collect();
+    fn name(segment: &str) -> &str {
+        segment.split_once('=').map_or(segment, |(k, _)| k)
+    }
+    segments.sort_by(|a, b| name(a).cmp(name(b)));
+    segments
+}
+
+fn parse_pairs(query: &str) -> QueryPairs {
     let mut out = QueryPairs::new();
     for pair in query.split('&') {
         if pair.is_empty() {
@@ -247,6 +283,28 @@ fn decode(s: &str) -> Cow<'_, str> {
 
 #[cfg(test)]
 mod tests {
+    use super::raw_segments_sorted;
+
+    #[test]
+    fn debug_prints_keys_and_lengths_not_values() {
+        let req = HttpRequest::new("GET", "/s?token=s3cret&page=2");
+        let out = format!("{:?}", req.query());
+        assert!(!out.contains("s3cret"), "{out}");
+        assert!(out.contains("token") && out.contains("<6 bytes>"), "{out}");
+    }
+
+    #[test]
+    fn raw_segments_sort_by_name_and_keep_repeats_in_order() {
+        assert_eq!(
+            raw_segments_sorted("b=2&a=1&&a=0"),
+            vec!["a=1", "a=0", "b=2"]
+        );
+        // Distinct raw bytes stay distinct, even where decoding merges them.
+        assert_ne!(raw_segments_sorted("a=%FF"), raw_segments_sorted("a=%FE"));
+        assert_ne!(raw_segments_sorted("a=+"), raw_segments_sorted("a=%20"));
+        assert!(raw_segments_sorted("").is_empty());
+    }
+
     /// Distinct raw keys that decode to the same lossy string are one key to
     /// serde, so they must be deduplicated (first wins) too.
     #[test]

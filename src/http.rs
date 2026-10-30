@@ -51,8 +51,23 @@ impl RouteParamsExt for RouteParams {
 /// `OnceLock` rather than `OnceCell` because `HttpRequest` must stay `Sync`:
 /// extractors hold `&HttpRequest` across an `await` inside a `Send` future, and
 /// `&T: Send` requires `T: Sync`.
-#[derive(Debug, Default)]
+///
+/// `Debug` prints key names and value lengths only (see
+/// [`QueryView`](crate::query::QueryView)).
+#[derive(Default)]
 pub struct QueryCache(OnceLock<QueryPairs>);
+
+impl std::fmt::Debug for QueryCache {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self.0.get() {
+            Some(pairs) => f
+                .debug_tuple("QueryCache")
+                .field(&crate::headers::RedactedPairs(pairs))
+                .finish(),
+            None => f.write_str("QueryCache(<unparsed>)"),
+        }
+    }
+}
 
 impl Clone for QueryCache {
     /// A clone starts cold.
@@ -1749,6 +1764,15 @@ fn is_cookie_value(value: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn query_cache_debug_prints_keys_and_lengths_only() {
+        let req = HttpRequest::new("GET", "/s?token=s3cret");
+        let _ = req.query();
+        let out = format!("{:?}", req.query_cache);
+        assert!(!out.contains("s3cret"), "{out}");
+        assert!(out.contains("token") && out.contains("<6 bytes>"), "{out}");
+    }
 
     /// M12: attribute injection through a cookie value or path is refused.
     #[test]

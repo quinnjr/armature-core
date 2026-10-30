@@ -173,10 +173,12 @@ impl FormFile {
             .chars()
             .filter(|&c| !c.is_control() && !is_format_char(c) && c != ':')
             .collect();
+        // Dots and whitespace together at the front: trimming them one after
+        // the other lets `". .htaccess"` keep its inner dot once the leading
+        // space goes.
         let name = name
-            .trim()
-            .trim_start_matches('.')
-            .trim_end_matches(['.', ' ']);
+            .trim_start_matches(|c: char| c == '.' || c.is_whitespace())
+            .trim_end_matches(|c: char| c == '.' || c.is_whitespace());
 
         if name.is_empty() {
             "file".to_string()
@@ -281,13 +283,16 @@ fn fit_filename(name: &str, max: usize) -> String {
     if let Some((stem, ext)) = split_extension(name)
         && ext.len() <= MAX_PRESERVED_EXTENSION_LEN
     {
-        // At least `max - 17` bytes of stem are kept, and it begins with a
-        // character that is neither a dot nor a space (the name was trimmed),
-        // so it cannot trim away to nothing.
+        // The cut stem can still trim away to nothing (`a` followed by 300
+        // dots); `.{ext}` would then be a hidden file, so it gets a stem.
         let stem = truncate_filename(stem, max - ext.len() - 1);
+        let stem = if stem.is_empty() { "file" } else { stem };
         return format!("{stem}.{ext}");
     }
-    truncate_filename(name, max).to_string()
+    match truncate_filename(name, max) {
+        "" => "file".to_string(),
+        cut => cut.to_string(),
+    }
 }
 
 /// `(stem, extension)` of a single-component name, split at its last dot,
@@ -341,7 +346,7 @@ fn is_format_char(c: char) -> bool {
 }
 
 /// Whether Windows treats `name` as a device (`CON`, `PRN`, `AUX`, `NUL`,
-/// `CONIN$`, `CONOUT$`, `COM1`-`COM9`, `LPT1`-`LPT9`, and the
+/// `CONIN$`, `CONOUT$`, `COM0`-`COM9`, `LPT0`-`LPT9`, and the
 /// superscript-digit variants), with or without an extension: opening
 /// `uploads\con.txt` opens the console, not a file.
 fn is_windows_reserved(name: &str) -> bool {
@@ -359,7 +364,7 @@ fn is_windows_reserved(name: &str) -> bool {
             let mut chars = digit.chars();
             matches!(
                 (chars.next(), chars.next()),
-                (Some('1'..='9' | '\u{B9}' | '\u{B2}' | '\u{B3}'), None)
+                (Some('0'..='9' | '\u{B9}' | '\u{B2}' | '\u{B3}'), None)
             )
         }
     }
@@ -1291,8 +1296,33 @@ mod tests {
         ] {
             assert_eq!(f(input), want, "{input}");
         }
-        for ok in ["CONSOLE.txt", "COM10", "LPT0", "nullable", "com"] {
+        for ok in ["CONSOLE.txt", "COM10", "LPT10", "nullable", "com"] {
             assert_eq!(f(ok), ok);
+        }
+    }
+
+    #[test]
+    fn safe_filename_never_yields_a_hidden_name() {
+        let named = |n: String| FormFile::new(n, "x".into(), vec![]).safe_filename();
+        // Leading dot, space, then dots that the stem cut trims to nothing.
+        let n = named(format!(". {}htaccess", ".".repeat(300)));
+        assert!(!n.starts_with('.') && !n.is_empty(), "{n:?}");
+        assert_eq!(named(". .htaccess".into()), "htaccess");
+        assert_eq!(named(" . .env".into()), "env");
+        // A stem that trims away entirely still keeps a name before the dot.
+        let n = named(format!("a{}.png", ".".repeat(300)));
+        assert!(!n.starts_with('.'), "{n:?}");
+        assert!(n.ends_with(".png"), "{n:?}");
+        // An over-long extension that is cut away to nothing falls back too.
+        let n = named(format!(". {}{}", ".".repeat(300), "x".repeat(0)));
+        assert_eq!(n, "file");
+    }
+
+    #[test]
+    fn windows_zero_numbered_devices_are_reserved() {
+        for name in ["COM0", "lpt0.txt"] {
+            let f = FormFile::new(name.into(), "x".into(), vec![]);
+            assert!(f.safe_filename().starts_with('_'), "{name}");
         }
     }
 

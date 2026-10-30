@@ -43,7 +43,8 @@
 //!
 //! - `write_timeout` -> `armature_h1::Limits::write_timeout`, and a
 //!   `WriteDeadline` around every socket hyper serves (HTTP/1.1 with the
-//!   feature off, HTTP/2 always).
+//!   feature off, HTTP/2 always), which also holds responses to the
+//!   application's `BodyReadPolicy` minimum rate.
 //! - `keep_alive_timeout` -> the idle deadline of every HTTP/2 connection
 //!   (see `http2::H2ConnectionServer`). On the hyper HTTP/1.1 path an idle
 //!   keep-alive connection is instead bounded by [`HEADER_READ_TIMEOUT`],
@@ -220,6 +221,17 @@ pub struct PipelineConfig {
     /// indefinitely by shrinking its receive window to zero. Five
     /// minutes is generous enough for a large response over a slow link and
     /// finite enough that the hold is not free.
+    ///
+    /// On the hyper paths the deadline is reset by every bit of progress, so
+    /// responses there are also held to the minimum rate of the application's
+    /// [`BodyReadPolicy`](crate::BodyReadPolicy) — otherwise a peer reading a
+    /// byte just inside each timeout would hold the connection for hours (on
+    /// HTTP/2 per stream as well, until the peer has actually been sent the
+    /// response). On the `h1-backend` path no such rule is needed:
+    /// `armature-h1` arms this deadline once per response write and does not
+    /// reset it on progress, and this crate hands it whole (`Full`) bodies, so
+    /// a response there is written in full within `write_timeout` or the
+    /// connection closes.
     pub write_timeout: Option<Duration>,
 
     /// Maximum requests per connection before forcing close.
@@ -326,10 +338,31 @@ pub(crate) fn hardened_http1_builder() -> hyper::server::conn::http1::Builder {
 /// the length of a large response over a slow link. A write that completes
 /// immediately — the overwhelmingly common case — never touches the timer: the
 /// `Sleep` is allocated on the first `Pending` and only then.
+///
+/// Progress alone does not bound the transfer, though: a peer that reads a
+/// byte just inside every timeout never stalls, and holds the connection for
+/// `size × timeout`. So with [`with_min_rate`](Self::with_min_rate) the writes
+/// are also held to the [`BodyReadPolicy`](crate::BodyReadPolicy)'s minimum
+/// rate — the rule request bodies are read under — over each *backlog*: from
+/// the first write that has to wait for the peer until one goes out whole,
+/// which is the peer keeping up again. A response the socket absorbs at once
+/// never starts one.
 pub(crate) struct WriteDeadline<T> {
     inner: T,
     timeout: Option<Duration>,
     stalled: Option<std::pin::Pin<Box<tokio::time::Sleep>>>,
+    rate: Option<crate::BodyReadPolicy>,
+    /// The backlog the minimum rate is being held over, if one is open.
+    backlog: Option<Backlog>,
+}
+
+/// Writes waiting on a peer that has not been keeping up.
+#[derive(Debug, Clone, Copy)]
+struct Backlog {
+    /// The first write that had to wait.
+    since: tokio::time::Instant,
+    /// Bytes the peer has taken since.
+    written: usize,
 }
 
 impl<T> WriteDeadline<T> {
@@ -340,6 +373,49 @@ impl<T> WriteDeadline<T> {
             inner,
             timeout,
             stalled: None,
+            rate: None,
+            backlog: None,
+        }
+    }
+
+    /// Also hold writes the peer is slow to take to `rate`'s minimum (after
+    /// its `idle_timeout` grace); a policy with the rate rule disabled adds
+    /// nothing.
+    pub(crate) fn with_min_rate(mut self, rate: crate::BodyReadPolicy) -> Self {
+        self.rate = rate.rate_budget(0).is_some().then_some(rate);
+        self
+    }
+
+    /// Account for a write the peer took `n` of `wanted` bytes of: all of it
+    /// ends a backlog, part of it counts towards the backlog's rate.
+    fn wrote(&mut self, n: usize, wanted: usize) {
+        if let Some(backlog) = &mut self.backlog {
+            if n >= wanted {
+                self.backlog = None;
+            } else {
+                backlog.written = backlog.written.saturating_add(n);
+            }
+        }
+    }
+
+    /// When the stall now starting must end: within the write timeout, and
+    /// by when the backlog's bytes so far would meet the minimum rate.
+    fn stall_deadline(&mut self) -> Option<tokio::time::Instant> {
+        let now = tokio::time::Instant::now();
+        let stall = self
+            .timeout
+            .map(|limit| crate::http2::deadline_after(now, limit));
+        let slow = self.rate.and_then(|rate| {
+            let backlog = *self.backlog.get_or_insert(Backlog {
+                since: now,
+                written: 0,
+            });
+            rate.rate_budget(backlog.written)
+                .map(|budget| crate::http2::deadline_after(backlog.since, budget))
+        });
+        match (stall, slow) {
+            (Some(a), Some(b)) => Some(a.min(b)),
+            (a, b) => a.or(b),
         }
     }
 
@@ -357,16 +433,19 @@ impl<T> WriteDeadline<T> {
                 Poll::Ready(r)
             }
             Poll::Pending => {
-                let Some(timeout) = self.timeout else {
+                if self.stalled.is_none() {
+                    let Some(deadline) = self.stall_deadline() else {
+                        return Poll::Pending;
+                    };
+                    self.stalled = Some(Box::pin(tokio::time::sleep_until(deadline)));
+                }
+                let Some(sleep) = self.stalled.as_mut() else {
                     return Poll::Pending;
                 };
-                let sleep = self
-                    .stalled
-                    .get_or_insert_with(|| Box::pin(tokio::time::sleep(timeout)));
                 match sleep.as_mut().poll(cx) {
                     Poll::Ready(()) => Poll::Ready(Err(std::io::Error::new(
                         std::io::ErrorKind::TimedOut,
-                        "write stalled past the configured write timeout",
+                        "write stalled past the write timeout or fell below the minimum rate",
                     ))),
                     Poll::Pending => Poll::Pending,
                 }
@@ -392,6 +471,9 @@ impl<T: tokio::io::AsyncWrite + Unpin> tokio::io::AsyncWrite for WriteDeadline<T
         buf: &[u8],
     ) -> std::task::Poll<std::io::Result<usize>> {
         let polled = std::pin::Pin::new(&mut self.inner).poll_write(cx, buf);
+        if let std::task::Poll::Ready(Ok(n)) = polled {
+            self.wrote(n, buf.len());
+        }
         self.guard(cx, polled)
     }
 
@@ -423,6 +505,9 @@ impl<T: tokio::io::AsyncWrite + Unpin> tokio::io::AsyncWrite for WriteDeadline<T
         bufs: &[std::io::IoSlice<'_>],
     ) -> std::task::Poll<std::io::Result<usize>> {
         let polled = std::pin::Pin::new(&mut self.inner).poll_write_vectored(cx, bufs);
+        if let std::task::Poll::Ready(Ok(n)) = polled {
+            self.wrote(n, bufs.iter().map(|b| b.len()).sum());
+        }
         self.guard(cx, polled)
     }
 }
@@ -843,6 +928,63 @@ impl PipelinedHttp1Builder {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Write `len` bytes through a [`WriteDeadline`] (write timeout 2 s, rate
+    /// floor `min_rate` after a 200 ms grace) to a peer that reads `step`
+    /// bytes every 20 ms. Returns how the write ended and how long it took.
+    async fn write_to_a_trickling_reader(
+        len: usize,
+        step: usize,
+        min_rate: u64,
+    ) -> (std::io::Result<()>, Duration) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let (server, mut client) = tokio::io::duplex(1024);
+        let reader = tokio::spawn(async move {
+            let mut buf = vec![0u8; step];
+            loop {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+                match client.read(&mut buf).await {
+                    Ok(0) | Err(_) => return,
+                    Ok(_) => {}
+                }
+            }
+        });
+        let mut io = WriteDeadline::new(server, Some(Duration::from_secs(2))).with_min_rate(
+            crate::BodyReadPolicy {
+                idle_timeout: Duration::from_millis(200),
+                min_bytes_per_sec: min_rate,
+            },
+        );
+        let started = std::time::Instant::now();
+        let written = io.write_all(&vec![b'x'; len]).await;
+        let took = started.elapsed();
+        drop(io);
+        reader.abort();
+        (written, took)
+    }
+
+    /// The finding: the write deadline is reset by every bit of progress, so
+    /// a peer reading a byte at a time just inside it held the connection —
+    /// its slot, its descriptor and its response — for hours. A response the
+    /// peer takes below the minimum rate now fails the write.
+    #[tokio::test]
+    async fn a_reader_below_the_minimum_rate_fails_the_write() {
+        // 16 bytes every 20 ms is ~800 B/s against a 4 KiB/s floor; at that
+        // pace 64 KiB would take over a minute.
+        let (written, took) = write_to_a_trickling_reader(64 * 1024, 16, 4096).await;
+        let err = written.expect_err("a below-rate reader must not be served out");
+        assert_eq!(err.kind(), std::io::ErrorKind::TimedOut);
+        assert!(took < Duration::from_secs(2), "took {took:?}");
+    }
+
+    /// A reader slower than the socket but above the floor is served in full,
+    /// however long it takes.
+    #[tokio::test]
+    async fn a_reader_above_the_minimum_rate_is_served() {
+        // 1 KiB every 20 ms is ~50 KiB/s against a 4 KiB/s floor.
+        let (written, _) = write_to_a_trickling_reader(64 * 1024, 1024, 4096).await;
+        written.expect("an above-rate reader is served in full");
+    }
 
     #[test]
     fn test_pipeline_mode_properties() {

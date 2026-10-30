@@ -169,8 +169,18 @@ impl<E1: Extract, E2: Extract, E3: Extract, E4: Extract, E5: Extract> Extract
 // ============================================================================
 
 /// Extract the raw request body as bytes.
-#[derive(Debug, Clone)]
+///
+/// `Debug` prints the length, not the bytes: a body carries credentials.
+#[derive(Clone)]
 pub struct RawBody(pub bytes::Bytes);
+
+impl std::fmt::Debug for RawBody {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_tuple("RawBody")
+            .field(&crate::headers::RedactedLen(self.0.len()))
+            .finish()
+    }
+}
 
 impl Extract for RawBody {
     #[inline]
@@ -969,6 +979,15 @@ pub fn middleware_stats() -> &'static ZeroCostStats {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn raw_body_debug_prints_length_only() {
+        let out = format!(
+            "{:?}",
+            RawBody(bytes::Bytes::from_static(b"password=s3cret"))
+        );
+        assert_eq!(out, "RawBody(<15 bytes>)");
+    }
     use bytes::Bytes;
 
     fn create_request() -> HttpRequest {

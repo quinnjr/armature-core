@@ -55,11 +55,9 @@ pnpm-debug.log*
 .pnpm-store/
 
 # Environment & Secrets
-.env
-.env.local
-.env.*.local
-.env.development
-.env.production
+# Every env file (`.env.staging`, `.env.test`, ...), not a list of known ones.
+.env*
+!.env.example
 *.pem
 *.key
 *.crt

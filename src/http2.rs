@@ -578,6 +578,8 @@ impl H2ConnectionServer {
 
         let limits = self.limits;
         let tracker = Arc::new(StreamTracker::new());
+        let wire = Arc::new(WireStreams::default());
+        let rate = state.body_read();
         // One budget per connection, shared by its streams through the state
         // every one of them is served with.
         let state = state.with_body_budget(limits.body_budget);
@@ -610,31 +612,54 @@ impl H2ConnectionServer {
             })
         };
 
-        let io = hyper_util::rt::TokioIo::new(crate::pipeline::WriteDeadline::new(
-            io,
-            limits.write_timeout,
+        let io = hyper_util::rt::TokioIo::new(WireWatch::new(
+            crate::pipeline::WriteDeadline::new(io, limits.write_timeout).with_min_rate(rate),
+            Arc::clone(&wire),
         ));
         let conn = self.builder.serve_connection(io, service);
         let mut conn = std::pin::pin!(conn);
 
+        // A response stream can open on the wire between two looks, and the
+        // next look may otherwise be a whole idle timeout away; no stream's
+        // first deadline is sooner than this, so looking at least this often
+        // catches a stalled one within twice its budget.
+        let look_every = match (limits.write_timeout, rate.rate_budget(0)) {
+            (Some(a), Some(b)) => Some(a.min(b)),
+            (a, b) => a.or(b),
+        };
         let mut deadline = tracker.started + limits.handshake_timeout;
         let served = loop {
             tokio::select! {
                 served = conn.as_mut() => break Some(served),
                 () = tokio::time::sleep_until(deadline) => {
                     let now = tokio::time::Instant::now();
-                    let Some(next) = tracker.next_deadline(now, limits.idle_timeout) else {
+                    let Some(mut next) = tracker.next_deadline(now, limits.idle_timeout) else {
                         break None;
                     };
                     // hyper cannot reset one stream from out here, so a
                     // response the peer has stopped accepting (or accepts too
                     // slowly) closes the connection, the way a stalled write
-                    // does on HTTP/1.1.
-                    match tracker.next_stall_deadline(now) {
-                        Err(Stalled) => break None,
-                        Ok(Some(stall)) => deadline = next.min(stall),
-                        Ok(None) => deadline = next,
+                    // does on HTTP/1.1. Checked twice: while hyper still holds
+                    // the body (`TrackedBody`), and on the wire, which also
+                    // covers the tail `h2` keeps after hyper has let go.
+                    let mut stalled = false;
+                    for stall in [
+                        tracker.next_stall_deadline(now),
+                        wire.next_stall_deadline(now, limits.write_timeout, rate),
+                    ] {
+                        match stall {
+                            Err(Stalled) => stalled = true,
+                            Ok(Some(stall)) => next = next.min(stall),
+                            Ok(None) => {}
+                        }
                     }
+                    if stalled {
+                        break None;
+                    }
+                    if let Some(every) = look_every {
+                        next = next.min(deadline_after(now, every));
+                    }
+                    deadline = next;
                 }
             }
         };
@@ -660,6 +685,17 @@ impl H2ConnectionServer {
         stats.connection_closed();
         served
     }
+}
+
+/// `at + after`, saturating at a moment far enough out to mean "never".
+///
+/// `Duration::MAX` (or anything close) is how a configuration says "no
+/// deadline", and `Instant + Duration` panics past the platform's range — in
+/// a connection watcher, that panic ends the watcher and with it every bound
+/// it enforced. Thirty years is what tokio itself uses for "far future".
+pub(crate) fn deadline_after(at: tokio::time::Instant, after: Duration) -> tokio::time::Instant {
+    const FAR_FUTURE: Duration = Duration::from_secs(30 * 365 * 24 * 60 * 60);
+    at.checked_add(after.min(FAR_FUTURE)).unwrap_or(at)
 }
 
 /// Counts a connection's in-flight streams and remembers when it last went
@@ -745,7 +781,7 @@ impl StreamTracker {
         let Some(oldest) = oldest else {
             return Ok(None);
         };
-        let expires = self.started + Duration::from_nanos(oldest);
+        let expires = deadline_after(self.started, Duration::from_nanos(oldest));
         if expires <= now {
             Err(Stalled)
         } else {
@@ -780,11 +816,13 @@ impl StreamTracker {
             return None;
         }
         if self.active.load(Ordering::Acquire) > 0 {
-            return Some(now + idle_timeout);
+            return Some(deadline_after(now, idle_timeout));
         }
-        let idle_since =
-            self.started + Duration::from_nanos(self.idle_since_nanos.load(Ordering::Acquire));
-        let expires = idle_since + idle_timeout;
+        let idle_since = deadline_after(
+            self.started,
+            Duration::from_nanos(self.idle_since_nanos.load(Ordering::Acquire)),
+        );
+        let expires = deadline_after(idle_since, idle_timeout);
         (expires > now).then_some(expires)
     }
 }
@@ -815,6 +853,9 @@ const RESPONSE_CHUNK: usize = 16 * 1024;
 /// hours, for a large body. So the body must also keep to the policy's
 /// minimum rate: chunk `k` must be accepted by `grace + bytes_before_k /
 /// min_bytes_per_sec` after the response started.
+///
+/// Its watch ends when hyper drops the body, which can be well before the
+/// peer has been sent all of it; [`WireStreams`] watches the rest.
 pub(crate) struct TrackedBody {
     /// Bytes not yet handed to hyper.
     pending: bytes::Bytes,
@@ -865,11 +906,11 @@ impl TrackedBody {
     /// When the next poll is due, having sent `self.sent` bytes by `now`: the
     /// sooner of the stall bound and the minimum-rate bound.
     fn next_deadline(&self, now: tokio::time::Instant) -> Option<tokio::time::Instant> {
-        let stall = self.write_timeout.map(|limit| now + limit);
+        let stall = self.write_timeout.map(|limit| deadline_after(now, limit));
         let rate = self
             .rate
             .rate_budget(self.sent)
-            .map(|budget| self.started + budget);
+            .map(|budget| deadline_after(self.started, budget));
         match (stall, rate) {
             (Some(a), Some(b)) => Some(a.min(b)),
             (a, b) => a.or(b),
@@ -921,6 +962,290 @@ impl hyper::body::Body for TrackedBody {
             hint.set_upper(upper + pending);
         }
         hint
+    }
+}
+
+/// The response streams a connection has started on the wire and not yet
+/// finished, as the bytes actually written to the socket show them.
+///
+/// [`TrackedBody`] can only watch a response while hyper holds its body, and
+/// hyper lets go early: once a stream has a single byte of window it hands
+/// `h2` the whole next chunk, and after the last one it ends the body, drops
+/// it and is done — while `h2` may still be holding most of that chunk,
+/// waiting on credit the peer need never grant. A peer with a one-byte stream
+/// window pinned up to a chunk per stream that way, indefinitely, with no
+/// stream counted in flight and nothing watching.
+///
+/// So the socket is watched too ([`WireWatch`]): a response stream opens when
+/// its `HEADERS` (without `END_STREAM`) are written, makes progress with each
+/// `DATA` frame written for it, and ends with `END_STREAM` or an
+/// `RST_STREAM` in either direction — a peer that cancels a download leaves
+/// `h2` nothing more to send, which must not read as a stall. Every open one
+/// must meet the same rules as [`TrackedBody`]: progress within the write
+/// timeout, and the minimum rate counted from its headers.
+#[derive(Default)]
+pub(crate) struct WireStreams {
+    open: std::sync::Mutex<std::collections::HashMap<u32, WireStream>>,
+}
+
+/// One response stream open on the wire.
+#[derive(Debug, Clone, Copy)]
+struct WireStream {
+    /// When its `HEADERS` were written: the rate rule counts from here.
+    opened: tokio::time::Instant,
+    /// When the last `DATA` for it was written (or `opened`).
+    progressed: tokio::time::Instant,
+    /// `DATA` payload bytes written for it.
+    sent: u64,
+}
+
+impl WireStreams {
+    /// The earliest moment an open response stream must next make progress,
+    /// `Ok(None)` if none is open (or no rule applies), or [`Stalled`] if one
+    /// is already past it.
+    pub(crate) fn next_stall_deadline(
+        &self,
+        now: tokio::time::Instant,
+        write_timeout: Option<Duration>,
+        rate: crate::BodyReadPolicy,
+    ) -> Result<Option<tokio::time::Instant>, Stalled> {
+        let Ok(open) = self.open.lock() else {
+            return Ok(None);
+        };
+        let mut earliest: Option<tokio::time::Instant> = None;
+        for stream in open.values() {
+            let stall = write_timeout.map(|limit| deadline_after(stream.progressed, limit));
+            let slow = rate
+                .rate_budget(usize::try_from(stream.sent).unwrap_or(usize::MAX))
+                .map(|budget| deadline_after(stream.opened, budget));
+            let due = match (stall, slow) {
+                (Some(a), Some(b)) => a.min(b),
+                (Some(a), None) | (None, Some(a)) => a,
+                (None, None) => continue,
+            };
+            if due <= now {
+                return Err(Stalled);
+            }
+            earliest = Some(earliest.map_or(due, |e| e.min(due)));
+        }
+        Ok(earliest)
+    }
+
+    /// Apply the frames one side of the connection has just carried.
+    fn record(&self, frames: &[FrameHead], outbound: bool) {
+        let Ok(mut open) = self.open.lock() else {
+            return;
+        };
+        let now = tokio::time::Instant::now();
+        for frame in frames {
+            let end_stream = frame.flags & FLAG_END_STREAM != 0;
+            match (frame.kind, outbound) {
+                (FRAME_RST_STREAM, _) => {
+                    open.remove(&frame.stream);
+                }
+                (FRAME_HEADERS, true) if end_stream => {
+                    open.remove(&frame.stream);
+                }
+                (FRAME_HEADERS, true) => {
+                    open.entry(frame.stream).or_insert(WireStream {
+                        opened: now,
+                        progressed: now,
+                        sent: 0,
+                    });
+                }
+                (FRAME_DATA, true) => {
+                    if end_stream {
+                        open.remove(&frame.stream);
+                    } else if let Some(stream) = open.get_mut(&frame.stream)
+                        && frame.len > 0
+                    {
+                        stream.sent = stream.sent.saturating_add(u64::from(frame.len));
+                        stream.progressed = now;
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+}
+
+const FRAME_DATA: u8 = 0x0;
+const FRAME_HEADERS: u8 = 0x1;
+const FRAME_RST_STREAM: u8 = 0x3;
+const FLAG_END_STREAM: u8 = 0x1;
+/// The client connection preface (RFC 9113 §3.4), which precedes the first
+/// frame a client sends.
+const CLIENT_PREFACE_LEN: usize = 24;
+
+/// The fields of an HTTP/2 frame header (RFC 9113 §4.1) [`WireStreams`]
+/// needs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct FrameHead {
+    len: u32,
+    kind: u8,
+    flags: u8,
+    stream: u32,
+}
+
+/// Finds the frame headers in one direction of a connection's byte stream,
+/// fed in whatever pieces the socket moves it in. Only the nine-byte headers
+/// are looked at; payloads are skipped by length.
+struct FrameScanner {
+    /// Bytes to pass over before the next frame header: a payload, or the
+    /// client preface.
+    skip: usize,
+    head: [u8; 9],
+    filled: usize,
+}
+
+impl FrameScanner {
+    fn new(skip: usize) -> Self {
+        Self {
+            skip,
+            head: [0; 9],
+            filled: 0,
+        }
+    }
+
+    /// Scan `bytes`, collecting the headers of the frames that matter to
+    /// [`WireStreams`] into `out`.
+    fn feed(&mut self, mut bytes: &[u8], out: &mut smallvec::SmallVec<[FrameHead; 4]>) {
+        while !bytes.is_empty() {
+            if self.skip > 0 {
+                let n = self.skip.min(bytes.len());
+                self.skip -= n;
+                bytes = &bytes[n..];
+                continue;
+            }
+            let n = (9 - self.filled).min(bytes.len());
+            self.head[self.filled..self.filled + n].copy_from_slice(&bytes[..n]);
+            self.filled += n;
+            bytes = &bytes[n..];
+            if self.filled == 9 {
+                self.filled = 0;
+                let h = &self.head;
+                let frame = FrameHead {
+                    len: u32::from_be_bytes([0, h[0], h[1], h[2]]),
+                    kind: h[3],
+                    flags: h[4],
+                    stream: u32::from_be_bytes([h[5], h[6], h[7], h[8]]) & 0x7fff_ffff,
+                };
+                self.skip = frame.len as usize;
+                if matches!(frame.kind, FRAME_DATA | FRAME_HEADERS | FRAME_RST_STREAM) {
+                    out.push(frame);
+                }
+            }
+        }
+    }
+}
+
+/// The transport an HTTP/2 connection is served over, reporting the frames
+/// it carries to the connection's [`WireStreams`].
+///
+/// Cheap on the hot path: the scan touches nine bytes per frame and skips
+/// payloads by length, and the shared state is locked once per read or write
+/// that carried a frame it cares about, not per byte or per frame.
+pub(crate) struct WireWatch<T> {
+    inner: T,
+    wire: Arc<WireStreams>,
+    outbound: FrameScanner,
+    inbound: FrameScanner,
+}
+
+impl<T> WireWatch<T> {
+    pub(crate) fn new(inner: T, wire: Arc<WireStreams>) -> Self {
+        Self {
+            inner,
+            wire,
+            // The server's first bytes are its SETTINGS frame; the client's
+            // are the connection preface, then frames.
+            outbound: FrameScanner::new(0),
+            inbound: FrameScanner::new(CLIENT_PREFACE_LEN),
+        }
+    }
+
+    fn wrote<'a>(&mut self, written: usize, bufs: impl IntoIterator<Item = &'a [u8]>) {
+        let mut frames = smallvec::SmallVec::new();
+        let mut left = written;
+        for buf in bufs {
+            if left == 0 {
+                break;
+            }
+            let n = left.min(buf.len());
+            self.outbound.feed(&buf[..n], &mut frames);
+            left -= n;
+        }
+        if !frames.is_empty() {
+            self.wire.record(&frames, true);
+        }
+    }
+}
+
+impl<T: tokio::io::AsyncRead + Unpin> tokio::io::AsyncRead for WireWatch<T> {
+    fn poll_read(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &mut tokio::io::ReadBuf<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        let before = buf.filled().len();
+        let polled = std::pin::Pin::new(&mut self.inner).poll_read(cx, buf);
+        if let std::task::Poll::Ready(Ok(())) = polled
+            && buf.filled().len() > before
+        {
+            let mut frames = smallvec::SmallVec::new();
+            self.inbound.feed(&buf.filled()[before..], &mut frames);
+            // Of what the peer sends only a reset ends a response; skipping the
+            // rest keeps request heads and bodies from taking the lock.
+            frames.retain(|f: &mut FrameHead| f.kind == FRAME_RST_STREAM);
+            if !frames.is_empty() {
+                self.wire.record(&frames, false);
+            }
+        }
+        polled
+    }
+}
+
+impl<T: tokio::io::AsyncWrite + Unpin> tokio::io::AsyncWrite for WireWatch<T> {
+    fn poll_write(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &[u8],
+    ) -> std::task::Poll<std::io::Result<usize>> {
+        let polled = std::pin::Pin::new(&mut self.inner).poll_write(cx, buf);
+        if let std::task::Poll::Ready(Ok(n)) = polled {
+            self.wrote(n, [buf]);
+        }
+        polled
+    }
+
+    fn poll_flush(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        std::pin::Pin::new(&mut self.inner).poll_flush(cx)
+    }
+
+    fn poll_shutdown(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        std::pin::Pin::new(&mut self.inner).poll_shutdown(cx)
+    }
+
+    fn is_write_vectored(&self) -> bool {
+        self.inner.is_write_vectored()
+    }
+
+    fn poll_write_vectored(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        bufs: &[std::io::IoSlice<'_>],
+    ) -> std::task::Poll<std::io::Result<usize>> {
+        let polled = std::pin::Pin::new(&mut self.inner).poll_write_vectored(cx, bufs);
+        if let std::task::Poll::Ready(Ok(n)) = polled {
+            self.wrote(n, bufs.iter().map(|b| &**b));
+        }
+        polled
     }
 }
 
@@ -1095,12 +1420,19 @@ mod tests {
         Ok(HttpResponse::new(204))
     }
 
+    /// One response chunk's worth: hyper hands it to `h2` whole, so its tail
+    /// outlives the response body.
+    async fn medium(_req: HttpRequest) -> Result<HttpResponse, Error> {
+        Ok(HttpResponse::ok().with_body(vec![b'x'; 8 * 1024]))
+    }
+
     fn state() -> ServeState {
         let mut router = Router::new();
         router.get("/hello", hello);
         router.get("/slow", slow);
         router.get("/big", big);
         router.get("/empty", empty);
+        router.get("/medium", medium);
         ServeState::for_test(
             Arc::new(OptimizedRouter::from_router(&router)),
             crate::DEFAULT_MAX_BODY_SIZE,
@@ -1315,6 +1647,121 @@ mod tests {
         drop(pinned);
     }
 
+    /// The finding: hyper hands `h2` a whole body chunk as soon as the stream
+    /// has a single byte of window, and on the last chunk drops the body —
+    /// and with it the in-flight count and the progress clock — while `h2`
+    /// still holds the bytes it could not send. A peer advertising a one-byte
+    /// stream window pinned that tail on every stream it opened, for as long
+    /// as a cheap request now and then kept the connection from going idle.
+    /// What the peer has actually been sent is now watched on the wire, so a
+    /// tail it never takes closes the connection like any other stalled
+    /// response.
+    #[tokio::test]
+    async fn a_response_tail_left_in_h2_closes_the_connection() {
+        let limits = H2ConnectionLimits {
+            handshake_timeout: Duration::from_millis(500),
+            idle_timeout: Duration::from_millis(300),
+            shutdown_grace: Duration::from_millis(200),
+            write_timeout: Some(Duration::from_millis(400)),
+            body_budget: 1024,
+        };
+        let server = Http2Builder::new()
+            .connection_server(&crate::pipeline::PipelineConfig::default(), 1024)
+            .with_limits(limits);
+        let (client, done) = serve_one(server).await;
+        let mut builder =
+            hyper::client::conn::http2::Builder::new(hyper_util::rt::TokioExecutor::new());
+        builder.initial_stream_window_size(1).adaptive_window(false);
+        let (mut sender, conn) = builder
+            .handshake::<_, Empty<Bytes>>(hyper_util::rt::TokioIo::new(client))
+            .await
+            .expect("h2 handshake");
+        tokio::spawn(conn);
+
+        // Each response is one chunk: hyper passes it to h2 on the first byte
+        // of window and is done with it. Hold the responses unread, so the
+        // window is never replenished.
+        let mut pinned = Vec::new();
+        for _ in 0..4 {
+            let request = hyper::Request::get("http://localhost/medium")
+                .body(Empty::<Bytes>::new())
+                .unwrap();
+            pinned.push(sender.send_request(request).await.expect("head served"));
+        }
+
+        // Keep the idle clock fresh with requests that need no window.
+        let trickle = tokio::spawn(async move {
+            loop {
+                let request = hyper::Request::get("http://localhost/empty")
+                    .body(Empty::<Bytes>::new())
+                    .unwrap();
+                if sender.send_request(request).await.is_err() {
+                    return;
+                }
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+        });
+
+        tokio::time::timeout(Duration::from_secs(3), done)
+            .await
+            .expect("a response tail the peer never takes must not hold the connection")
+            .unwrap();
+        trickle.abort();
+        drop(pinned);
+    }
+
+    /// A client that cancels a download (`RST_STREAM`) leaves the server
+    /// nothing more to send on that stream: the bytes `h2` was holding for it
+    /// are discarded, not stalled, and the connection goes on serving.
+    #[tokio::test]
+    async fn a_cancelled_response_is_not_mistaken_for_a_stalled_one() {
+        let limits = H2ConnectionLimits {
+            handshake_timeout: Duration::from_millis(500),
+            idle_timeout: Duration::from_secs(5),
+            shutdown_grace: Duration::from_millis(200),
+            write_timeout: Some(Duration::from_millis(300)),
+            body_budget: 1024,
+        };
+        let server = Http2Builder::new()
+            .connection_server(&crate::pipeline::PipelineConfig::default(), 1024)
+            .with_limits(limits);
+        let (client, done) = serve_one(server).await;
+        let mut builder =
+            hyper::client::conn::http2::Builder::new(hyper_util::rt::TokioExecutor::new());
+        builder
+            .initial_stream_window_size(16 * 1024)
+            .adaptive_window(false);
+        let (mut sender, conn) = builder
+            .handshake::<_, Empty<Bytes>>(hyper_util::rt::TokioIo::new(client))
+            .await
+            .expect("h2 handshake");
+        tokio::spawn(conn);
+
+        for target in ["http://localhost/big", "http://localhost/medium"] {
+            let request = hyper::Request::get(target)
+                .body(Empty::<Bytes>::new())
+                .unwrap();
+            let mut body = sender.send_request(request).await.unwrap().into_body();
+            body.frame().await.expect("a first frame").expect("data");
+            // Dropping the body resets the stream.
+            drop(body);
+        }
+
+        let until = Instant::now() + Duration::from_secs(1);
+        while Instant::now() < until {
+            let request = hyper::Request::get("http://localhost/hello")
+                .body(Empty::<Bytes>::new())
+                .unwrap();
+            let response = sender
+                .send_request(request)
+                .await
+                .expect("the connection must survive a cancelled download");
+            assert_eq!(response.status(), 200);
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        assert!(!done.is_finished());
+    }
+
     /// A slow reader that keeps granting window is not mistaken for a stalled
     /// one: progress, not total time, is what the write timeout bounds.
     #[tokio::test]
@@ -1437,6 +1884,87 @@ mod tests {
         assert_eq!(received, 1 << 20);
     }
 
+    /// Frame headers are found however the socket splits the bytes, and
+    /// payloads — which may look like anything — are skipped by length.
+    #[test]
+    fn the_frame_scanner_survives_any_split() {
+        fn frame(kind: u8, flags: u8, stream: u32, payload: &[u8]) -> Vec<u8> {
+            let len = (payload.len() as u32).to_be_bytes();
+            let mut out = vec![len[1], len[2], len[3], kind, flags];
+            out.extend_from_slice(&stream.to_be_bytes());
+            out.extend_from_slice(payload);
+            out
+        }
+        let mut wire = frame(0x4, 0, 0, &[0; 6]); // SETTINGS
+        wire.extend(frame(FRAME_HEADERS, 0x4, 1, &[0x88]));
+        // A payload that happens to look like a frame header.
+        wire.extend(frame(FRAME_DATA, 0, 1, &frame(FRAME_RST_STREAM, 0, 9, &[])));
+        wire.extend(frame(FRAME_DATA, FLAG_END_STREAM, 1, b"tail"));
+        let expected = vec![
+            FrameHead {
+                len: 1,
+                kind: FRAME_HEADERS,
+                flags: 0x4,
+                stream: 1,
+            },
+            FrameHead {
+                len: 9,
+                kind: FRAME_DATA,
+                flags: 0,
+                stream: 1,
+            },
+            FrameHead {
+                len: 4,
+                kind: FRAME_DATA,
+                flags: FLAG_END_STREAM,
+                stream: 1,
+            },
+        ];
+        for piece in [1, 2, 7, 9, 10, wire.len()] {
+            let mut scanner = FrameScanner::new(0);
+            let mut frames = smallvec::SmallVec::new();
+            for chunk in wire.chunks(piece) {
+                scanner.feed(chunk, &mut frames);
+            }
+            assert_eq!(frames.to_vec(), expected, "split into {piece}-byte pieces");
+        }
+    }
+
+    /// A response stream is watched from its headers to its end, and one the
+    /// peer resets is let go rather than counted as stalled.
+    #[tokio::test]
+    async fn wire_streams_follow_a_response_to_its_end() {
+        let wire = WireStreams::default();
+        let timeout = Some(Duration::from_millis(100));
+        let rate = crate::BodyReadPolicy {
+            idle_timeout: Duration::from_secs(60),
+            min_bytes_per_sec: 0,
+        };
+        let head = |kind, flags, stream| FrameHead {
+            len: 4,
+            kind,
+            flags,
+            stream,
+        };
+        let now = tokio::time::Instant::now();
+        wire.record(
+            &[head(FRAME_HEADERS, 0x4, 1), head(FRAME_HEADERS, 0x4, 3)],
+            true,
+        );
+        let due = wire
+            .next_stall_deadline(now, timeout, rate)
+            .unwrap()
+            .expect("two responses open");
+        assert_eq!(
+            wire.next_stall_deadline(due, timeout, rate),
+            Err(Stalled),
+            "no DATA within the write timeout"
+        );
+        wire.record(&[head(FRAME_DATA, FLAG_END_STREAM, 1)], true);
+        wire.record(&[head(FRAME_RST_STREAM, 0, 3)], false);
+        assert_eq!(wire.next_stall_deadline(due, timeout, rate), Ok(None));
+    }
+
     #[tokio::test]
     async fn the_tracker_reports_a_stalled_response() {
         let tracker = Arc::new(StreamTracker::new());
@@ -1451,6 +1979,39 @@ mod tests {
         assert_eq!(tracker.next_stall_deadline(expires), Err(Stalled));
         drop(clock);
         assert_eq!(tracker.next_stall_deadline(expires), Ok(None));
+    }
+
+    /// `Duration::MAX` is how a configuration says "never": every deadline
+    /// derived from one must saturate rather than overflow `Instant + Duration`,
+    /// which panics — and a panic in the HTTP/3 watcher ended it, so the
+    /// connection it guarded was never closed for idleness again.
+    #[tokio::test]
+    async fn deadlines_from_unbounded_durations_do_not_overflow() {
+        let tracker = Arc::new(StreamTracker::new());
+        let now = tokio::time::Instant::now();
+        let active = tracker.begin();
+        let next = tracker
+            .next_deadline(now, Duration::MAX)
+            .expect("in flight");
+        assert!(next > now + Duration::from_secs(365 * 24 * 60 * 60));
+        drop(active);
+        assert!(tracker.next_deadline(now, Duration::MAX).is_some());
+
+        let _clock = tracker.watch_response(deadline_after(now, Duration::MAX));
+        let stall = tracker.next_stall_deadline(now).unwrap().expect("watched");
+        assert!(stall > now);
+
+        let body = TrackedBody::new(
+            http_body_util::Full::new(bytes::Bytes::from_static(b"x")),
+            tracker.begin(),
+            &tracker,
+            Some(Duration::MAX),
+            crate::BodyReadPolicy {
+                idle_timeout: Duration::MAX,
+                min_bytes_per_sec: 1,
+            },
+        );
+        assert!(body.next_deadline(now).is_some_and(|at| at > now));
     }
 
     #[tokio::test]

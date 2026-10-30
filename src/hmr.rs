@@ -549,15 +549,11 @@ impl HmrManager {
 
         let handle = tokio::spawn(async move {
             loop {
-                let (stream, _addr) = match listener.accept().await {
-                    Ok(conn) => conn,
-                    Err(e) => {
-                        if verbose {
-                            eprintln!("❌ HMR WebSocket accept error: {}", e);
-                        }
-                        continue;
-                    }
-                };
+                // The shared accept helper, not a bare `continue` on error: an
+                // `EMFILE` stays pending in the backlog, so retrying at once
+                // spun this task on a core for as long as descriptors ran out.
+                // It backs off on exhaustion and logs at a bounded rate.
+                let (stream, _addr) = crate::application::accept_tcp(&listener).await;
 
                 // Subscribe before the handshake so no event published during
                 // the handshake window is missed.
@@ -590,7 +586,14 @@ impl HmrManager {
                     // client count.
                     let handshake = tokio::time::timeout(
                         Duration::from_secs(10),
-                        tokio_tungstenite::accept_hdr_async(stream, check),
+                        // The server-side message and frame caps, not
+                        // tungstenite's 64 MiB defaults: the browser on the
+                        // other end only ever sends small control messages.
+                        tokio_tungstenite::accept_hdr_async_with_config(
+                            stream,
+                            check,
+                            Some(crate::websocket::recommended_config()),
+                        ),
                     )
                     .await;
 

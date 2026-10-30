@@ -1501,10 +1501,16 @@ impl Application {
                 apply_socket_tuning(stream.as_fd(), tuning, "accepted connection");
             }
 
-            let io = TokioIo::new(crate::pipeline::WriteDeadline::new(
-                stream,
-                pipeline_builder.config().write_timeout,
-            ));
+            let io = TokioIo::new(
+                crate::pipeline::WriteDeadline::new(
+                    stream,
+                    pipeline_builder.config().write_timeout,
+                )
+                // The response is held to the minimum rate request bodies
+                // are: progress alone would let a peer reading a byte per
+                // write timeout hold the connection for hours.
+                .with_min_rate(state.body_read()),
+            );
             let state = state.for_peer(client_addr);
             let http_builder = pipeline_builder.configure_hyper_builder();
             let stats = Arc::clone(&pipeline_stats);
@@ -1693,10 +1699,13 @@ impl Application {
                 match tls_accept(&acceptor, stream).await {
                     Ok(tls_stream) => {
                         debug!(client = %client_addr, "TLS handshake successful");
-                        let io = TokioIo::new(crate::pipeline::WriteDeadline::new(
-                            tls_stream,
-                            write_timeout,
-                        ));
+                        let io = TokioIo::new(
+                            crate::pipeline::WriteDeadline::new(tls_stream, write_timeout)
+                                // The response is held to the minimum rate request bodies
+                                // are: progress alone would let a peer reading a byte per
+                                // write timeout hold the connection for hours.
+                                .with_min_rate(state.body_read()),
+                        );
 
                         let service = service_fn(move |req: Request<IncomingBody>| {
                             let state = state.clone();
@@ -1893,10 +1902,13 @@ impl Application {
                 let _permit = permit;
                 match tls_accept(&acceptor, stream).await {
                     Ok(tls_stream) => {
-                        let io = TokioIo::new(crate::pipeline::WriteDeadline::new(
-                            tls_stream,
-                            write_timeout,
-                        ));
+                        let io = TokioIo::new(
+                            crate::pipeline::WriteDeadline::new(tls_stream, write_timeout)
+                                // The response is held to the minimum rate request bodies
+                                // are: progress alone would let a peer reading a byte per
+                                // write timeout hold the connection for hours.
+                                .with_min_rate(state.body_read()),
+                        );
 
                         let service = service_fn(move |req: Request<IncomingBody>| {
                             let state = state.clone();
@@ -2134,10 +2146,13 @@ impl Application {
                             debug!(client = %client_addr, "Using HTTP/1.1 (ALPN fallback)");
                             h1_stats.connection_opened();
 
-                            let io = TokioIo::new(crate::pipeline::WriteDeadline::new(
-                                tls_stream,
-                                write_timeout,
-                            ));
+                            let io = TokioIo::new(
+                                crate::pipeline::WriteDeadline::new(tls_stream, write_timeout)
+                                    // The response is held to the minimum rate request bodies
+                                    // are: progress alone would let a peer reading a byte per
+                                    // write timeout hold the connection for hours.
+                                    .with_min_rate(state.body_read()),
+                            );
                             let stats = Arc::clone(&h1_stats);
 
                             let service = service_fn(move |req: Request<IncomingBody>| {
@@ -2852,7 +2867,9 @@ pub(crate) async fn handle_request(
     ) {
         Ok(host) => host,
         Err(rejection) => {
-            warn!(method = %method, reason = rejection, "Rejected a request authority");
+            // `debug`, like every rejection a client can cause at will: one
+            // `warn` per malformed request lets any peer flood the log.
+            debug!(method = %method, reason = rejection, "Rejected a request authority");
             return Ok(to_hyper_response(
                 Error::BadRequest(rejection.to_string()).to_client_response(),
                 None,
@@ -2972,9 +2989,11 @@ fn body_read_rejection<E>(
     path: &str,
     state: &ServeState,
 ) -> HttpResponse {
+    // Every arm is the client's doing and repeatable at will, so `debug`: a
+    // `warn` per oversized, slow or broken body is a log flood on demand.
     match err {
         BodyReadError::TooLarge => {
-            warn!(
+            debug!(
                 method = %method,
                 path = %path,
                 limit = state.max_body_size,
@@ -2983,7 +3002,7 @@ fn body_read_rejection<E>(
             payload_too_large_response()
         }
         BodyReadError::TimedOut => {
-            warn!(
+            debug!(
                 method = %method,
                 path = %path,
                 idle_timeout = ?state.body_read.idle_timeout,
@@ -2993,7 +3012,7 @@ fn body_read_rejection<E>(
             body_timeout_response()
         }
         BodyReadError::Overloaded => {
-            warn!(
+            debug!(
                 method = %method,
                 path = %path,
                 "Connection's request-body budget exhausted by concurrent streams"
@@ -3008,7 +3027,7 @@ fn body_read_rejection<E>(
             response
         }
         BodyReadError::Source(_) => {
-            warn!(method = %method, path = %path, "Failed to read request body");
+            debug!(method = %method, path = %path, "Failed to read request body");
             HttpResponse::new(400)
         }
     }
@@ -3070,7 +3089,9 @@ pub(crate) async fn dispatch_via_h1(
         Ok(b) => b,
         Err(BodyReadError::Source(err)) => {
             let status = err.status();
-            warn!(
+            // A peer that overruns the cap or stalls its body: `debug`, as in
+            // `body_read_rejection`.
+            debug!(
                 method = %method,
                 path = armature_req.path_only(),
                 error = %err,
@@ -3153,13 +3174,32 @@ pub(crate) async fn dispatch_via_h3<E: std::fmt::Display>(
     let mut lease = BodyLease::on(state.body_budget.as_ref());
     match read_body_leased(poll_body, state.max_body_size, state.body_read, &mut lease).await {
         Ok(body) => {
+            // RFC 9114 §4.1.2: a `Content-Length` that disagrees with the DATA
+            // received makes the request malformed. `h2` refuses this on
+            // HTTP/2; `h3` does not, so the check is here — a handler or a
+            // proxy re-framing the request must not trust a length the body
+            // does not have. `build_armature_request` already refused a value
+            // that is not one decimal length, so anything unparsable here is
+            // too large to be this body's.
+            if let Some(declared) = armature_req.headers.get("content-length")
+                && declared_content_length(Some(declared)) != Some(body.len())
+            {
+                debug!(method = %method, path = armature_req.path_only(), "HTTP/3 Content-Length disagrees with the body received");
+                return to_hyper_response(
+                    Error::BadRequest("Content-Length does not match the body".to_string())
+                        .to_client_response(),
+                    state.cors.as_deref(),
+                    &method,
+                    armature_req.path_only(),
+                );
+            }
             if !body.is_empty() {
                 armature_req.set_body_bytes(body);
             }
         }
         Err(err) => {
             if let BodyReadError::Source(source) = &err {
-                warn!(method = %method, path = armature_req.path_only(), error = %source, "Failed to read HTTP/3 request body");
+                debug!(method = %method, path = armature_req.path_only(), error = %source, "Failed to read HTTP/3 request body");
             }
             return to_hyper_response(
                 body_read_rejection(&err, &method, armature_req.path_only(), state),
@@ -3224,7 +3264,7 @@ pub(crate) async fn admit(req: &mut HttpRequest, state: &ServeState) -> Admissio
         Ok(std::borrow::Cow::Borrowed(_)) => None,
         Ok(std::borrow::Cow::Owned(path)) => Some(path),
         Err(rejection) => {
-            warn!(method = %req.method, reason = %rejection, "Rejected a non-canonical request path");
+            debug!(method = %req.method, reason = %rejection, "Rejected a non-canonical request path");
             return Admission::Respond(
                 Error::BadRequest(rejection.to_string()).to_client_response(),
                 true,
@@ -3378,7 +3418,7 @@ fn declared_length_rejection(
     if body_within_limit(declared_len, state.max_body_size) {
         return None;
     }
-    warn!(
+    debug!(
         method = %method,
         path = %path,
         limit = state.max_body_size,
@@ -5169,6 +5209,51 @@ mod tests {
         )
         .with_guard_for_test(Arc::new(DenyGuard));
         assert_eq!(h3_dispatch(&state, "/echo", vec![]).await.status(), 403);
+    }
+
+    /// RFC 9114 §4.1.2: a request whose `Content-Length` disagrees with the
+    /// DATA received is malformed. HTTP/2 refuses it in `h2`; over QUIC
+    /// nothing did, so a handler (or a proxy re-framing the request) trusted
+    /// a length the body did not have.
+    #[cfg(feature = "http3")]
+    #[tokio::test]
+    async fn http3_content_length_must_match_the_body() {
+        let mut router = Router::new();
+        router.post("/echo", echo_body_handler);
+        let state = ServeState::for_test(
+            Arc::new(OptimizedRouter::from_router(&router)),
+            DEFAULT_MAX_BODY_SIZE,
+        );
+        let send = |declared: &'static str, chunks: Vec<&'static [u8]>| {
+            let state = state.clone();
+            async move {
+                let mut request = HttpRequest::new("POST", "/echo".to_string());
+                request.headers.insert("content-length", declared);
+                let mut chunks = chunks.into_iter();
+                dispatch_via_h3(
+                    request,
+                    move |_cx| {
+                        Poll::Ready(
+                            chunks
+                                .next()
+                                .map(|c| Ok::<_, std::io::Error>(Bytes::from_static(c))),
+                        )
+                    },
+                    &state,
+                )
+                .await
+                .status()
+            }
+        };
+        assert_eq!(send("5", vec![b"hel", b"lo"]).await, 200);
+        assert_eq!(send("0", vec![]).await, 200);
+        assert_eq!(send("4", vec![b"hello"]).await, 400, "longer than declared");
+        assert_eq!(
+            send("9", vec![b"hello"]).await,
+            400,
+            "shorter than declared"
+        );
+        assert_eq!(send("5", vec![]).await, 400, "no body at all");
     }
 
     #[cfg(feature = "http3")]

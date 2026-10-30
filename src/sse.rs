@@ -6,7 +6,9 @@ use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
 
 /// Server-Sent Event
-#[derive(Debug, Clone)]
+///
+/// `Debug` prints `data`'s length, not its contents.
+#[derive(Clone)]
 pub struct ServerSentEvent {
     /// Event ID (optional)
     pub id: Option<String>,
@@ -16,6 +18,17 @@ pub struct ServerSentEvent {
     pub data: String,
     /// Retry interval in milliseconds (optional)
     pub retry: Option<u64>,
+}
+
+impl std::fmt::Debug for ServerSentEvent {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ServerSentEvent")
+            .field("id", &self.id)
+            .field("event", &self.event)
+            .field("data", &crate::headers::RedactedLen(self.data.len()))
+            .field("retry", &self.retry)
+            .finish()
+    }
 }
 
 impl ServerSentEvent {
@@ -343,6 +356,15 @@ impl Default for SseBroadcaster {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn debug_prints_data_length_only() {
+        let out = format!("{:?}", ServerSentEvent::new("token=s3cret".to_string()));
+        assert!(
+            !out.contains("s3cret") && out.contains("<12 bytes>"),
+            "{out}"
+        );
+    }
 
     #[test]
     fn test_sse_data_bare_cr_does_not_inject_field() {

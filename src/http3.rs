@@ -816,6 +816,15 @@ mod server {
         };
 
         stats.connection_opened();
+        // Closes the books however this function ends — the `?` on the h3
+        // handshake below included, which used to return past the explicit
+        // cleanup and leave the gauge counting a connection that was gone and
+        // its watcher holding a `quinn::Connection` clone, keeping the
+        // connection open until the idle deadline.
+        let mut scope = ConnectionScope {
+            stats: Arc::clone(&stats),
+            watcher: None,
+        };
         let remote_addr = conn.remote_address();
         debug!(client = %remote_addr, "HTTP/3 connection established");
         // The body budget is per connection for the same reason HTTP/2's is:
@@ -829,7 +838,7 @@ mod server {
         // timeout, or none at all within the first-request deadline — from a
         // watcher, so the accept loop below is never cancelled mid-poll.
         let tracker = Arc::new(crate::http2::StreamTracker::new());
-        let watcher = {
+        scope.watcher = Some({
             let tracker = Arc::clone(&tracker);
             let conn = conn.clone();
             tokio::spawn(async move {
@@ -855,7 +864,7 @@ mod server {
                     }
                 }
             })
-        };
+        });
 
         // Create HTTP/3 connection. `h3`'s default field-section limit is
         // unbounded; see `Http3Config::max_field_section_size`.
@@ -926,8 +935,7 @@ mod server {
         requests.abort_all();
         drop(requests);
 
-        watcher.abort();
-        stats.connection_closed();
+        drop(scope);
         debug!(client = %remote_addr, "HTTP/3 connection closed");
 
         Ok(())
@@ -960,6 +968,7 @@ mod server {
                 .iter()
                 .map(|v| v.as_bytes()),
         )?;
+        reject_malformed_fields(request.headers())?;
 
         // `Method::from` matches the token against the well-known set, so the
         // common case is a unit variant rather than a per-request `String`.
@@ -993,6 +1002,53 @@ mod server {
         }
 
         Ok(armature_req)
+    }
+
+    /// The field rules RFC 9114 makes a request malformed for breaking, which
+    /// `h3` leaves to the application (on HTTP/2, `h2` enforces the same set):
+    ///
+    /// * §4.2: no connection-specific field — `Connection`, `Keep-Alive`,
+    ///   `Proxy-Connection`, `Transfer-Encoding`, `Upgrade` — and `TE` only as
+    ///   `trailers`. QUIC frames the body itself, so a `Transfer-Encoding`
+    ///   here could only be meant for whatever reads the request next (a
+    ///   proxy re-encoding it as HTTP/1.1), which is request smuggling.
+    /// * §4.1.2: a `Content-Length` must be one decimal length (repeated
+    ///   copies only if identical), so that the check against the DATA
+    ///   actually received (`dispatch_via_h3`) compares against one number.
+    fn reject_malformed_fields(headers: &http::HeaderMap) -> Result<(), &'static str> {
+        use http::header;
+        for name in [
+            header::CONNECTION,
+            header::TRANSFER_ENCODING,
+            header::UPGRADE,
+            header::HeaderName::from_static("keep-alive"),
+            header::HeaderName::from_static("proxy-connection"),
+        ] {
+            if headers.contains_key(&name) {
+                return Err("connection-specific header field in an HTTP/3 request");
+            }
+        }
+        if headers
+            .get_all(header::TE)
+            .iter()
+            .any(|te| !te.as_bytes().trim_ascii().eq_ignore_ascii_case(b"trailers"))
+        {
+            return Err("TE other than \"trailers\" in an HTTP/3 request");
+        }
+        let mut length: Option<&[u8]> = None;
+        for value in headers.get_all(header::CONTENT_LENGTH) {
+            for element in value.as_bytes().split(|&b| b == b',') {
+                let element = element.trim_ascii();
+                if element.is_empty()
+                    || !element.iter().all(u8::is_ascii_digit)
+                    || length.is_some_and(|seen| seen != element)
+                {
+                    return Err("malformed Content-Length in an HTTP/3 request");
+                }
+                length = Some(element);
+            }
+        }
+        Ok(())
     }
 
     /// Whether a request may be served from early (0-RTT) data: only the
@@ -1035,6 +1091,24 @@ mod server {
     pub(super) fn buf_to_bytes(mut buf: impl Buf) -> Bytes {
         let remaining = buf.remaining();
         buf.copy_to_bytes(remaining)
+    }
+
+    /// One open connection in [`Http3Stats`] and its idle watcher: dropping
+    /// it stops the watcher and counts the connection closed, so every exit
+    /// from `handle_connection` — an error return, or the future being
+    /// dropped — does both.
+    struct ConnectionScope {
+        stats: Arc<Http3Stats>,
+        watcher: Option<tokio::task::JoinHandle<()>>,
+    }
+
+    impl Drop for ConnectionScope {
+        fn drop(&mut self) {
+            if let Some(watcher) = self.watcher.take() {
+                watcher.abort();
+            }
+            self.stats.connection_closed();
+        }
     }
 
     /// One open request stream in [`Http3Stats`], closed when dropped — so the
@@ -1181,8 +1255,13 @@ mod server {
         let started = tokio::time::Instant::now();
         // When the write that brings the total to `sent` bytes must finish.
         let deadline = |sent: usize| {
-            let stall = write_timeout.map(|limit| tokio::time::Instant::now() + limit);
-            let rate = rate.rate_budget(sent).map(|budget| started + budget);
+            // Saturating: `Duration::MAX` means "no deadline", and a plain
+            // `+` would panic the request task on it.
+            let stall = write_timeout
+                .map(|limit| crate::http2::deadline_after(tokio::time::Instant::now(), limit));
+            let rate = rate
+                .rate_budget(sent)
+                .map(|budget| crate::http2::deadline_after(started, budget));
             match (stall, rate) {
                 (Some(a), Some(b)) => Some(a.min(b)),
                 (a, b) => a.or(b),
@@ -1564,6 +1643,42 @@ mod tests {
         assert!(super::server::build_armature_request(&request, None).is_err());
     }
 
+    /// RFC 9114 §4.2: connection-specific fields make a request malformed,
+    /// as they do on HTTP/2 (where `h2` refuses them itself). A server that
+    /// passed them on would let a client smuggle `Transfer-Encoding` or
+    /// `Connection` semantics to whatever reads the request next.
+    #[cfg(feature = "http3")]
+    #[test]
+    fn test_build_armature_request_rejects_connection_specific_fields() {
+        let build = |name: &str, value: &str| {
+            let request = http::Request::builder()
+                .version(http::Version::HTTP_3)
+                .uri("https://tenant.example/")
+                .header(name, value)
+                .body(())
+                .unwrap();
+            super::server::build_armature_request(&request, None)
+        };
+        for (name, value) in [
+            ("transfer-encoding", "chunked"),
+            ("connection", "close"),
+            ("keep-alive", "timeout=5"),
+            ("proxy-connection", "keep-alive"),
+            ("upgrade", "websocket"),
+            ("te", "gzip"),
+            ("te", "trailers, gzip"),
+            ("content-length", "abc"),
+            ("content-length", "5, 6"),
+            ("content-length", "+5"),
+        ] {
+            assert!(build(name, value).is_err(), "{name}: {value}");
+        }
+        assert!(build("te", "trailers").is_ok());
+        assert!(build("te", "Trailers").is_ok());
+        assert!(build("content-length", "5").is_ok());
+        assert!(build("content-length", "5, 5").is_ok());
+    }
+
     /// The QUIC listener negotiates `h3` whatever ALPN list the shared TLS
     /// config carries (it offers `h2`/`http/1.1` for the TCP listeners), and
     /// does so without touching the caller's config.
@@ -1789,6 +1904,36 @@ mod tests {
             matches!(reason, quinn::ConnectionError::ApplicationClosed(_)),
             "{reason:?}"
         );
+    }
+
+    /// A connection whose h3 setup fails is still counted closed: the setup
+    /// error used to return past the cleanup, leaving `active_connections`
+    /// counting it forever. A client that grants no unidirectional streams
+    /// parks the server's h3 setup (it cannot open its control stream) until
+    /// the first-request deadline closes the connection and the setup fails.
+    #[cfg(all(feature = "http3", feature = "self-signed-certs"))]
+    #[tokio::test]
+    async fn test_h3_setup_failure_still_closes_the_books() {
+        let (tls, mut client) = quic_pair();
+        let mut transport = quinn::TransportConfig::default();
+        transport.max_concurrent_uni_streams(0u8.into());
+        client.transport_config(std::sync::Arc::new(transport));
+        let config = Http3Config::builder()
+            .max_idle_timeout(Duration::from_secs(1))
+            .build();
+        let (addr, stats) = spawn_h3_with(config, &tls, 16, None);
+        let conn = connect(&client, addr).await;
+        tokio::time::timeout(Duration::from_secs(5), conn.closed())
+            .await
+            .expect("the server must close a connection it cannot set up");
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        while stats.active_connections() != 0 {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "a connection whose h3 setup failed is still counted open"
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
     }
 
     /// A client whose transport keeps the connection alive with PINGs.

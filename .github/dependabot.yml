@@ -48,6 +48,10 @@ updates:
     schedule:
       interval: "weekly"
       day: "monday"
+    # Same reasoning as for crates: a hijacked action release should be
+    # caught and pulled before a pin moves to it.
+    cooldown:
+      default-days: 7
     commit-message:
       prefix: "deps(actions)"
     labels:

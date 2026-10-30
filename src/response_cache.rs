@@ -429,16 +429,13 @@ pub struct CacheKey {
     pub authority: Option<String>,
     /// Request path
     pub path: crate::ByteStr,
-    /// Canonicalized query string: the decoded pairs sorted by name, each key
-    /// and value length-prefixed as `{len}:{bytes}`.
+    /// Canonicalized query string: the raw (undecoded) `name=value` segments
+    /// sorted by name, each length-prefixed as `{len}:{bytes}`.
     ///
-    /// Not a re-rendered query string — the pairs arrive percent-decoded, so a
-    /// value may itself contain `&` or `=`. Joined naively, `?a=1%26b%3D2` (one
-    /// param whose value is `1&b=2`) and `?a=1&b=2` (two params) both render
-    /// `a=1&b=2` and would share a cache entry, letting one request be served
-    /// the other's body. The length prefix fixes where each field ends
-    /// regardless of the bytes inside it, so distinct pair sets always differ
-    /// here.
+    /// Raw, because decoding is lossy (`%FF` and `%FE` both decode to U+FFFD)
+    /// and a handler reading the raw query would answer two such requests
+    /// differently from one entry. Length-prefixed, so where each segment ends
+    /// never depends on the bytes inside it.
     pub query: String,
     /// Vary header values that affect caching
     pub vary_values: Vec<(String, String)>,
@@ -460,15 +457,12 @@ impl CacheKey {
 
     /// Generate a cache key from a request with Vary headers.
     pub fn from_request_with_vary(request: &HttpRequest, vary_headers: &[&str]) -> Self {
-        // Sort query params for consistent keys, then length-prefix each field
-        // so decoded delimiters can't merge two different pair sets into one
-        // key (see the `query` field docs).
+        // Raw segments in name order, each length-prefixed (see the `query`
+        // field docs).
         use fmt::Write as _;
-        let mut query_params: Vec<_> = request.query().iter().collect();
-        query_params.sort_by(|a, b| a.0.cmp(b.0));
         let mut query = String::new();
-        for (k, v) in &query_params {
-            let _ = write!(query, "{}:{}={}:{}&", k.len(), k, v.len(), v);
+        for segment in crate::query::raw_segments_sorted(request.query_string().unwrap_or("")) {
+            let _ = write!(query, "{}:{}&", segment.len(), segment);
         }
 
         // Collect Vary header values. Every field line counts, not just the
@@ -1675,6 +1669,15 @@ impl HttpResponse {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn test_cache_key_keeps_raw_query_bytes_apart() {
+        let key = |t| CacheKey::from_request(&HttpRequest::new("GET", t)).to_string_key();
+        assert_ne!(key("/s?a=%FF"), key("/s?a=%FE"));
+        assert_ne!(key("/s?a=+"), key("/s?a=%20"));
+        assert_eq!(key("/s?a=1&b=2"), key("/s?b=2&a=1"));
+    }
+
     use super::*;
     use bytes::Bytes;
 
@@ -1789,7 +1792,7 @@ mod tests {
         assert_eq!(key.method, "GET");
         assert_eq!(key.path, "/api/users");
         // Sorted by name, with each field length-prefixed.
-        assert_eq!(key.query, "5:limit=2:10&4:page=1:1&");
+        assert_eq!(key.query, "8:limit=10&6:page=1&");
     }
 
     #[test]

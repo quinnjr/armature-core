@@ -287,7 +287,8 @@ impl OwnedParsedRequest {
     ///
     /// [`Error::BadRequest`](crate::Error::BadRequest) when `Host` and the
     /// request target break the rules every serve path enforces (see
-    /// [`ParsedRequest::to_http_request`]).
+    /// [`ParsedRequest::to_http_request`], which also covers path
+    /// canonicalization and the peer address the caller must set).
     pub fn to_http_request(&self) -> Result<crate::HttpRequest, crate::Error> {
         build_http_request(
             &self.method,
@@ -354,11 +355,21 @@ impl<'a> ParsedRequest<'a> {
     /// `Host` on HTTP/1.1, none that is malformed or repeated, and no
     /// absolute-form target. A request built here would otherwise reach a
     /// virtual-host router or a redirect builder carrying a `Host` that no
-    /// listener would have let through.
+    /// listener would have let through. The path is canonicalized by
+    /// [`canonicalize_path`](crate::routing::canonicalize_path), as every serve
+    /// path does before routing, and every field line is kept byte for byte.
+    ///
+    /// The request carries no peer address: this parser never saw the socket.
+    /// Set it with [`HttpRequest::with_peer`](crate::HttpRequest::with_peer)
+    /// before anything reads [`client_address`](crate::HttpRequest::client_address)
+    /// — without one, a direct-connection policy (`trusted_proxy_depth == 0`)
+    /// names no client, and a proxy-trust one can only fall back to
+    /// `X-Forwarded-For`, which the client writes.
     ///
     /// # Errors
     ///
-    /// [`Error::BadRequest`](crate::Error::BadRequest) naming the rule broken.
+    /// [`Error::BadRequest`](crate::Error::BadRequest) naming the rule broken,
+    /// or the path's [`PathRejection`](crate::routing::PathRejection).
     pub fn to_http_request(&self) -> Result<crate::HttpRequest, crate::Error> {
         build_http_request(
             self.method,
@@ -402,14 +413,35 @@ fn build_http_request<'h>(
     )
     .map_err(|reason| crate::Error::BadRequest(reason.to_string()))?;
 
-    let mut req = crate::HttpRequest::new(method.to_string(), path.to_string());
+    // The one spelling of the path every serve path rewrites the target to
+    // before middleware, guards and routing see it (`admit`), so a request
+    // built here cannot reach them as `//%61dmin` or `/a/../admin`.
+    let (raw_path, query) = match path.split_once('?') {
+        Some((p, q)) => (p, Some(q)),
+        None => (path, None),
+    };
+    let target = match crate::routing::canonicalize_path(raw_path)
+        .map_err(|rejection| crate::Error::BadRequest(rejection.to_string()))?
+    {
+        std::borrow::Cow::Borrowed(_) => path.to_string(),
+        std::borrow::Cow::Owned(mut canonical) => {
+            if let Some(query) = query {
+                canonical.push('?');
+                canonical.push_str(query);
+            }
+            canonical
+        }
+    };
+
+    let mut req = crate::HttpRequest::new(method.to_string(), target);
     // `append`, not `insert`: a repeated field (`X-Forwarded-For`) must keep
     // every occurrence, as it does on the serve paths, or a proxy-trust policy
-    // reads only whichever copy happened to come last.
+    // reads only whichever copy happened to come last. Raw bytes, not only the
+    // lines that are UTF-8: dropping a non-UTF-8 `X-Forwarded-For` line would
+    // let the next one be read as the whole chain, where the serve paths keep
+    // it and `client_address` then names no client at all.
     for (name, value) in headers {
-        if let Ok(v) = std::str::from_utf8(value) {
-            req.headers.append(name, v);
-        }
+        req.headers.append(name, value);
     }
     if let Some(host) = host_from_authority {
         req.headers.append("host", host);
@@ -1168,6 +1200,46 @@ mod tests {
                 String::from_utf8_lossy(bad)
             );
             assert!(owned(&result.requests[0]).to_http_request().is_err());
+        }
+    }
+
+    /// A field line that is not UTF-8 reaches the request as-is, so the
+    /// `X-Forwarded-For` rule that such a chain names no client applies here
+    /// as on the serve paths, instead of the bad line silently vanishing and
+    /// the next one being trusted in its place.
+    #[test]
+    fn to_http_request_keeps_non_utf8_field_lines() {
+        let parser = BatchParser::new(BatchConfig::default());
+        let raw = b"GET / HTTP/1.1\r\nHost: a.example\r\nX-Forwarded-For: 1.1.1.1\r\nX-Forwarded-For: \xff2.2.2.2\r\n\r\n";
+        let result = parser.parse_batch(raw);
+        let peer = "10.0.0.1:443".parse().ok();
+        let req = result.requests[0]
+            .to_http_request()
+            .unwrap()
+            .with_peer(peer);
+        assert_eq!(req.headers.get_all_bytes("x-forwarded-for").len(), 2);
+        assert_eq!(req.client_address(1), None);
+    }
+
+    /// The target is canonicalized by the same rule `admit` applies, so a
+    /// batch-built request cannot carry a spelling no serve path would let
+    /// through.
+    #[test]
+    fn to_http_request_canonicalizes_the_target() {
+        let parser = BatchParser::new(BatchConfig::default());
+        let result = parser.parse_batch(b"GET //%61dmin//x?q=%2F HTTP/1.1\r\nHost: a\r\n\r\n");
+        let req = result.requests[0].to_http_request().unwrap();
+        assert_eq!(req.path, "/admin/x?q=%2F");
+
+        for bad in [
+            &b"GET /a/../admin HTTP/1.1\r\nHost: a\r\n\r\n"[..],
+            b"GET /%2Fadmin HTTP/1.1\r\nHost: a\r\n\r\n",
+        ] {
+            let result = parser.parse_batch(bad);
+            assert!(matches!(
+                result.requests[0].to_http_request(),
+                Err(crate::Error::BadRequest(_))
+            ));
         }
     }
 

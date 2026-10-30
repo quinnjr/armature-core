@@ -1,4 +1,10 @@
-// Interceptors for transforming requests and responses
+//! Interceptors for transforming requests and responses.
+//!
+//! [`CacheInterceptor`] is a shared response cache. It stores a response only
+//! when the handler explicitly marks it shareable (`Cache-Control: public` or
+//! `s-maxage`); anything else passes through uncached. It must sit inside
+//! every guard and authentication layer, since a hit answers the request
+//! without running anything it wraps.
 
 use crate::{Error, HttpRequest, HttpResponse};
 use async_trait::async_trait;
@@ -114,6 +120,13 @@ where
 
 /// Response-cache interceptor.
 ///
+/// **Opt-in per response.** Only a response that carries an explicit
+/// `Cache-Control: public` or `s-maxage` directive is stored; a response
+/// without one passes through uncached. Whether a request is credentialed is
+/// judged from header names (see below), and no name list covers every
+/// gateway's identity header, so absent an explicit statement from the
+/// handler that the body is the same for every caller, it is not shared.
+///
 /// Caches successful **GET/HEAD** responses keyed by
 /// `METHOD:host:path?sorted-query` for `ttl_seconds`. Query parameters are
 /// folded into the key (sorted by name) so that requests differing only in the
@@ -152,6 +165,7 @@ where
 /// [`RequestRoles`](crate::RequestRoles). A request with more than one `Host`
 /// bypasses it too. Otherwise the cache will **not store** a response that:
 ///
+/// - lacks an explicit `Cache-Control: public` or `s-maxage` directive, or
 /// - was produced by a method other than `GET` or `HEAD`, or
 /// - carries a `Set-Cookie` header (session/user state), or
 /// - carries `Cache-Control: private`, `no-store` or `no-cache` (this cache
@@ -177,6 +191,13 @@ where
 /// authenticates from something the header check cannot see (mTLS, or a
 /// gateway header it strips). Register the authentication middleware so it
 /// wraps the handler this interceptor is attached to.
+///
+/// **A hit short-circuits everything inside the cache.** A fresh entry is
+/// returned without running the downstream future, so any guard, interceptor
+/// or middleware wrapped *by* this one never sees the request. Place it
+/// inside every guard and authorization check, never around one; otherwise a
+/// response cached for an admitted caller is served to a caller the guard
+/// would have rejected.
 pub struct CacheInterceptor {
     /// Freshness window, in seconds. A cached entry is served only while its
     /// age is strictly less than this. `0` disables caching (nothing is ever
@@ -351,8 +372,9 @@ fn cache_key(request: &HttpRequest) -> String {
     // Cheap upper-bound capacity pass so the common case (few short params)
     // needs no reallocation while building the key below.
     let mut capacity = method.len() + 1 + 20 + 1 + path.len() + 1;
-    for (k, v) in request.query().iter() {
-        capacity += 20 + 1 + k.len() + 1 + 20 + 1 + v.len() + 1;
+    let segments = crate::query::raw_segments_sorted(request.query_string().unwrap_or(""));
+    for segment in &segments {
+        capacity += 20 + 1 + segment.len() + 1;
     }
     let authority = request
         .headers
@@ -372,20 +394,15 @@ fn cache_key(request: &HttpRequest) -> String {
     key.push(':');
     key.push_str(path);
 
-    if request.query().is_empty() {
+    if segments.is_empty() {
         return key;
     }
-    let mut params: Vec<(&str, &str)> = request.query().iter().collect();
-    params.sort_by(|a, b| a.0.cmp(b.0));
+    // Raw segments, not decoded pairs: see `query::raw_segments_sorted`.
     key.push('?');
-    for (k, v) in params {
-        let _ = write!(key, "{}", k.len());
+    for segment in segments {
+        let _ = write!(key, "{}", segment.len());
         key.push(':');
-        key.push_str(k);
-        key.push('=');
-        let _ = write!(key, "{}", v.len());
-        key.push(':');
-        key.push_str(v);
+        key.push_str(segment);
         key.push('&');
     }
     key
@@ -466,6 +483,23 @@ fn must_not_cache(response: &HttpResponse) -> bool {
     false
 }
 
+/// Whether the handler explicitly declared `response` storable by a shared
+/// cache: some `Cache-Control` line carries `public` or `s-maxage`.
+///
+/// Required for every store, not just a tie-breaker: the credential check
+/// works from header names, and an identity header it doesn't know would
+/// otherwise let a per-caller body into the shared store. Every line is
+/// walked, case-insensitively, for the same reason as in [`must_not_cache`].
+fn is_explicitly_shareable(response: &HttpResponse) -> bool {
+    response.headers.iter().any(|(name, value)| {
+        name.eq_ignore_ascii_case("cache-control")
+            && value.split(',').any(|directive| {
+                let name = directive.split('=').next().unwrap_or("").trim();
+                name.eq_ignore_ascii_case("public") || name.eq_ignore_ascii_case("s-maxage")
+            })
+    })
+}
+
 #[async_trait]
 impl Interceptor for CacheInterceptor {
     async fn intercept(
@@ -512,13 +546,15 @@ impl Interceptor for CacheInterceptor {
         let response = next.await?;
 
         // Store only when: the method is safe, caching is enabled, the response
-        // is a success (2xx), and it is safe to share — i.e. it does not carry a
-        // Set-Cookie, a private/no-store Cache-Control, a Vary header, or a
-        // Content-Encoding header. This keeps per-user bodies, session cookies,
-        // and negotiated/encoded representations from bleeding across callers.
+        // is a success (2xx), the handler marked it `public`/`s-maxage`, and
+        // nothing contradicts that — no Set-Cookie, private/no-store/no-cache
+        // Cache-Control, Vary, or Content-Encoding. This keeps per-user bodies,
+        // session cookies, and negotiated/encoded representations from
+        // bleeding across callers.
         if let Some(key) = cache_key
             && self.ttl_seconds > 0
             && (200..300).contains(&response.status)
+            && is_explicitly_shareable(&response)
             && !must_not_cache(&response)
             && response.body.len() <= self.max_body_bytes
         {
@@ -584,6 +620,15 @@ mod tests {
     }
 
     #[test]
+    fn cache_key_keeps_raw_query_bytes_apart() {
+        // Both decode to U+FFFD / a space; a handler reading the raw query
+        // tells them apart, so the cache must too.
+        let key = |t| cache_key(&crate::HttpRequest::new("GET", t));
+        assert_ne!(key("/s?a=%FF"), key("/s?a=%FE"));
+        assert_ne!(key("/s?a=+"), key("/s?a=%20"));
+    }
+
+    #[test]
     fn cache_key_is_order_insensitive_across_query_orderings() {
         let a = crate::HttpRequest::new("GET", "/search?a=1&b=2");
         let b = crate::HttpRequest::new("GET", "/search?b=2&a=1");
@@ -618,6 +663,8 @@ mod tests {
             calls.fetch_add(1, Ordering::SeqCst);
             let mut resp = HttpResponse::new(status);
             resp.body = Bytes::copy_from_slice(body);
+            resp.headers
+                .insert("Cache-Control".to_string(), "public".to_string());
             Ok(resp)
         })
     }
@@ -748,6 +795,8 @@ mod tests {
             let n = calls.fetch_add(1, Ordering::SeqCst);
             let mut resp = HttpResponse::ok();
             resp.body = Bytes::from(format!("user-{n}").into_bytes());
+            resp.headers
+                .insert("Cache-Control".to_string(), "public".to_string());
             resp.cookies.push(format!("session=secret-{n}; HttpOnly"));
             Ok(resp)
         })
@@ -825,6 +874,10 @@ mod tests {
             let n = calls.fetch_add(1, Ordering::SeqCst);
             let mut resp = HttpResponse::ok();
             resp.body = Bytes::from(format!("body-{n}").into_bytes());
+            // Explicitly shareable, so a refusal is down to the header under
+            // test (which overwrites this line when it is `Cache-Control`).
+            resp.headers
+                .insert("Cache-Control".to_string(), "public".to_string());
             resp.headers
                 .insert(header_name.to_string(), header_value.to_string());
             Ok(resp)
@@ -1336,5 +1389,50 @@ mod tests {
         let key = |p: &str| cache_key(&HttpRequest::new("GET", p.to_string()));
         assert_ne!(key("/s?q=1&=x"), key("/s?q=1"));
         assert_ne!(key("/s?q=%FF"), key("/s?q=%25FF"));
+    }
+
+    /// Only a response the handler explicitly marked `public` / `s-maxage`
+    /// is stored; one without a Cache-Control statement passes through, since
+    /// an identity header the credential check doesn't know would otherwise
+    /// let a per-caller body into the shared store.
+    #[tokio::test]
+    async fn test_cache_interceptor_stores_only_explicitly_public_responses() {
+        fn next_with(
+            calls: Arc<AtomicUsize>,
+            cache_control: Option<&'static str>,
+        ) -> Pin<Box<dyn Future<Output = Result<HttpResponse, Error>> + Send>> {
+            Box::pin(async move {
+                calls.fetch_add(1, Ordering::SeqCst);
+                let mut resp = HttpResponse::ok();
+                resp.body = Bytes::from_static(b"x");
+                if let Some(cc) = cache_control {
+                    resp.headers
+                        .insert("cache-control".to_string(), cc.to_string());
+                }
+                Ok(resp)
+            })
+        }
+        for (cc, stored) in [
+            (None, false),
+            (Some("max-age=60"), false),
+            (Some("public"), true),
+            (Some("Public, max-age=60"), true),
+            (Some("s-maxage=60"), true),
+            (Some("public, private"), false),
+        ] {
+            let interceptor = CacheInterceptor::new(60);
+            let calls = Arc::new(AtomicUsize::new(0));
+            for _ in 0..2 {
+                // An unknown gateway identity header: not caught by name.
+                let mut req = HttpRequest::new("GET", "/me");
+                req.headers.insert("x-acme-gateway-user", "alice");
+                interceptor
+                    .intercept(ExecutionContext::new(req), next_with(calls.clone(), cc))
+                    .await
+                    .unwrap();
+            }
+            assert_eq!(!interceptor.is_empty(), stored, "{cc:?}");
+            assert_eq!(calls.load(Ordering::SeqCst), if stored { 1 } else { 2 });
+        }
     }
 }

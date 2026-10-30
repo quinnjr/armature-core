@@ -68,7 +68,9 @@ use tokio::sync::mpsc;
 // ============================================================================
 
 /// A chunk of streaming data.
-#[derive(Debug, Clone)]
+///
+/// `Debug` prints a `Bytes` chunk's length, not its contents.
+#[derive(Clone)]
 pub enum StreamChunk {
     /// Raw bytes
     Bytes(Bytes),
@@ -76,6 +78,19 @@ pub enum StreamChunk {
     End,
     /// Error occurred
     Error(String),
+}
+
+impl std::fmt::Debug for StreamChunk {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Bytes(b) => f
+                .debug_tuple("Bytes")
+                .field(&crate::headers::RedactedLen(b.len()))
+                .finish(),
+            Self::End => f.write_str("End"),
+            Self::Error(e) => f.debug_tuple("Error").field(e).finish(),
+        }
+    }
 }
 
 impl From<Vec<u8>> for StreamChunk {
@@ -874,6 +889,15 @@ impl StreamingResponse {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn stream_chunk_debug_prints_length_only() {
+        let out = format!(
+            "{:?}",
+            StreamChunk::Bytes(Bytes::from_static(b"token=s3cret"))
+        );
+        assert_eq!(out, "Bytes(<12 bytes>)");
+    }
     use futures_util::StreamExt;
 
     #[test]

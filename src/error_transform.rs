@@ -60,22 +60,33 @@ static SENSITIVE_PATTERNS: LazyLock<Vec<(regex::Regex, &'static str)>> = LazyLoc
     // A bare `code` is the OAuth authorization code in a query/form body; in
     // JSON it is too often an error code, so only qualified `*_code` keys are
     // filtered there.
-    const SUBSTRING_KEYS: &str = "password|passwd|pwd|secret|token|api[_-]?key|apikey|\
-                                  authorization|session|credential|cvv|cvc|private[_-]?key";
-    const DELIMITED_KEYS: &str = "pin|otp|totp|ssn";
+    const SUBSTRING_KEYS: &str = "password|passwd|passphrase|pwd|secret|token|api[_-]?key|apikey|\
+                                  authorization|session|credential|cvv|cvc|private[_-]?key|\
+                                  jwt|signature|cookie";
+    const DELIMITED_KEYS: &str = "pin|otp|totp|ssn|pass|pw|auth";
     const CODE_KEYS: &str = "(?:auth|authorization|oauth|otp|totp|mfa|2fa|sms|verification|\
-                             verify|access|reset|recovery|security|confirmation|one[_-]?time)[_-]?code";
+                             verify|access|reset|recovery|security|confirmation|one[_-]?time|\
+                             pin)[_-]?code";
+    // Between a key and its `=`/`:`: optional whitespace (`password = x`) and
+    // the closing bracket of a Rails/PHP-style key (`user[password]=x`,
+    // `user%5Bpassword%5D=x`).
+    const SEP: &str = r"(?:\]|%5d)?\s*[=:]";
+    // A JSON key may be dotted or bracketed (`"user.password"`).
+    const KEY_CHARS: &str = r"[a-z0-9_.\[\]-]";
     // A JSON value: a string (escapes honoured) or a bare number.
     const JSON_VALUE: &str = r#"(?:"(?:[^"\\]|\\.)*"|-?[0-9][0-9.eE+-]*)"#;
 
     let json_substring =
-        format!(r#""([a-z0-9_-]*(?:{SUBSTRING_KEYS})[a-z0-9_-]*)"\s*:\s*{JSON_VALUE}"#);
-    let json_delimited =
-        format!(r#""((?:[a-z0-9]+[_-])*(?:{DELIMITED_KEYS}|{CODE_KEYS}))"\s*:\s*{JSON_VALUE}"#);
-    let form_substring =
-        String::from(r"\b([a-z0-9_-]*(?:passwd|session|credential|cvv|cvc)[a-z0-9_-]*)[=:]\s*\S+");
-    let form_delimited =
-        format!(r"\b((?:[a-z0-9]+[_-])*(?:{DELIMITED_KEYS}|{CODE_KEYS}|code))[=:]\s*\S+");
+        format!(r#""({KEY_CHARS}*(?:{SUBSTRING_KEYS}){KEY_CHARS}*)"\s*:\s*{JSON_VALUE}"#);
+    let json_delimited = format!(
+        r#""((?:[a-z0-9]+[_.\[\]-]+)*(?:{DELIMITED_KEYS}|{CODE_KEYS})\]?)"\s*:\s*{JSON_VALUE}"#
+    );
+    const FORM_SUBSTRING_KEYS: &str =
+        "passwd|passphrase|session|credential|cvv|cvc|jwt|signature|cookie";
+    let form_substring = format!(r"\b([a-z0-9_-]*(?:{FORM_SUBSTRING_KEYS})[a-z0-9_-]*){SEP}\s*\S+");
+    let form_delimited = format!(
+        r"\b((?:[a-z0-9]+(?:[_-]|\[|%5b))*(?:{DELIMITED_KEYS}|{CODE_KEYS}|code)){SEP}\s*\S+"
+    );
 
     let patterns: Vec<(String, &str)> = vec![
         // JSON members whose key names a credential: `"password": "x"`.
@@ -87,23 +98,23 @@ static SENSITIVE_PATTERNS: LazyLock<Vec<(regex::Regex, &'static str)>> = LazyLoc
         // bare-key patterns: matching only up to the scheme would leave the
         // credential itself behind.
         (
-            r"authorization[=:]\s*(?:(?:bearer|basic|digest|negotiate|token)\s+)?\S+".into(),
+            format!(r"authorization{SEP}\s*(?:(?:bearer|basic|digest|negotiate|token)\s+)?\S+"),
             "authorization=[FILTERED]",
         ),
         // Passwords
-        (r"password[=:]\s*\S+".into(), "password=[FILTERED]"),
-        (r"pwd[=:]\s*\S+".into(), "pwd=[FILTERED]"),
+        (format!(r"password{SEP}\s*\S+"), "password=[FILTERED]"),
+        (format!(r"pwd{SEP}\s*\S+"), "pwd=[FILTERED]"),
         // API keys
-        (r"api[_-]?key[=:]\s*\S+".into(), "api_key=[FILTERED]"),
-        (r"apikey[=:]\s*\S+".into(), "apikey=[FILTERED]"),
+        (format!(r"api[_-]?key{SEP}\s*\S+"), "api_key=[FILTERED]"),
+        (format!(r"apikey{SEP}\s*\S+"), "apikey=[FILTERED]"),
         // Tokens
-        (r"token[=:]\s*\S+".into(), "token=[FILTERED]"),
+        (format!(r"token{SEP}\s*\S+"), "token=[FILTERED]"),
         (r"bearer\s+\S+".into(), "Bearer [FILTERED]"),
         // Basic credentials are base64 `user:pass`; the length floor keeps
         // prose such as "basic auth failed" intact.
         (r"\bbasic\s+[a-z0-9+/]{6,}=*".into(), "Basic [FILTERED]"),
         // Secrets
-        (r"secret[=:]\s*\S+".into(), "secret=[FILTERED]"),
+        (format!(r"secret{SEP}\s*\S+"), "secret=[FILTERED]"),
         // Session ids, passwd, card security codes, PINs, OTPs, SSNs and
         // one-time/authorization codes in `key=value` / `key: value` form.
         (form_substring, "$1=[FILTERED]"),
@@ -128,6 +139,47 @@ static SENSITIVE_PATTERNS: LazyLock<Vec<(regex::Regex, &'static str)>> = LazyLoc
         })
         .collect()
 });
+
+/// Whether a structured field name — a JSON member key or a form field
+/// name — names a credential or PII whose value must not be logged.
+///
+/// The one key test behind structural body redaction (see
+/// `LoggingMiddleware`), so JSON and form bodies agree on what is secret.
+/// The key is lowercased and `.`, `[`, `]`, `-` and spaces become `_`, so
+/// dotted and bracketed paths (`user.password`, `user[password]`) and
+/// camelCase (`authToken`) are tested on every segment. Broad on purpose:
+/// a false positive costs a `[FILTERED]` in a log line, a false negative
+/// leaks a credential.
+///
+/// A bare `code` is *not* matched: in JSON it is usually an error code.
+/// Form callers treat it (the OAuth authorization code) separately.
+pub(crate) fn is_sensitive_key(key: &str) -> bool {
+    static SENSITIVE_KEY: LazyLock<Option<regex::Regex>> = LazyLock::new(|| {
+        // Matched against the normalized key, so `_` is the only separator.
+        let substring = "password|passwd|passphrase|pwd|secret|token|api_?key|authorization|\
+                         session|credential|cvv|cvc|private_?key|jwt|signature|cookie|\
+                         code_?verifier|assertion";
+        let segment = "pass|pw|pin|otp|totp|ssn|auth";
+        let code = "(?:auth|authorization|oauth|otp|totp|mfa|2fa|sms|verification|verify|\
+                    access|reset|recovery|security|confirmation|one_?time|pin)_?code";
+        let pattern = format!("(?:{substring})|(?:^|_)(?:{segment}|{code})(?:_|$)");
+        let re = regex::Regex::new(&pattern);
+        debug_assert!(re.is_ok(), "bad sensitive-key pattern: {re:?}");
+        re.ok()
+    });
+    let normalized: String = key
+        .chars()
+        .map(|c| match c {
+            '.' | '[' | ']' | '-' | ' ' => '_',
+            c => c.to_ascii_lowercase(),
+        })
+        .collect();
+    // A pattern that failed to compile treats every key as sensitive: fail
+    // closed rather than log secrets.
+    SENSITIVE_KEY
+        .as_ref()
+        .is_none_or(|re| re.is_match(&normalized))
+}
 
 /// Replace credentials and common PII in `s` with `[FILTERED]` markers, using
 /// [`SENSITIVE_PATTERNS`].
@@ -1826,6 +1878,81 @@ mod tests {
         let benign =
             r#"shipping=ground spinner=on {"error_code":"E42","mapping":"x"} basic auth failed"#;
         assert_eq!(redact_sensitive(benign), benign);
+    }
+
+    /// Round-4 bypasses of the text path: whitespace before `=`, dotted and
+    /// bracketed keys, and the added key names.
+    #[test]
+    fn test_redact_sensitive_round4_shapes() {
+        for input in [
+            "password = s3cr3tv4l",
+            "token : s3cr3tv4l",
+            "user[password]=s3cr3tv4l",
+            "user%5Bpassword%5D=s3cr3tv4l",
+            "user[pin]=s3cr3tv4l",
+            r#"{"user.password":"s3cr3tv4l"}"#,
+            r#"{"user[pin]":"s3cr3tv4l"}"#,
+            "pass=s3cr3tv4l pw=s3cr3tv4l auth=s3cr3tv4l",
+            "passphrase=s3cr3tv4l jwt=s3cr3tv4l signature=s3cr3tv4l",
+            "cookie=s3cr3tv4l pin_code=s3cr3tv4l",
+            r#"{"pass":"s3cr3tv4l","pw":"s3cr3tv4l","auth":"s3cr3tv4l","pin_code":"s3cr3tv4l"}"#,
+            r#"{"passphrase":"s3cr3tv4l","jwt":"s3cr3tv4l","signature":"s3cr3tv4l"}"#,
+        ] {
+            let out = redact_sensitive(input);
+            assert!(!out.contains("s3cr3tv4l"), "{input} -> {out}");
+        }
+        // `pass` and `pw` are whole-key only.
+        let benign = "bypass=1 compass=n";
+        assert_eq!(redact_sensitive(benign), benign);
+    }
+
+    #[test]
+    fn test_is_sensitive_key() {
+        for key in [
+            "password",
+            "user.password",
+            "user[password]",
+            "user[0][password]",
+            "newPassword",
+            "authToken",
+            "apiKey",
+            "x-api-key",
+            "pass",
+            "user_pass",
+            "passphrase",
+            "pw",
+            "auth",
+            "jwt",
+            "id_token",
+            "signature",
+            "cookie",
+            "pin_code",
+            "pinCode",
+            "otp",
+            "sms-otp",
+            "ssn",
+            "one_time_code",
+            "code_verifier",
+            "client_secret",
+            "session.id",
+        ] {
+            assert!(is_sensitive_key(key), "{key}");
+        }
+        for key in [
+            "user",
+            "name",
+            "email",
+            "code",
+            "error_code",
+            "bypass",
+            "compass",
+            "author",
+            "shipping",
+            "spinner",
+            "mapping",
+        ] {
+            assert!(!is_sensitive_key(key), "{key}");
+        }
     }
 
     #[test]

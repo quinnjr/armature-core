@@ -56,7 +56,7 @@ dependencies = [
 
 [[package]]
 name = "armature-core"
-version = "0.12.0"
+version = "0.13.0"
 dependencies = [
  "armature-h1",
  "async-trait",

@@ -10,6 +10,8 @@ Changes at or before `0.6.0` are recorded in the workspace
 
 ## [Unreleased]
 
+## [0.13.0] - 2026-10-31
+
 ### Security
 
 - **`ModuleRegistry` binds module guards to the module's routes.** `ModuleRegistry::register_module` registered controller routes with no guards attached and only logged a guard factory failure; it now layers each module's guards onto that module's routes exactly as `Application::register_module` does, and a guard that cannot be built aborts registration. `ModuleRegistry::guards()` is deprecated.

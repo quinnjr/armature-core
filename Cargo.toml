@@ -71,7 +71,7 @@ regex = "1.13"
 parking_lot = "0.12"
 
 # Bounded caches
-lru = "0.18"
+lru = "0.19"
 
 # Hot Module Reload (HMR)
 notify = "8.2"

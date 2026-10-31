@@ -220,6 +220,18 @@ impl HealthResponse {
         self
     }
 
+    /// Strip component details and application info, keeping only the
+    /// overall status and timestamp.
+    ///
+    /// For probes reachable without authentication: component details name
+    /// internal dependencies, versions, paths and error text that help an
+    /// attacker map the deployment.
+    pub fn summary_only(mut self) -> Self {
+        self.components.clear();
+        self.info = None;
+        self
+    }
+
     /// Calculates the overall status from component statuses
     pub fn calculate_status(&mut self) {
         if self.components.is_empty() {
@@ -451,6 +463,10 @@ impl HealthIndicator for MemoryHealthIndicator {
 }
 
 /// Disk health indicator that checks available disk space.
+///
+/// At most one disk probe runs at a time per indicator: checks that arrive
+/// while one is in flight wait for that probe's result rather than starting
+/// another, so a hung filesystem cannot pile up stuck blocking threads.
 pub struct DiskHealthIndicator {
     /// Path to check disk space for
     pub path: String,
@@ -458,6 +474,7 @@ pub struct DiskHealthIndicator {
     pub degraded_threshold: f64,
     /// Threshold percentage of used space above which status becomes DOWN
     pub critical_threshold: f64,
+    probe: DiskProbe,
 }
 
 impl Default for DiskHealthIndicator {
@@ -466,7 +483,77 @@ impl Default for DiskHealthIndicator {
             path: "/".to_string(),
             degraded_threshold: 80.0,
             critical_threshold: 95.0,
+            probe: DiskProbe::new(read_disk_info),
         }
+    }
+}
+
+/// `(total, available)` bytes for a path, or `None` if unreadable.
+type DiskInfo = Option<(u64, u64)>;
+
+/// A probe running on the blocking pool, shareable between the checks
+/// waiting on it.
+type SharedProbe = futures_util::future::Shared<futures_util::future::BoxFuture<'static, DiskInfo>>;
+
+/// Single-flight runner for the blocking disk probe.
+///
+/// `statvfs` on a hung filesystem (a stale NFS mount) blocks its thread until
+/// the filesystem answers, and neither the health service's timeout nor
+/// dropping the future can cancel a `spawn_blocking` task. Spawning one per
+/// check would let a public health endpoint pile up stuck threads until the
+/// blocking pool is exhausted. Instead the in-flight probe is shared: checks
+/// that arrive while it runs await the same result (each still bounded by its
+/// own timeout, so a hung filesystem reads as DOWN), and a new probe starts
+/// only once the previous one has returned.
+struct DiskProbe {
+    read: Arc<dyn Fn(&str) -> DiskInfo + Send + Sync>,
+    in_flight: std::sync::Mutex<Option<SharedProbe>>,
+}
+
+impl DiskProbe {
+    fn new(read: impl Fn(&str) -> DiskInfo + Send + Sync + 'static) -> Self {
+        Self {
+            read: Arc::new(read),
+            in_flight: std::sync::Mutex::new(None),
+        }
+    }
+
+    /// The running probe's result, starting a probe if none is running.
+    fn sample(&self, path: &str) -> SharedProbe {
+        use futures_util::FutureExt;
+
+        // A poisoned lock only means a panic elsewhere mid-update; the slot
+        // is still a valid `Option`.
+        let mut slot = self
+            .in_flight
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(probe) = slot.as_ref()
+            && probe.peek().is_none()
+        {
+            return probe.clone();
+        }
+        let read = Arc::clone(&self.read);
+        let path = path.to_owned();
+        let probe = tokio::task::spawn_blocking(move || read(&path))
+            .map(|joined| joined.ok().flatten())
+            .boxed()
+            .shared();
+        *slot = Some(probe.clone());
+        probe
+    }
+}
+
+/// Disk totals for `path` (blocking).
+fn read_disk_info(path: &str) -> DiskInfo {
+    #[cfg(unix)]
+    {
+        get_unix_disk_info(path)
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = path;
+        None
     }
 }
 
@@ -496,12 +583,13 @@ impl HealthIndicator for DiskHealthIndicator {
     async fn check(&self) -> HealthCheckResult {
         let start = Instant::now();
 
-        // Get disk info (platform-specific implementation)
-        #[cfg(unix)]
-        let disk_info = get_unix_disk_info(&self.path);
-
-        #[cfg(not(unix))]
-        let disk_info: Option<(u64, u64)> = None;
+        // `statvfs` is a blocking syscall that can hang for as long as the
+        // filesystem does (a stale NFS mount), so it runs on the blocking pool
+        // rather than stalling an executor thread — and every request queued
+        // behind it — for the duration, and only one at a time (see
+        // `DiskProbe`). The indicator's timeout still bounds how long the
+        // check itself waits.
+        let disk_info = self.probe.sample(&self.path).await;
 
         let duration = start.elapsed();
 
@@ -606,11 +694,15 @@ impl HealthIndicator for UptimeHealthIndicator {
     }
 }
 
+/// Default per-indicator time limit; see [`HealthService::with_indicator_timeout`].
+pub const DEFAULT_INDICATOR_TIMEOUT: Duration = Duration::from_secs(5);
+
 /// Service for managing and executing health checks.
 pub struct HealthService {
     indicators: RwLock<Vec<Arc<dyn HealthIndicator>>>,
     info: RwLock<Option<HealthInfo>>,
     start_time: Instant,
+    indicator_timeout: Duration,
 }
 
 impl Default for HealthService {
@@ -626,7 +718,52 @@ impl HealthService {
             indicators: RwLock::new(Vec::new()),
             info: RwLock::new(None),
             start_time: Instant::now(),
+            indicator_timeout: DEFAULT_INDICATOR_TIMEOUT,
         }
+    }
+
+    /// Bound each indicator's `check()` to `timeout` (default
+    /// [`DEFAULT_INDICATOR_TIMEOUT`]). An indicator that does not answer in
+    /// time is reported `Down`. Without a bound, one hung dependency stalls
+    /// every probe request, and probes piling up on it exhaust the server.
+    pub fn with_indicator_timeout(mut self, timeout: Duration) -> Self {
+        self.indicator_timeout = timeout;
+        self
+    }
+
+    /// Run `indicators` concurrently, each under the configured timeout.
+    async fn run_indicators(
+        &self,
+        indicators: Vec<Arc<dyn HealthIndicator>>,
+    ) -> Vec<HealthCheckResult> {
+        let limit = self.indicator_timeout;
+        let futures: Vec<_> = indicators
+            .into_iter()
+            .map(|indicator| async move {
+                let start = Instant::now();
+                match tokio::time::timeout(limit, indicator.check()).await {
+                    Ok(mut result) => {
+                        if result.duration_ms.is_none() {
+                            result.duration_ms = Some(start.elapsed().as_millis() as u64);
+                        }
+                        result
+                    }
+                    Err(_) => {
+                        let mut result = HealthCheckResult::down(indicator.name())
+                            .with_error(format!("timed out after {} ms", limit.as_millis()));
+                        result.duration_ms = Some(start.elapsed().as_millis() as u64);
+                        result
+                    }
+                }
+            })
+            .collect();
+        join_all(futures).await
+    }
+
+    /// [`check`](Self::check) reduced to the overall status, for endpoints
+    /// served without authentication. See [`HealthResponse::summary_only`].
+    pub async fn check_summary(&self) -> HealthResponse {
+        self.check().await.summary_only()
     }
 
     /// Creates a health service with default indicators (memory, disk, uptime)
@@ -658,23 +795,10 @@ impl HealthService {
             response.info = Some(info);
         }
 
-        // Run all health checks concurrently
-        let futures: Vec<_> = indicators
-            .iter()
-            .map(|indicator| {
-                let indicator = Arc::clone(indicator);
-                async move {
-                    let start = Instant::now();
-                    let mut result = indicator.check().await;
-                    if result.duration_ms.is_none() {
-                        result.duration_ms = Some(start.elapsed().as_millis() as u64);
-                    }
-                    result
-                }
-            })
-            .collect();
-
-        let results = join_all(futures).await;
+        // Run all health checks concurrently, each under the timeout.
+        let all: Vec<_> = indicators.iter().cloned().collect();
+        drop(indicators);
+        let results = self.run_indicators(all).await;
 
         for result in results {
             response.components.insert(result.name.clone(), result);
@@ -696,22 +820,8 @@ impl HealthService {
             .cloned()
             .collect();
 
-        let futures: Vec<_> = liveness_indicators
-            .iter()
-            .map(|indicator| {
-                let indicator = Arc::clone(indicator);
-                async move {
-                    let start = Instant::now();
-                    let mut result = indicator.check().await;
-                    if result.duration_ms.is_none() {
-                        result.duration_ms = Some(start.elapsed().as_millis() as u64);
-                    }
-                    result
-                }
-            })
-            .collect();
-
-        let results = join_all(futures).await;
+        drop(indicators);
+        let results = self.run_indicators(liveness_indicators).await;
 
         for result in results {
             response.components.insert(result.name.clone(), result);
@@ -734,22 +844,8 @@ impl HealthService {
             .cloned()
             .collect();
 
-        let futures: Vec<_> = readiness_indicators
-            .iter()
-            .map(|indicator| {
-                let indicator = Arc::clone(indicator);
-                async move {
-                    let start = Instant::now();
-                    let mut result = indicator.check().await;
-                    if result.duration_ms.is_none() {
-                        result.duration_ms = Some(start.elapsed().as_millis() as u64);
-                    }
-                    result
-                }
-            })
-            .collect();
-
-        let results = join_all(futures).await;
+        drop(indicators);
+        let results = self.run_indicators(readiness_indicators).await;
 
         for result in results {
             response.components.insert(result.name.clone(), result);
@@ -757,6 +853,20 @@ impl HealthService {
 
         response.calculate_status();
         response
+    }
+
+    /// [`check_liveness`](Self::check_liveness) reduced to its overall status,
+    /// for a probe endpoint served without authentication. See
+    /// [`HealthResponse::summary_only`].
+    pub async fn check_liveness_summary(&self) -> HealthResponse {
+        self.check_liveness().await.summary_only()
+    }
+
+    /// [`check_readiness`](Self::check_readiness) reduced to its overall
+    /// status, for a probe endpoint served without authentication. See
+    /// [`HealthResponse::summary_only`].
+    pub async fn check_readiness_summary(&self) -> HealthResponse {
+        self.check_readiness().await.summary_only()
     }
 
     /// Returns the number of registered indicators
@@ -835,6 +945,7 @@ fn current_timestamp() -> u64 {
 pub struct HealthServiceBuilder {
     indicators: Vec<Arc<dyn HealthIndicator>>,
     info: Option<HealthInfo>,
+    indicator_timeout: Duration,
 }
 
 impl Default for HealthServiceBuilder {
@@ -849,7 +960,14 @@ impl HealthServiceBuilder {
         Self {
             indicators: Vec::new(),
             info: None,
+            indicator_timeout: DEFAULT_INDICATOR_TIMEOUT,
         }
+    }
+
+    /// Per-indicator time limit; see [`HealthService::with_indicator_timeout`].
+    pub fn with_indicator_timeout(mut self, timeout: Duration) -> Self {
+        self.indicator_timeout = timeout;
+        self
     }
 
     /// Adds a health indicator
@@ -877,6 +995,7 @@ impl HealthServiceBuilder {
             indicators: RwLock::new(self.indicators),
             info: RwLock::new(self.info),
             start_time: Instant::now(),
+            indicator_timeout: self.indicator_timeout,
         }
     }
 }
@@ -884,6 +1003,67 @@ impl HealthServiceBuilder {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    struct HangingIndicator;
+
+    #[async_trait]
+    impl HealthIndicator for HangingIndicator {
+        fn name(&self) -> &str {
+            "hangs"
+        }
+        async fn check(&self) -> HealthCheckResult {
+            std::future::pending().await
+        }
+        fn include_in_liveness(&self) -> bool {
+            true
+        }
+    }
+
+    #[tokio::test]
+    async fn test_hung_indicator_times_out_as_down() {
+        let service = HealthService::new().with_indicator_timeout(Duration::from_millis(20));
+        service.register(HangingIndicator).await;
+        service.register(UptimeHealthIndicator::new()).await;
+
+        let response = tokio::time::timeout(Duration::from_secs(5), service.check())
+            .await
+            .expect("a hung indicator must not stall the health check");
+        assert_eq!(response.components["hangs"].status, HealthStatus::Down);
+        assert_eq!(response.status, HealthStatus::Down);
+
+        let live = tokio::time::timeout(Duration::from_secs(5), service.check_liveness())
+            .await
+            .unwrap();
+        assert_eq!(live.components["hangs"].status, HealthStatus::Down);
+    }
+
+    #[tokio::test]
+    async fn test_probe_summaries_hide_details() {
+        let service = HealthService::new();
+        service.register(UptimeHealthIndicator::new()).await;
+        for summary in [
+            service.check_liveness_summary().await,
+            service.check_readiness_summary().await,
+        ] {
+            assert!(summary.components.is_empty());
+            assert!(summary.info.is_none());
+            assert_eq!(summary.status, HealthStatus::Up);
+        }
+    }
+
+    #[tokio::test]
+    async fn test_summary_only_hides_details() {
+        let service = HealthService::new();
+        service.register(UptimeHealthIndicator::new()).await;
+        service
+            .set_info(HealthInfo::new("svc").with_version("1.2.3"))
+            .await;
+        let summary = service.check_summary().await;
+        assert!(summary.components.is_empty());
+        assert!(summary.info.is_none());
+        let json = serde_json::to_string(&summary).unwrap();
+        assert!(!json.contains("1.2.3"));
+    }
 
     #[test]
     fn test_health_status_is_healthy() {
@@ -1038,6 +1218,48 @@ mod tests {
         assert!(get_unix_disk_info("--version").is_none());
         assert!(get_unix_disk_info("/\0").is_none());
         assert!(get_unix_disk_info("/nonexistent/armature/path").is_none());
+    }
+
+    /// A hung filesystem must not cost one stuck blocking thread per health
+    /// request: checks that arrive while a probe is stuck share it, and a new
+    /// probe starts only after it returns.
+    #[tokio::test]
+    async fn test_disk_probe_is_single_flight() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let calls = Arc::new(AtomicUsize::new(0));
+        let (release, gate) = std::sync::mpsc::channel::<()>();
+        let gate = std::sync::Mutex::new(gate);
+        let indicator = DiskHealthIndicator {
+            probe: DiskProbe::new({
+                let calls = Arc::clone(&calls);
+                move |_path: &str| {
+                    calls.fetch_add(1, Ordering::SeqCst);
+                    // Hang like a stale mount until released.
+                    let _ = gate.lock().unwrap().recv();
+                    Some((100, 90))
+                }
+            }),
+            ..DiskHealthIndicator::new("/")
+        };
+
+        for _ in 0..5 {
+            let timed_out =
+                tokio::time::timeout(Duration::from_millis(20), indicator.check()).await;
+            assert!(timed_out.is_err(), "the probe is hung");
+        }
+        assert_eq!(calls.load(Ordering::SeqCst), 1, "one probe, not five");
+
+        // The filesystem answers: the stuck probe's result is used, then the
+        // next check starts a fresh probe.
+        release.send(()).unwrap();
+        let result = indicator.check().await;
+        assert_eq!(result.status, HealthStatus::Up);
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        release.send(()).unwrap();
+        let result = indicator.check().await;
+        assert_eq!(result.status, HealthStatus::Up);
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
     }
 
     #[tokio::test]

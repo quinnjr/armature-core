@@ -40,7 +40,7 @@ pub trait Handler: Clone + Send + Sync + 'static {
     /// Handle an HTTP request.
     ///
     /// This method should be inlined by the compiler due to monomorphization.
-    /// Note: #[inline] hints are applied in implementations, not trait definitions.
+    /// Note: `#[inline]` hints are applied in implementations, not trait definitions.
     fn call(&self, req: HttpRequest) -> Self::Future;
 }
 
@@ -135,7 +135,8 @@ impl BoxedHandler {
         &self,
         req: HttpRequest,
     ) -> Pin<Box<dyn Future<Output = Result<HttpResponse, Error>> + Send>> {
-        trace!(path = %req.path, method = %req.method, "Handler dispatch");
+        // Path only: the query string may carry secrets.
+        trace!(path = %req.path_only(), method = %req.method, "Handler dispatch");
         self.inner.call(req)
     }
 }
@@ -170,9 +171,10 @@ struct HandlerWrapper<H: Handler> {
     _marker: PhantomData<fn() -> H::Future>,
 }
 
-// Safety: HandlerWrapper is Send + Sync if H is Send + Sync
-unsafe impl<H: Handler> Send for HandlerWrapper<H> {}
-unsafe impl<H: Handler> Sync for HandlerWrapper<H> {}
+// No `unsafe impl Send/Sync`: `Handler` already requires `Send + Sync`, and
+// `PhantomData<fn() -> _>` is both whatever the future is, so the auto traits
+// hold on their own — an unconditional unsafe impl could only ever hide a
+// future bound being loosened.
 
 impl<H: Handler> ErasedHandler for HandlerWrapper<H> {
     #[inline(always)]
@@ -215,7 +217,7 @@ where
 
 /// Legacy handler function type alias.
 ///
-/// This type uses double dynamic dispatch (dyn Fn + Box<dyn Future>) which
+/// This type uses double dynamic dispatch (`dyn Fn` + `Box<dyn Future>`) which
 /// prevents inlining. Prefer using the optimized handler system.
 #[allow(clippy::type_complexity)]
 pub type LegacyHandlerFn = Arc<

@@ -1,0 +1,40 @@
+name: Audit
+
+# Advisories are published independently of this repository's activity, so the
+# check runs on a schedule as well as on every change: a dependency can become
+# vulnerable while nothing here moves.
+on:
+  push:
+    branches: [main, develop]
+  pull_request:
+  schedule:
+    - cron: "0 6 * * 1"
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  deny:
+    name: cargo deny
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
+        with:
+          toolchain: 1.99.0 # pinned stable; bump deliberately
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          # A cached binary would satisfy `cargo install` without rebuilding
+          # the pinned version below.
+          cache-bin: false
+      - run: cargo install cargo-deny --locked --version 0.20.2
+      - run: cargo deny --locked --all-features check advisories bans licenses sources
+      # `fuzz/` is its own workspace with its own lockfile: a graph the step
+      # above never sees, although it builds on every pull request.
+      - run: cargo deny --manifest-path fuzz/Cargo.toml --locked check advisories bans sources

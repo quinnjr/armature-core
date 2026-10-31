@@ -32,6 +32,12 @@ use crate::{Error, Guard, GuardContext, HttpMethod, Middleware, Route, Router};
 use std::sync::Arc;
 
 /// A guard that checks all guards in a list
+///
+/// Fails closed: a `MultiGuard` with **no** guards rejects every request with
+/// `403 Forbidden`. "All of nothing" is vacuously true, but a guard built
+/// from a list that came out empty (a misread config, a filtered-out entry)
+/// is far more likely a mistake than a deliberate "admit everyone"; a route
+/// that needs no guard should simply not have one.
 pub struct MultiGuard {
     guards: Vec<Box<dyn Guard>>,
 }
@@ -45,6 +51,9 @@ impl MultiGuard {
 #[async_trait::async_trait]
 impl Guard for MultiGuard {
     async fn can_activate(&self, context: &GuardContext) -> Result<bool, Error> {
+        if self.guards.is_empty() {
+            return Err(Error::Forbidden("No guards configured".to_string()));
+        }
         for guard in &self.guards {
             if !guard.can_activate(context).await? {
                 return Ok(false);
@@ -426,6 +435,14 @@ mod tests {
             .unwrap();
         assert_eq!(response.status, 200);
         assert_eq!(*log.lock().unwrap(), vec!["middleware", "guard"]);
+    }
+
+    /// An empty `MultiGuard` used to admit everyone (`all` over nothing).
+    #[tokio::test]
+    async fn an_empty_multi_guard_fails_closed() {
+        let guard = MultiGuard::new(vec![]);
+        let context = GuardContext::new(crate::HttpRequest::new("GET", "/x"));
+        assert!(!matches!(guard.can_activate(&context).await, Ok(true)));
     }
 
     #[test]

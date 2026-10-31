@@ -125,6 +125,18 @@ impl ETag {
     /// assert!(weak.weak);
     /// assert_eq!(weak.value, "abc123");
     /// ```
+    ///
+    /// Follows RFC 9110 section 8.8.3: the value between the quotes must be
+    /// `etagc` (`%x21 / %x23-7E / obs-text`), so a DQUOTE, space or control
+    /// character inside it makes the whole value invalid (`None`) rather than
+    /// part of the tag. (`w/` is accepted alongside `W/` for lenience; it can't
+    /// be confused with anything else.)
+    ///
+    /// ```
+    /// use armature_core::conditional::ETag;
+    ///
+    /// assert!(ETag::parse("\"a\"b\"").is_none());
+    /// ```
     pub fn parse(s: &str) -> Option<Self> {
         let s = s.trim();
 
@@ -135,9 +147,15 @@ impl ETag {
         };
 
         // Extract value from quotes
-        let value = value_part.strip_prefix('"')?.strip_suffix('"')?.to_string();
+        let value = value_part.strip_prefix('"')?.strip_suffix('"')?;
+        if !value.bytes().all(is_etagc) {
+            return None;
+        }
 
-        Some(Self { value, weak })
+        Some(Self {
+            value: value.to_string(),
+            weak,
+        })
     }
 
     /// Generate an ETag from bytes using a hash.
@@ -221,6 +239,71 @@ impl ETag {
     }
 }
 
+/// RFC 9110 `etagc = %x21 / %x23-7E / obs-text`: visible ASCII except DQUOTE,
+/// plus any non-ASCII byte. Notably *not* space, DQUOTE or a control byte.
+fn is_etagc(b: u8) -> bool {
+    b == 0x21 || (0x23..=0x7E).contains(&b) || b >= 0x80
+}
+
+/// Split an entity-tag list into its members.
+///
+/// A comma is a legal `etagc`, so a plain `split(',')` cuts `"a,b"` into the
+/// two non-tags `"a` and `b"`. Each member is instead scanned to its closing
+/// quote, so commas inside the tag stay in it. A member with anything but
+/// whitespace between its closing quote and the next comma (`"x"y"`) is
+/// yielded as written — [`ETag::parse`] then rejects it — and scanning
+/// resumes at that next comma, so a malformed member can't swallow the
+/// well-formed ones after it (as quote-parity toggling would).
+fn split_etag_list(header: &str) -> Vec<&str> {
+    let bytes = header.as_bytes();
+    let mut members = Vec::new();
+    let mut i = 0;
+    while i < bytes.len() {
+        // Skip separators and OWS before a member.
+        if matches!(bytes[i], b',' | b' ' | b'\t') {
+            i += 1;
+            continue;
+        }
+        let start = i;
+        // An optional weak prefix, then the opening quote.
+        if bytes[i..].starts_with(b"W/") || bytes[i..].starts_with(b"w/") {
+            i += 2;
+        }
+        let mut well_formed = false;
+        if bytes.get(i) == Some(&b'"') {
+            // Find the closing quote; DQUOTE is not an `etagc`, so the first
+            // one ends the tag.
+            if let Some(len) = bytes[i + 1..].iter().position(|&b| b == b'"') {
+                i += 1 + len + 1;
+                let rest = &bytes[i..];
+                let ows = rest
+                    .iter()
+                    .position(|&b| b != b' ' && b != b'\t')
+                    .unwrap_or(rest.len());
+                well_formed = rest.get(ows).is_none_or(|&b| b == b',');
+            }
+        }
+        if !well_formed {
+            // Malformed: take everything up to the next comma as one bad
+            // member and resynchronize there.
+            i = bytes[start..]
+                .iter()
+                .position(|&b| b == b',')
+                .map_or(bytes.len(), |p| start + p);
+        }
+        // Boundaries are ASCII bytes, so these are char boundaries.
+        members.push(header[start..i].trim());
+    }
+    members
+}
+
+/// All field lines of a list-valued header joined into one list, as
+/// RFC 9110 section 5.3 says a recipient may. `None` when absent.
+fn list_header(request: &HttpRequest, name: &str) -> Option<String> {
+    let lines = request.headers.get_all(name);
+    (!lines.is_empty()).then(|| lines.join(", "))
+}
+
 impl fmt::Display for ETag {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "{}", self.to_header_value())
@@ -275,9 +358,9 @@ impl ETagList {
             return Self::any();
         }
 
-        let etags: Vec<ETag> = header
-            .split(',')
-            .filter_map(|s| ETag::parse(s.trim()))
+        let etags: Vec<ETag> = split_etag_list(header)
+            .into_iter()
+            .filter_map(ETag::parse)
             .collect();
 
         Self { etags, any: false }
@@ -333,9 +416,12 @@ impl ConditionalHeaders {
     pub fn from_request(request: &HttpRequest) -> Self {
         // One lookup each: header names intern case-insensitively, so the
         // lowercased retry was always redundant.
-        let if_none_match = request.headers.get("If-None-Match").map(ETagList::parse);
+        //
+        // The two ETag lists are list fields: every field line is read, so a
+        // second `If-Match` line is part of the condition, not ignored.
+        let if_none_match = list_header(request, "If-None-Match").map(|h| ETagList::parse(&h));
 
-        let if_match = request.headers.get("If-Match").map(ETagList::parse);
+        let if_match = list_header(request, "If-Match").map(|h| ETagList::parse(&h));
 
         let if_modified_since = request
             .headers
@@ -467,11 +553,11 @@ impl ConditionalRequest for HttpRequest {
     // One lookup per accessor: header names intern case-insensitively, so the
     // lowercased retry was always redundant.
     fn if_none_match(&self) -> Option<ETagList> {
-        self.headers.get("If-None-Match").map(ETagList::parse)
+        list_header(self, "If-None-Match").map(|h| ETagList::parse(&h))
     }
 
     fn if_match(&self) -> Option<ETagList> {
-        self.headers.get("If-Match").map(ETagList::parse)
+        list_header(self, "If-Match").map(|h| ETagList::parse(&h))
     }
 
     fn if_modified_since(&self) -> Option<SystemTime> {
@@ -1067,5 +1153,50 @@ mod tests {
 
         let response = check_conditionals(&request, Some(&etag), None);
         assert!(response.is_none());
+    }
+
+    // ---- RFC 9110 entity-tag grammar ----------------------------------------
+
+    /// `etagc` excludes DQUOTE, so `"a"b"` is not an entity-tag; nor is a
+    /// value with whitespace or control characters inside the quotes.
+    #[test]
+    fn test_etag_parse_rejects_non_etagc() {
+        for bad in [
+            "\"a\"b\"",
+            "\"a b\"",
+            "\"a\tb\"",
+            "\"a\u{7f}\"",
+            "\"",
+            "abc",
+            "W/abc",
+        ] {
+            assert!(ETag::parse(bad).is_none(), "{bad:?} must not parse");
+        }
+        // obs-text (non-ASCII) is allowed by the grammar.
+        assert_eq!(ETag::parse("\"caf\u{e9}\"").unwrap().value, "caf\u{e9}");
+    }
+
+    /// A comma is a legal `etagc`, so the list must be split outside quotes:
+    /// `"a,b"` is one tag, not the fragments `"a` and `b"`.
+    #[test]
+    fn test_etag_list_split_respects_quotes() {
+        let list = ETagList::parse("\"a,b\", W/\"c\"");
+        assert_eq!(list.etags, vec![ETag::strong("a,b"), ETag::weak("c")]);
+
+        // A malformed member is dropped without swallowing its neighbours.
+        let list = ETagList::parse("\"x\"y\", \"ok\"");
+        assert_eq!(list.etags, vec![ETag::strong("ok")]);
+    }
+
+    /// If-None-Match / If-Match are list fields: two field lines are one
+    /// list (RFC 9110 section 5.3), not "the first line wins".
+    #[test]
+    fn test_conditional_headers_combine_field_lines() {
+        let mut request = HttpRequest::new("GET", "/r");
+        request.headers.append("If-None-Match", "\"one\"");
+        request.headers.append("If-None-Match", "\"two\"");
+        let headers = ConditionalHeaders::from_request(&request);
+        assert!(headers.is_not_modified(Some(&ETag::strong("two")), None));
+        assert!(request.if_none_match_matches(&ETag::strong("two")));
     }
 }

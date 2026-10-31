@@ -46,6 +46,18 @@ Benchmarked against other Rust frameworks:
 | JSON RPS | 305k | 310k | 340k |
 | Latency P50 | 0.11ms | 0.10ms | 0.09ms |
 
+## Contributing
+
+The git hooks in `.cargo-husky/hooks` (commit-message format, pre-commit
+fmt/clippy, pre-push tests) are opt-in. Enable them once per clone:
+
+```bash
+git config core.hooksPath .cargo-husky/hooks
+```
+
+They run from the checked-out tree, so they stay current with the branch
+instead of being copied into `.git` once and never updated.
+
 ## License
 
 MIT OR Apache-2.0

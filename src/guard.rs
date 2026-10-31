@@ -15,8 +15,40 @@ impl GuardContext {
         Self { request }
     }
 
+    /// The **first** value of header `name`, case-insensitively.
+    ///
+    /// First-wins on a repeated header: with two `X-Tenant` fields (one from
+    /// the client, one appended by a proxy) which one a guard sees depends on
+    /// their order. For a header a guard trusts as a credential or an
+    /// authorization input, use [`get_unique_header`](Self::get_unique_header).
     pub fn get_header(&self, name: &str) -> Option<&str> {
         self.request.headers.get(name)
+    }
+
+    /// The value of header `name`, refusing a repeated one.
+    ///
+    /// `Ok(None)` when the header is absent (or not UTF-8, as with
+    /// [`get_header`](Self::get_header)); `Err(Forbidden)` when it appears
+    /// more than once, since a guard cannot know which copy the client sent
+    /// and which an intermediary added. Prefer this over `get_header` for
+    /// credential and authorization headers.
+    ///
+    /// ```
+    /// use armature_core::{GuardContext, HttpRequest};
+    ///
+    /// let mut request = HttpRequest::new("GET", "/");
+    /// request.headers.append("x-tenant", "a");
+    /// request.headers.append("x-tenant", "b");
+    /// let context = GuardContext::new(request);
+    /// assert!(context.get_unique_header("x-tenant").is_err());
+    /// ```
+    pub fn get_unique_header(&self, name: &str) -> Result<Option<&str>, Error> {
+        let value = self
+            .request
+            .headers
+            .get_unique(name)
+            .map_err(|_| Error::Forbidden(format!("More than one {name} header")))?;
+        Ok(value.and_then(|v| std::str::from_utf8(v).ok()))
     }
 
     pub fn get_param(&self, name: &str) -> Option<&str> {
@@ -63,18 +95,62 @@ impl VerifiedIdentity {
 }
 
 /// Whether an authentication layer has attached verified credentials to this
-/// request: a [`VerifiedIdentity`] or a [`RequestRoles`].
+/// request: a [`VerifiedIdentity`] with a non-blank subject, or a non-empty
+/// [`RequestRoles`].
+///
+/// A blank subject is refused for the same reason blank roles are: a layer
+/// that maps a missing `sub` claim to `""` has identified nobody.
+///
+/// An empty `RequestRoles` (`RequestRoles::default()`, or only blank role
+/// names, as a layer that maps a missing claim to `[""]` produces) is not
+/// evidence of anything: a layer that attaches roles to every request, with none for an
+/// anonymous caller, would otherwise make every anonymous request look
+/// authenticated. `armature-auth`'s `JwtAuthMiddleware` attaches a
+/// `VerifiedIdentity` alongside the roles, so a verified caller with no
+/// roles still passes.
 fn is_verified(request: &HttpRequest) -> bool {
+    request
+        .extensions
+        .get::<VerifiedIdentity>()
+        .is_some_and(|identity| !identity.subject.trim().is_empty())
+        || request
+            .extensions
+            .get::<RequestRoles>()
+            .is_some_and(|roles| roles.0.iter().any(|role| !role.trim().is_empty()))
+}
+
+/// Whether the response to `request` may be specific to the caller, so a
+/// shared cache keyed only on the request line must not serve or store it
+/// freely.
+///
+/// True when the request carries any credential header
+/// ([`is_credential_header`](crate::headers::is_credential_header):
+/// `Authorization`, `Cookie`, `X-Api-Key`, `X-Auth-Token`, ...) **or** an
+/// authentication layer has already attached a verified identity. The latter
+/// matters because middleware may authenticate from something the header
+/// check can't see (mTLS, a header it then strips), and once it has, the
+/// handler answers *this* caller.
+///
+/// Deliberately looser than [`is_verified`]: *any* `RequestRoles` or
+/// `VerifiedIdentity`, blank or not, marks the request as per-user here. An empty one is not enough to
+/// authenticate (that check fails closed by refusing it), but a layer that
+/// attached it has still identified *this* caller, and a cache that ignored
+/// it would fail open by sharing that caller's response.
+pub(crate) fn is_credentialed_request(request: &HttpRequest) -> bool {
     request.extensions.get::<VerifiedIdentity>().is_some()
         || request.extensions.get::<RequestRoles>().is_some()
+        || request
+            .headers
+            .names()
+            .any(crate::headers::is_credential_header)
 }
 
 /// Authentication guard: admits only requests carrying a **verified**
 /// identity.
 ///
 /// Fails closed. The request must carry a [`VerifiedIdentity`] (or a
-/// [`RequestRoles`]) extension, which only an authentication layer that has
-/// actually validated a credential inserts. The presence or shape of an
+/// non-empty [`RequestRoles`]) extension, which only an authentication layer
+/// that has actually validated a credential inserts. The presence or shape of an
 /// `Authorization` header proves nothing — `Bearer x` is as easy to send as
 /// any other string — and is not consulted.
 ///
@@ -136,20 +212,36 @@ impl RequestRoles {
 /// roles. Fails closed: requests without verified roles are rejected.
 ///
 /// An **empty** role list means "any authenticated caller": the request must
-/// still carry a [`VerifiedIdentity`] or [`RequestRoles`] extension. It never
+/// still carry a [`VerifiedIdentity`] or a non-empty [`RequestRoles`]
+/// extension. It never
 /// means "allow everyone".
+///
+/// Blank role names (empty or whitespace, as an unset config entry reads)
+/// are ignored on both sides: a blank required role is dropped, and a blank
+/// granted role matches nothing. A list of *only* blank names denies every
+/// request rather than collapsing into the empty list's "any authenticated
+/// caller" — the configuration asked for a role, just not a usable one.
 pub struct RolesGuard {
     /// Built once at construction so authorizing a request is a hash probe per
     /// granted role rather than a scan of required roles against a scan of
     /// granted ones. `CompactString` keeps the common short names ("admin",
     /// "user") inline, so the set costs no heap allocation per entry.
     required_roles: HashSet<CompactString>,
+    /// Roles were configured but all were blank: nothing can satisfy them.
+    deny_all: bool,
 }
 
 impl RolesGuard {
     pub fn new(roles: Vec<String>) -> Self {
+        let configured = !roles.is_empty();
+        let required_roles: HashSet<CompactString> = roles
+            .into_iter()
+            .filter(|role| !role.trim().is_empty())
+            .map(CompactString::from)
+            .collect();
         Self {
-            required_roles: roles.into_iter().map(CompactString::from).collect(),
+            deny_all: configured && required_roles.is_empty(),
+            required_roles,
         }
     }
 }
@@ -157,6 +249,9 @@ impl RolesGuard {
 #[async_trait]
 impl Guard for RolesGuard {
     async fn can_activate(&self, context: &GuardContext) -> Result<bool, Error> {
+        if self.deny_all {
+            return Err(Error::Forbidden("Insufficient role".to_string()));
+        }
         if self.required_roles.is_empty() {
             // "Authenticated, any role" — never "anyone".
             return if is_verified(&context.request) {
@@ -179,10 +274,14 @@ impl Guard for RolesGuard {
             })?;
 
         // Probe the required set with each granted role: a request carries a
-        // handful of roles, and membership is O(1) per probe.
+        // handful of roles, and membership is O(1) per probe. The required
+        // set holds no blank names, so a blank granted role (an anonymous
+        // caller's `[""]`) cannot match; the explicit skip keeps that true
+        // independent of how the set was built.
         if roles
             .0
             .iter()
+            .filter(|role| !role.trim().is_empty())
             .any(|role| self.required_roles.contains(role.as_str()))
         {
             Ok(true)
@@ -220,27 +319,56 @@ where
 }
 
 /// API key guard
+///
+/// Configured keys are held only as SHA-256 digests. Comparing fixed-length
+/// digests keeps the check constant-time with respect to the submitted key's
+/// *length* as well as its content, so a probe cannot learn how long any
+/// configured key is from an early length-mismatch return.
 pub struct ApiKeyGuard {
-    valid_keys: Vec<String>,
+    valid_key_digests: Vec<[u8; 32]>,
 }
 
 impl ApiKeyGuard {
+    /// Build a guard accepting any of `keys`.
+    ///
+    /// Empty strings are dropped: an empty configured key would otherwise
+    /// match an empty `X-API-Key` header and admit anyone. A guard left with
+    /// no keys rejects every request (fail closed).
     pub fn new(keys: Vec<String>) -> Self {
-        Self { valid_keys: keys }
+        let valid_key_digests = keys
+            .iter()
+            .filter(|k| !k.is_empty())
+            .map(|k| Self::digest(k.as_bytes()))
+            .collect();
+        Self { valid_key_digests }
+    }
+
+    fn digest(bytes: &[u8]) -> [u8; 32] {
+        use sha2::{Digest, Sha256};
+        Sha256::digest(bytes).into()
     }
 }
 
 #[async_trait]
 impl Guard for ApiKeyGuard {
     async fn can_activate(&self, context: &GuardContext) -> Result<bool, Error> {
+        // Exactly one key: with two, a proxy that appended its own key would
+        // have the client's checked instead, depending on which one `get`
+        // happened to return.
         let api_key = context
-            .get_header("x-api-key")
+            .request
+            .headers
+            .get_unique("x-api-key")
+            .map_err(|_| Error::Forbidden("More than one API key".to_string()))?
+            .and_then(|k| std::str::from_utf8(k).ok())
+            .filter(|k| !k.is_empty())
             .ok_or_else(|| Error::Forbidden("Missing API key".to_string()))?;
 
+        let presented = Self::digest(api_key.as_bytes());
         // Constant-time per key, and every key is compared: an early exit
-        // would leak which configured key shares a prefix with the guess.
-        let matched = self.valid_keys.iter().fold(false, |found, k| {
-            crate::crypto::constant_time_eq(k.as_bytes(), api_key.as_bytes()) | found
+        // would leak which configured key matched.
+        let matched = self.valid_key_digests.iter().fold(false, |found, k| {
+            crate::crypto::constant_time_eq(k, &presented) | found
         });
         if matched {
             Ok(true)
@@ -255,6 +383,50 @@ mod tests {
     use super::*;
     use bytes::Bytes;
     use std::collections::HashMap;
+
+    #[tokio::test]
+    async fn api_key_guard_refuses_repeated_keys() {
+        let guard = ApiKeyGuard::new(vec!["good".to_string()]);
+        let mut request = HttpRequest::new("GET", "/test".to_string());
+        request.headers.append("x-api-key", "good");
+        request.headers.append("x-api-key", "other");
+        assert!(
+            guard
+                .can_activate(&GuardContext::new(request))
+                .await
+                .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn blank_role_names_are_not_authentication() {
+        let mut request = HttpRequest::new("GET", "/test".to_string());
+        request.extensions.insert(RequestRoles::new([""]));
+        let context = GuardContext::new(request);
+        assert!(!matches!(
+            AuthenticationGuard.can_activate(&context).await,
+            Ok(true)
+        ));
+    }
+
+    #[tokio::test]
+    async fn empty_request_roles_are_not_authentication() {
+        let mut anonymous = HttpRequest::new("GET", "/test".to_string());
+        anonymous.extensions.insert(RequestRoles::default());
+        let context = GuardContext::new(anonymous);
+        assert!(!matches!(
+            AuthenticationGuard.can_activate(&context).await,
+            Ok(true)
+        ));
+
+        let mut with_roles = HttpRequest::new("GET", "/test".to_string());
+        with_roles.extensions.insert(RequestRoles::new(["user"]));
+        let context = GuardContext::new(with_roles);
+        assert!(matches!(
+            AuthenticationGuard.can_activate(&context).await,
+            Ok(true)
+        ));
+    }
 
     #[tokio::test]
     async fn test_authentication_guard() {
@@ -507,7 +679,58 @@ mod tests {
     fn test_api_key_guard_creation() {
         let keys = vec!["key1".to_string(), "key2".to_string()];
         let guard = ApiKeyGuard::new(keys.clone());
-        assert_eq!(guard.valid_keys, keys);
+        assert_eq!(guard.valid_key_digests.len(), keys.len());
+    }
+
+    fn api_key_context(key: Option<&str>) -> GuardContext {
+        let mut headers = HashMap::new();
+        if let Some(key) = key {
+            headers.insert("x-api-key".to_string(), key.to_string());
+        }
+        GuardContext::new(HttpRequest::from_parts(
+            "GET",
+            "/test".to_string(),
+            headers,
+            vec![],
+            HashMap::new(),
+            HashMap::new(),
+        ))
+    }
+
+    #[tokio::test]
+    async fn test_api_key_guard_empty_configured_key_never_matches() {
+        let guard = ApiKeyGuard::new(vec![String::new(), "real".to_string()]);
+        assert_eq!(guard.valid_key_digests.len(), 1);
+        assert!(
+            guard
+                .can_activate(&api_key_context(Some("")))
+                .await
+                .is_err()
+        );
+        assert!(guard.can_activate(&api_key_context(None)).await.is_err());
+        assert!(
+            guard
+                .can_activate(&api_key_context(Some("real")))
+                .await
+                .is_ok()
+        );
+    }
+
+    #[tokio::test]
+    async fn test_api_key_guard_with_only_empty_keys_fails_closed() {
+        let guard = ApiKeyGuard::new(vec![String::new()]);
+        assert!(
+            guard
+                .can_activate(&api_key_context(Some("")))
+                .await
+                .is_err()
+        );
+        assert!(
+            guard
+                .can_activate(&api_key_context(Some("x")))
+                .await
+                .is_err()
+        );
     }
 
     #[test]
@@ -522,6 +745,97 @@ mod tests {
         for role in &roles {
             assert!(guard.required_roles.contains(role.as_str()));
         }
+    }
+
+    fn roles_context(granted: &[&str]) -> GuardContext {
+        let mut request = HttpRequest::new("GET", "/test".to_string());
+        request
+            .extensions
+            .insert(RequestRoles::new(granted.iter().copied()));
+        GuardContext::new(request)
+    }
+
+    /// A blank required role (e.g. an unset config entry read as `""`) used
+    /// to match the blank role a layer attaches to an anonymous caller.
+    #[tokio::test]
+    async fn roles_guard_blank_required_role_never_matches_a_blank_granted_role() {
+        let guard = RolesGuard::new(vec![String::new()]);
+        assert!(guard.can_activate(&roles_context(&[""])).await.is_err());
+        assert!(guard.can_activate(&roles_context(&["  "])).await.is_err());
+    }
+
+    /// Only-blank configuration denies everyone; it must not collapse into
+    /// the empty list's "any authenticated caller".
+    #[tokio::test]
+    async fn roles_guard_with_only_blank_roles_denies_all() {
+        let guard = RolesGuard::new(vec![String::new(), " ".to_string()]);
+        assert!(
+            guard
+                .can_activate(&roles_context(&["admin"]))
+                .await
+                .is_err()
+        );
+        let mut verified = HttpRequest::new("GET", "/test".to_string());
+        verified.extensions.insert(VerifiedIdentity::new("user-1"));
+        assert!(
+            guard
+                .can_activate(&GuardContext::new(verified))
+                .await
+                .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn roles_guard_blank_entries_are_dropped_beside_real_ones() {
+        let guard = RolesGuard::new(vec![String::new(), "admin".to_string()]);
+        assert!(
+            guard
+                .can_activate(&roles_context(&["admin"]))
+                .await
+                .unwrap()
+        );
+        assert!(
+            guard
+                .can_activate(&roles_context(&["", "user"]))
+                .await
+                .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn a_verified_identity_with_a_blank_subject_is_not_authentication() {
+        for subject in ["", "   "] {
+            let mut request = HttpRequest::new("GET", "/me".to_string());
+            request.extensions.insert(VerifiedIdentity::new(subject));
+            let context = GuardContext::new(request);
+            assert!(AuthenticationGuard.can_activate(&context).await.is_err());
+            assert!(
+                RolesGuard::new(vec![])
+                    .can_activate(&context)
+                    .await
+                    .is_err()
+            );
+            // Still per-user for caching: a layer attached it to this caller.
+            assert!(is_credentialed_request(&context.request));
+        }
+    }
+
+    #[test]
+    fn get_unique_header_refuses_a_repeated_header() {
+        let mut request = HttpRequest::new("GET", "/test".to_string());
+        request.headers.append("x-tenant", "a");
+        request.headers.append("x-tenant", "b");
+        request.headers.insert("x-single", "one");
+        let context = GuardContext::new(request);
+
+        assert!(matches!(
+            context.get_unique_header("x-tenant"),
+            Err(Error::Forbidden(_))
+        ));
+        assert_eq!(context.get_unique_header("x-single").unwrap(), Some("one"));
+        assert_eq!(context.get_unique_header("x-missing").unwrap(), None);
+        // The first-wins accessor is unchanged.
+        assert_eq!(context.get_header("x-tenant"), Some("a"));
     }
 
     #[tokio::test]

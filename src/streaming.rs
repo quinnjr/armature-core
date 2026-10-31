@@ -68,7 +68,9 @@ use tokio::sync::mpsc;
 // ============================================================================
 
 /// A chunk of streaming data.
-#[derive(Debug, Clone)]
+///
+/// `Debug` prints a `Bytes` chunk's length, not its contents.
+#[derive(Clone)]
 pub enum StreamChunk {
     /// Raw bytes
     Bytes(Bytes),
@@ -76,6 +78,19 @@ pub enum StreamChunk {
     End,
     /// Error occurred
     Error(String),
+}
+
+impl std::fmt::Debug for StreamChunk {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Bytes(b) => f
+                .debug_tuple("Bytes")
+                .field(&crate::headers::RedactedLen(b.len()))
+                .finish(),
+            Self::End => f.write_str("End"),
+            Self::Error(e) => f.debug_tuple("Error").field(e).finish(),
+        }
+    }
 }
 
 impl From<Vec<u8>> for StreamChunk {
@@ -141,8 +156,11 @@ impl ByteStream {
     }
 
     /// Create a new byte stream with custom buffer size.
+    ///
+    /// A size of `0` is treated as `1`: `mpsc::channel(0)` panics, and a
+    /// caller-supplied size should not be able to take the task down.
     pub fn with_buffer_size(size: usize) -> (Self, ByteStreamSender) {
-        let (sender, receiver) = mpsc::channel(size);
+        let (sender, receiver) = mpsc::channel(size.max(1));
         let bytes_sent = Arc::new(AtomicU64::new(0));
         (Self { receiver }, ByteStreamSender { sender, bytes_sent })
     }
@@ -302,18 +320,71 @@ impl Stream for JsonStream {
     }
 }
 
+/// `json` with U+2028, U+2029 and U+0085 written as `\uXXXX` escapes.
+///
+/// `serde_json` emits them raw, but JavaScript line splitters and
+/// Unicode-aware readers treat them as line breaks, which would cut an NDJSON
+/// record in two. Only called on valid JSON, where they can appear only inside
+/// strings and the escape denotes the same character.
+fn escape_unicode_line_breaks(json: &str) -> std::borrow::Cow<'_, str> {
+    const BREAKS: [char; 3] = ['\u{2028}', '\u{2029}', '\u{0085}'];
+    if !json.contains(BREAKS) {
+        return std::borrow::Cow::Borrowed(json);
+    }
+    let mut out = String::with_capacity(json.len() + 8);
+    for c in json.chars() {
+        match c {
+            '\u{2028}' => out.push_str("\\u2028"),
+            '\u{2029}' => out.push_str("\\u2029"),
+            '\u{0085}' => out.push_str("\\u0085"),
+            c => out.push(c),
+        }
+    }
+    std::borrow::Cow::Owned(out)
+}
+
 impl JsonStreamSender {
     /// Send a JSON-serializable value.
+    ///
+    /// U+2028, U+2029 and U+0085 in strings are escaped, since some NDJSON
+    /// readers split lines on them.
     pub async fn send_json<T: Serialize>(&self, value: &T) -> Result<(), Error> {
         let json = serde_json::to_string(value).map_err(|e| Error::Serialization(e.to_string()))?;
-        self.inner.send(format!("{}\n", json)).await?;
+        self.inner
+            .send(format!("{}\n", escape_unicode_line_breaks(&json)))
+            .await?;
         self.items_sent.fetch_add(1, Ordering::Relaxed);
         Ok(())
     }
 
     /// Send a raw JSON string (must be valid JSON).
+    ///
+    /// The string must be a single NDJSON record: an interior `\n` or `\r`
+    /// would end the record early and let the remainder be read as a second,
+    /// attacker-shaped record, so such input is rejected rather than sent.
+    /// It must also be exactly one JSON value: `{..} {..}` on one line, or a
+    /// value followed by trailing data, is read by lenient consumers as a
+    /// different record (or records) than the caller intended. Leading and
+    /// trailing whitespace (including a trailing newline) is trimmed first.
+    /// U+2028, U+2029 and U+0085 inside strings are escaped, as in
+    /// [`send_json`](Self::send_json).
     pub async fn send_raw(&self, json: &str) -> Result<(), Error> {
-        self.inner.send(format!("{}\n", json.trim())).await?;
+        let json = json.trim();
+        if json.contains(['\n', '\r']) {
+            return Err(Error::Serialization(
+                "raw NDJSON record must not contain a line break".to_string(),
+            ));
+        }
+        // `from_str` rejects trailing non-whitespace, so this accepts exactly
+        // one value; `IgnoredAny` validates it without building it.
+        serde_json::from_str::<serde::de::IgnoredAny>(json).map_err(|_| {
+            Error::Serialization("raw NDJSON record must be exactly one JSON value".to_string())
+        })?;
+        // Valid JSON allows these characters only inside strings, where the
+        // `\uXXXX` escape is the same value, so a plain replace is safe here.
+        self.inner
+            .send(format!("{}\n", escape_unicode_line_breaks(json)))
+            .await?;
         self.items_sent.fetch_add(1, Ordering::Relaxed);
         Ok(())
     }
@@ -401,7 +472,16 @@ impl Stream for TextStream {
 
 impl TextStreamSender {
     /// Send a line of text (newline is added automatically).
+    ///
+    /// An interior `\n` or `\r` would split the line and let the remainder
+    /// be read as a separate, caller-unintended line, so such input is
+    /// rejected rather than sent.
     pub async fn send_line(&self, line: &str) -> Result<(), Error> {
+        if line.contains(['\n', '\r']) {
+            return Err(Error::Serialization(
+                "text line must not contain a line break".to_string(),
+            ));
+        }
         self.inner.send(format!("{}\n", line)).await?;
         self.lines_sent.fetch_add(1, Ordering::Relaxed);
         Ok(())
@@ -809,6 +889,15 @@ impl StreamingResponse {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn stream_chunk_debug_prints_length_only() {
+        let out = format!(
+            "{:?}",
+            StreamChunk::Bytes(Bytes::from_static(b"token=s3cret"))
+        );
+        assert_eq!(out, "Bytes(<12 bytes>)");
+    }
     use futures_util::StreamExt;
 
     #[test]
@@ -863,6 +952,100 @@ mod tests {
             .expect("wait_if_paused should resume after ack")
             .unwrap();
         assert!(!controller.is_paused());
+    }
+
+    #[tokio::test]
+    async fn zero_buffer_size_is_clamped_not_a_panic() {
+        let (mut stream, sender) = ByteStream::with_buffer_size(0);
+        let (_json, _json_sender) = JsonStream::with_buffer_size(0);
+        let (_text, _text_sender) = TextStream::with_buffer_size(0);
+        tokio::spawn(async move {
+            sender.send(b"x".to_vec()).await.unwrap();
+            sender.close().await;
+        });
+        assert_eq!(&stream.next().await.unwrap().unwrap()[..], b"x");
+    }
+
+    #[tokio::test]
+    async fn send_raw_rejects_interior_line_breaks() {
+        let (mut stream, sender) = JsonStream::new();
+        assert!(
+            sender
+                .send_raw("{\"a\":1}\n{\"admin\":true}")
+                .await
+                .is_err()
+        );
+        assert!(sender.send_raw("{\"a\":\r1}").await.is_err());
+        // A trailing newline is just whitespace and still accepted.
+        sender.send_raw("{\"a\":1}\n").await.unwrap();
+        sender.close().await;
+        assert_eq!(&stream.next().await.unwrap().unwrap()[..], b"{\"a\":1}\n");
+        assert!(stream.next().await.is_none());
+        assert_eq!(sender.items_sent(), 1);
+    }
+
+    /// A raw record must be exactly one JSON value: two values on one line
+    /// (`{..} {..}`), trailing garbage, or non-JSON would be read by a
+    /// consumer as something other than the one record the caller meant.
+    #[tokio::test]
+    async fn send_raw_rejects_anything_but_one_json_value() {
+        let (mut stream, sender) = JsonStream::new();
+        for bad in [
+            "{\"a\":1} {\"admin\":true}",
+            "{\"a\":1}garbage",
+            "not json",
+            "{\"a\":",
+            "",
+        ] {
+            assert!(sender.send_raw(bad).await.is_err(), "{bad:?}");
+        }
+        sender.send_raw(" [1, \"two\"] ").await.unwrap();
+        sender.close().await;
+        assert_eq!(
+            &stream.next().await.unwrap().unwrap()[..],
+            b"[1, \"two\"]\n"
+        );
+        assert!(stream.next().await.is_none());
+        assert_eq!(sender.items_sent(), 1);
+    }
+
+    #[tokio::test]
+    async fn send_line_rejects_interior_line_breaks() {
+        let (mut stream, sender) = TextStream::new();
+        assert!(sender.send_line("ok\nINJECTED").await.is_err());
+        assert!(sender.send_line("ok\rINJECTED").await.is_err());
+        sender.send_line("fine").await.unwrap();
+        sender.close().await;
+        assert_eq!(&stream.next().await.unwrap().unwrap()[..], b"fine\n");
+        assert!(stream.next().await.is_none());
+        assert_eq!(sender.lines_sent(), 1);
+    }
+
+    /// U+2028/U+2029/U+0085 are line breaks to some splitters (JavaScript,
+    /// Unicode-aware `lines()`), so an NDJSON record carrying them raw can be
+    /// split in two. They are escaped, which is the same JSON value.
+    #[tokio::test]
+    async fn ndjson_escapes_unicode_line_separators() {
+        let (mut stream, sender) = JsonStream::new();
+        let tricky = "a\u{2028}b\u{2029}c\u{0085}d";
+        sender.send_json(&tricky).await.unwrap();
+        sender
+            .send_raw(&format!("{{\"k\":\"{tricky}\"}}"))
+            .await
+            .unwrap();
+        sender.close().await;
+
+        let first = stream.next().await.unwrap().unwrap();
+        let first = std::str::from_utf8(&first).unwrap();
+        assert_eq!(first, "\"a\\u2028b\\u2029c\\u0085d\"\n");
+        assert_eq!(serde_json::from_str::<String>(first).unwrap(), tricky);
+
+        let second = stream.next().await.unwrap().unwrap();
+        let second = std::str::from_utf8(&second).unwrap();
+        assert_eq!(second, "{\"k\":\"a\\u2028b\\u2029c\\u0085d\"}\n");
+        let v: serde_json::Value = serde_json::from_str(second).unwrap();
+        assert_eq!(v["k"], tricky);
+        assert!(stream.next().await.is_none());
     }
 
     #[tokio::test]

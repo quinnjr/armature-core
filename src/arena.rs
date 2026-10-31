@@ -550,14 +550,27 @@ impl<'a> ArenaRequest<'a> {
     }
 }
 
+/// Same rules as `HttpRequest`'s `Debug`: the path without any query,
+/// sensitive header values redacted, query parameter *names* only (values
+/// routinely carry tokens), and the body's length rather than its bytes.
 impl<'a> fmt::Debug for ArenaRequest<'a> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let headers = crate::headers::RedactedHeaders(
+            self.headers
+                .iter()
+                .map(|(k, v)| (k.as_str(), v.as_str().as_bytes()))
+                .collect(),
+        );
+        let query_keys: Vec<&str> = self.query_params.keys().map(|k| k.as_str()).collect();
         f.debug_struct("ArenaRequest")
             .field("method", &self.method)
-            .field("path", &self.path)
-            .field("headers", &self.headers)
+            .field(
+                "path",
+                &crate::headers::path_without_query(self.path.as_str()),
+            )
+            .field("headers", &headers)
             .field("path_params", &self.path_params)
-            .field("query_params", &self.query_params)
+            .field("query_keys", &query_keys)
             .field("body_len", &self.body.len())
             .finish()
     }
@@ -811,5 +824,19 @@ mod tests {
             assert_eq!(vec[2], 3);
         });
         reset_arena();
+    }
+
+    #[test]
+    fn arena_request_debug_follows_http_request_rules() {
+        let arena = Bump::new();
+        let mut req = ArenaRequest::new(&arena, "GET", "/me?token=q-secret");
+        req.add_header(&arena, "Authorization", "Bearer h-secret");
+        req.add_query_param(&arena, "token", "p-secret");
+        req.body = b"b-secret";
+        let out = format!("{req:?}");
+        for secret in ["q-secret", "h-secret", "p-secret", "b-secret"] {
+            assert!(!out.contains(secret), "{secret} leaked: {out}");
+        }
+        assert!(out.contains("\"/me\"") && out.contains("token"), "{out}");
     }
 }

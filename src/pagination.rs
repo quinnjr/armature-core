@@ -548,6 +548,18 @@ impl FilterOperator {
 }
 
 /// Single filter condition
+///
+/// # Building SQL from a condition
+///
+/// When it comes from [`FilterParams::from_query`], `field` is a plain
+/// identifier (`^[A-Za-z0-9_]+$`), but it is still a name the *client* chose:
+/// prefer [`FilterParams::from_query_allowed`] so only columns you mean to
+/// expose can be filtered on. `value` is arbitrary client input and must
+/// never be interpolated into SQL: bind it as a query parameter. For the
+/// `LIKE`-based operators ([`FilterOperator::Contains`], `StartsWith`,
+/// `EndsWith`), pass it through [`like_escape`] before adding your own `%`
+/// and declare the escape character (`LIKE $1 ESCAPE '\'`), or a `%` or `_`
+/// in the value becomes a wildcard.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FilterCondition {
     /// Field name
@@ -556,7 +568,7 @@ pub struct FilterCondition {
     /// Filter operator
     pub operator: FilterOperator,
 
-    /// Filter value(s)
+    /// Filter value(s). Untrusted: bind it, never format it into SQL.
     pub value: Option<String>,
 }
 
@@ -604,6 +616,14 @@ impl FilterParams {
     /// Supports formats:
     /// - `field=value` → field = value
     /// - `field__op=value` → field op value (e.g., age__gte=18)
+    ///
+    /// Like [`SortParams::from_query`], a condition whose field name is not a
+    /// plain identifier (`^[A-Za-z0-9_]+$`, see
+    /// [`SortField::is_valid_field_name`]) is silently dropped: the key is
+    /// attacker-chosen, and the field is what a caller interpolates into a
+    /// `WHERE` clause beside [`FilterOperator::to_sql`]. Any identifier is
+    /// still accepted; use [`from_query_allowed`](Self::from_query_allowed)
+    /// to restrict filtering to known columns.
     pub fn from_query(params: &HashMap<String, String>) -> Self {
         let mut conditions = Vec::new();
 
@@ -617,23 +637,56 @@ impl FilterParams {
                 continue;
             }
 
-            // Parse field__operator format
+            // Parse field__operator format. A recognised operator with an
+            // invalid field drops the condition rather than falling back to
+            // treating the whole key as a field name.
             if let Some((field, op_str)) = key.split_once("__")
                 && let Some(operator) = FilterOperator::from_suffix(op_str)
             {
-                conditions.push(FilterCondition::new(field, operator, Some(value.clone())));
+                if SortField::is_valid_field_name(field) {
+                    conditions.push(FilterCondition::new(field, operator, Some(value.clone())));
+                }
                 continue;
             }
 
             // Default to equality
-            conditions.push(FilterCondition::new(
-                key,
-                FilterOperator::Eq,
-                Some(value.clone()),
-            ));
+            if SortField::is_valid_field_name(key) {
+                conditions.push(FilterCondition::new(
+                    key,
+                    FilterOperator::Eq,
+                    Some(value.clone()),
+                ));
+            }
         }
 
         Self::new(conditions)
+    }
+
+    /// [`from_query`](Self::from_query), keeping only conditions on the
+    /// fields in `allowed`.
+    ///
+    /// The recommended form whenever conditions reach SQL: the client can
+    /// then filter only on columns you chose to expose, not on any column
+    /// (`password_hash`, `deleted_at`, ...) whose name it can guess.
+    ///
+    /// ```
+    /// use armature_core::FilterParams;
+    /// use std::collections::HashMap;
+    ///
+    /// let mut params = HashMap::new();
+    /// params.insert("age__gte".to_string(), "18".to_string());
+    /// params.insert("password_hash".to_string(), "x".to_string());
+    ///
+    /// let filters = FilterParams::from_query_allowed(&params, &["age", "status"]);
+    /// assert_eq!(filters.conditions.len(), 1);
+    /// assert_eq!(filters.conditions[0].field, "age");
+    /// ```
+    pub fn from_query_allowed(params: &HashMap<String, String>, allowed: &[&str]) -> Self {
+        let mut filters = Self::from_query(params);
+        filters
+            .conditions
+            .retain(|c| allowed.contains(&c.field.as_str()));
+        filters
     }
 
     /// Check if filters are empty
@@ -645,6 +698,31 @@ impl FilterParams {
     pub fn get(&self, field: &str) -> Option<&FilterCondition> {
         self.conditions.iter().find(|c| c.field == field)
     }
+}
+
+/// Escape `value` for use as a literal inside a SQL `LIKE` pattern.
+///
+/// Prefixes `\`, `%` and `_` with a backslash, so a client's `%` or `_` is
+/// matched literally rather than as a wildcard. Add your own wildcards after
+/// escaping, bind the result as a parameter, and declare the escape character
+/// in the query (`LIKE $1 ESCAPE '\'`): not every database treats `\` as the
+/// default escape.
+///
+/// ```
+/// use armature_core::pagination::like_escape;
+///
+/// let pattern = format!("%{}%", like_escape("50%_off"));
+/// assert_eq!(pattern, r"%50\%\_off%");
+/// ```
+pub fn like_escape(value: &str) -> String {
+    let mut escaped = String::with_capacity(value.len());
+    for c in value.chars() {
+        if matches!(c, '\\' | '%' | '_') {
+            escaped.push('\\');
+        }
+        escaped.push(c);
+    }
+    escaped
 }
 
 impl Default for FilterParams {
@@ -971,6 +1049,40 @@ mod tests {
 
         let age_filter = filters.get("age").unwrap();
         assert_eq!(age_filter.operator, FilterOperator::Gte);
+    }
+
+    #[test]
+    fn filter_params_drop_fields_that_are_not_identifiers() {
+        let mut params = HashMap::new();
+        params.insert("status".to_string(), "active".to_string());
+        params.insert("name; DROP TABLE users--".to_string(), "x".to_string());
+        params.insert("1=1 OR a__gte".to_string(), "0".to_string());
+        params.insert("a.b__eq".to_string(), "1".to_string());
+        params.insert("__gte".to_string(), "1".to_string());
+
+        let filters = FilterParams::from_query(&params);
+        assert_eq!(filters.conditions.len(), 1, "{:?}", filters.conditions);
+        assert_eq!(filters.conditions[0].field, "status");
+    }
+
+    #[test]
+    fn filter_params_allowlist_keeps_only_named_fields() {
+        let mut params = HashMap::new();
+        params.insert("status".to_string(), "active".to_string());
+        params.insert("age__gte".to_string(), "18".to_string());
+        params.insert("password_hash".to_string(), "x".to_string());
+
+        let filters = FilterParams::from_query_allowed(&params, &["status", "age"]);
+        assert_eq!(filters.conditions.len(), 2);
+        assert!(filters.get("status").is_some());
+        assert_eq!(filters.get("age").unwrap().operator, FilterOperator::Gte);
+        assert!(filters.get("password_hash").is_none());
+    }
+
+    #[test]
+    fn like_escape_neutralizes_wildcards() {
+        assert_eq!(like_escape(r"50%_off\"), r"50\%\_off\\");
+        assert_eq!(like_escape("plain"), "plain");
     }
 
     #[test]

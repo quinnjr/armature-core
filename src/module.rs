@@ -37,7 +37,12 @@
 //! - B's providers are registered in the container
 //! - B's controllers are registered with the router
 //! - B's exported providers become available to A
-//! - B's guards become available to A's controllers (if exported)
+//! - B's guards are **not** inherited by A: a module's guards bind only to
+//!   the routes of that module's *own* controllers, never to an importer's
+//!   or an imported module's routes. Declare the guards on every module whose
+//!   controllers need them, or use `Application::with_guard` for a guard that
+//!   must cover every route. A module that declares guards but no
+//!   controllers is rejected at registration (it would protect nothing).
 //!
 //! ```rust
 //! use armature_core::Module;
@@ -478,6 +483,12 @@ pub struct ModuleRegistry {
     registered: HashSet<TypeId>,
     /// Global modules that should be auto-imported
     global_modules: Vec<Arc<dyn ModuleExt>>,
+    /// How many entries of `global_modules` have been registered. The list
+    /// is append-only, so a cursor identifies them exactly; tracking it here
+    /// (instead of relying on `dedup_key`) is what keeps a global
+    /// `DynamicModule`, which opts out of dedup, from being registered again
+    /// -- recursively, from inside its own registration -- on every call.
+    globals_registered: usize,
     /// Guards registered by all modules
     guards: Vec<Arc<dyn Guard>>,
 }
@@ -543,9 +554,11 @@ impl ModuleRegistry {
             self.register_module(container, router, imported.as_ref())?;
         }
 
-        // Register global modules if not already registered
-        let globals: Vec<Arc<dyn ModuleExt>> = self.global_modules.clone();
-        for global in globals {
+        // Register global modules not yet registered. The cursor advances
+        // *before* recursing so the global's own registration (which runs
+        // this same loop) does not reach it again.
+        while let Some(global) = self.global_modules.get(self.globals_registered).cloned() {
+            self.globals_registered += 1;
             self.register_module(container, router, global.as_ref())?;
         }
 
@@ -559,30 +572,70 @@ impl ModuleRegistry {
             );
         }
 
-        // Register guards
-        for guard_reg in module.guards() {
+        // Guards bind only to this module's own controllers' routes (see
+        // below), so guards with no controllers would protect nothing --
+        // typically the author expected them to cover an importer's or an
+        // imported module's routes, which then end up unguarded. Fail closed
+        // instead of registering a module whose guards are inert.
+        let guard_regs = module.guards();
+        let controllers = module.controllers();
+        if !guard_regs.is_empty() && controllers.is_empty() {
+            tracing::error!(
+                module = %module_name,
+                "Module declares guards but registers no controllers"
+            );
+            return Err(Error::Internal(format!(
+                "module {module_name} declares guards but no controllers; module \
+                 guards apply only to the module's own controllers -- declare them \
+                 on the modules whose controllers need them, or use \
+                 Application::with_guard for an application-wide guard"
+            )));
+        }
+        if !guard_regs.is_empty() && module.metadata().global {
+            tracing::warn!(
+                module = %module_name,
+                "Global module declares guards; they apply only to this module's \
+                 own controllers, not to modules that see it as global"
+            );
+        }
+
+        // Instantiate this module's guards. Mirrors `Application::register_module`
+        // (armature-core/src/application.rs): they are bound below to the
+        // routes THIS module's controllers register -- not to every request,
+        // and not to controllers of imported modules. A factory failure aborts
+        // registration before any of those routes exist, so a guard that
+        // cannot be built never leaves its routes reachable unguarded.
+        let mut module_guards: Vec<Arc<dyn Guard>> = Vec::with_capacity(guard_regs.len());
+        for guard_reg in guard_regs {
             match (guard_reg.factory)(container) {
                 Ok(guard) => {
-                    self.guards.push(guard);
                     tracing::trace!(
                         module = %module_name,
                         guard = guard_reg.type_name,
-                        "Guard registered"
+                        "Guard instantiated"
                     );
+                    module_guards.push(guard);
                 }
                 Err(e) => {
-                    tracing::warn!(
+                    tracing::error!(
                         module = %module_name,
                         guard = guard_reg.type_name,
                         error = %e,
-                        "Failed to register guard"
+                        "Failed to instantiate guard; aborting module registration"
                     );
+                    return Err(Error::Internal(format!(
+                        "module {module_name}: failed to instantiate guard {}: {e}",
+                        guard_reg.type_name
+                    )));
                 }
             }
         }
 
         // Register controllers
-        for controller_reg in module.controllers() {
+        for controller_reg in controllers {
+            // Every route this controller's registrar adds lands in this
+            // range, which is what the module's guards are bound to.
+            let first_route = router.routes.len();
             match (controller_reg.factory)(container) {
                 Ok(controller_instance) => {
                     if let Err(e) =
@@ -612,7 +665,16 @@ impl ModuleRegistry {
                     );
                 }
             }
+            // Bound even when the registrar failed part-way: whatever routes
+            // it did add are reachable and must carry the guards.
+            let added = first_route..router.routes.len();
+            if !module_guards.is_empty() && !added.is_empty() {
+                router.layer_routes(added, &[], &module_guards);
+            }
         }
+
+        // Kept only to back the deprecated `guards()` accessor.
+        self.guards.extend(module_guards);
 
         // Call module init hook
         module.on_module_init(container)?;
@@ -631,7 +693,17 @@ impl ModuleRegistry {
         self.global_modules.push(Arc::from(module));
     }
 
-    /// Get all registered guards
+    /// Get all guards instantiated by registered modules.
+    ///
+    /// Module guards are already bound to their own module's routes by
+    /// [`register_module`](Self::register_module). Applying this list
+    /// globally (e.g. as middleware on every request) would widen each
+    /// guard's scope beyond the module that declared it.
+    #[deprecated(
+        since = "0.12.1",
+        note = "module guards are bound to their module's routes during \
+                registration; do not apply this list globally"
+    )]
     pub fn guards(&self) -> &[Arc<dyn Guard>] {
         &self.guards
     }
@@ -848,7 +920,9 @@ mod tests {
     #[test]
     fn test_module_registry_creation() {
         let registry = ModuleRegistry::new();
-        assert!(registry.guards().is_empty());
+        #[allow(deprecated)]
+        let guards = registry.guards();
+        assert!(guards.is_empty());
     }
 
     #[test]
@@ -1066,4 +1140,201 @@ mod tests {
              through the ArcModule wrapper, not collapse into the first"
         );
     }
+
+    // ---- ModuleRegistry binds module guards to the module's own routes ----
+
+    async fn registry_ok_handler(_req: crate::HttpRequest) -> Result<crate::HttpResponse, Error> {
+        Ok(crate::HttpResponse::ok().with_body(b"secret".to_vec()))
+    }
+
+    struct RegistryDenyGuard;
+
+    #[async_trait::async_trait]
+    impl Guard for RegistryDenyGuard {
+        async fn can_activate(&self, _ctx: &crate::GuardContext) -> Result<bool, Error> {
+            Ok(false)
+        }
+    }
+
+    fn registry_admin_controller() -> ControllerRegistration {
+        ControllerRegistration {
+            type_id: TypeId::of::<u8>(),
+            type_name: "RegistryAdminController",
+            base_path: "/admin",
+            factory: |_c| Ok(Box::new(()) as Box<dyn std::any::Any + Send + Sync>),
+            route_registrar: |_c, r, _b| {
+                r.get("/admin/users", registry_ok_handler);
+                Ok(())
+            },
+        }
+    }
+
+    fn registry_public_controller() -> ControllerRegistration {
+        ControllerRegistration {
+            type_id: TypeId::of::<u16>(),
+            type_name: "RegistryPublicController",
+            base_path: "/public",
+            factory: |_c| Ok(Box::new(()) as Box<dyn std::any::Any + Send + Sync>),
+            route_registrar: |_c, r, _b| {
+                r.get("/public", registry_ok_handler);
+                Ok(())
+            },
+        }
+    }
+
+    struct RegistryPublicModule;
+    impl ModuleExt for RegistryPublicModule {
+        fn controllers(&self) -> Vec<ControllerRegistration> {
+            vec![registry_public_controller()]
+        }
+        fn metadata(&self) -> ModuleMetadata {
+            ModuleMetadata::new().name("RegistryPublicModule")
+        }
+    }
+
+    struct RegistryGuardedModule;
+    impl ModuleExt for RegistryGuardedModule {
+        fn controllers(&self) -> Vec<ControllerRegistration> {
+            vec![registry_admin_controller()]
+        }
+        fn guards(&self) -> Vec<GuardRegistration> {
+            vec![GuardRegistration {
+                type_id: TypeId::of::<RegistryDenyGuard>(),
+                type_name: "RegistryDenyGuard",
+                factory: |_c| Ok(Arc::new(RegistryDenyGuard) as Arc<dyn Guard>),
+            }]
+        }
+        fn imports(&self) -> Vec<Box<dyn ModuleExt>> {
+            vec![Box::new(RegistryPublicModule)]
+        }
+        fn metadata(&self) -> ModuleMetadata {
+            ModuleMetadata::new().name("RegistryGuardedModule")
+        }
+    }
+
+    struct RegistryBrokenGuardModule;
+    impl ModuleExt for RegistryBrokenGuardModule {
+        fn controllers(&self) -> Vec<ControllerRegistration> {
+            vec![registry_admin_controller()]
+        }
+        fn guards(&self) -> Vec<GuardRegistration> {
+            vec![GuardRegistration {
+                type_id: TypeId::of::<RegistryDenyGuard>(),
+                type_name: "RegistryBrokenGuard",
+                factory: |_c| Err(Error::Internal("no deps".to_string())),
+            }]
+        }
+        fn metadata(&self) -> ModuleMetadata {
+            ModuleMetadata::new().name("RegistryBrokenGuardModule")
+        }
+    }
+
+    #[tokio::test]
+    async fn test_module_registry_binds_guards_to_module_routes_only() {
+        let container = Container::new();
+        let mut router = Router::new();
+        let mut registry = ModuleRegistry::new();
+        registry
+            .register_module(&container, &mut router, &RegistryGuardedModule)
+            .unwrap();
+
+        let guarded = router
+            .route(crate::HttpRequest::new("GET", "/admin/users".to_string()))
+            .await
+            .unwrap();
+        assert_eq!(
+            guarded.status, 403,
+            "the module's guard must run on its own controller's routes"
+        );
+
+        let public = router
+            .route(crate::HttpRequest::new("GET", "/public".to_string()))
+            .await
+            .unwrap();
+        assert_eq!(
+            public.status, 200,
+            "an imported module's routes must not inherit the importer's guards"
+        );
+    }
+
+    #[test]
+    fn test_module_registry_guard_factory_error_fails_closed() {
+        let container = Container::new();
+        let mut router = Router::new();
+        let mut registry = ModuleRegistry::new();
+        let result = registry.register_module(&container, &mut router, &RegistryBrokenGuardModule);
+        assert!(result.is_err(), "a guard that cannot be built must abort");
+        assert!(
+            router.routes.is_empty(),
+            "no route of the module may be registered without its guard"
+        );
+    }
+
+    /// Guards with no controllers of their own to bind to.
+    struct RegistryGuardOnlyModule;
+    impl ModuleExt for RegistryGuardOnlyModule {
+        fn guards(&self) -> Vec<GuardRegistration> {
+            vec![GuardRegistration {
+                type_id: TypeId::of::<RegistryDenyGuard>(),
+                type_name: "RegistryDenyGuard",
+                factory: |_c| Ok(Arc::new(RegistryDenyGuard) as Arc<dyn Guard>),
+            }]
+        }
+        fn imports(&self) -> Vec<Box<dyn ModuleExt>> {
+            vec![Box::new(RegistryPublicModule)]
+        }
+        fn metadata(&self) -> ModuleMetadata {
+            ModuleMetadata::new().name("RegistryGuardOnlyModule")
+        }
+    }
+
+    /// A module that declares guards but no controllers almost always means
+    /// the author expected the guards to cover *other* (imported or
+    /// importing) modules' routes, which they never do. Registering it
+    /// would leave those routes silently unguarded, so it must fail closed.
+    #[test]
+    fn test_module_registry_guards_without_controllers_fail_closed() {
+        let container = Container::new();
+        let mut router = Router::new();
+        let mut registry = ModuleRegistry::new();
+        let result = registry.register_module(&container, &mut router, &RegistryGuardOnlyModule);
+        assert!(
+            result.is_err(),
+            "guards with no controllers to bind to must abort registration"
+        );
+    }
+
+    /// A global `DynamicModule` opts out of dedup, so re-walking the global
+    /// list on every `register_module` call used to recurse into itself
+    /// forever (stack overflow at startup) and re-register its controllers
+    /// once per module registered after it.
+    #[test]
+    fn test_module_registry_global_dynamic_module_registers_once() {
+        let container = Container::new();
+        let mut router = Router::new();
+        let mut registry = ModuleRegistry::new();
+        registry.add_global_module(
+            DynamicModule::new("GlobalPublic")
+                .with_controller(registry_public_controller())
+                .global(),
+        );
+
+        registry
+            .register_module(&container, &mut router, &RegistryPublicModuleA)
+            .unwrap();
+        registry
+            .register_module(&container, &mut router, &RegistryPublicModuleB)
+            .unwrap();
+
+        let public_routes = router.routes.iter().filter(|r| r.path == "/public").count();
+        assert_eq!(
+            public_routes, 1,
+            "a global module must be registered exactly once"
+        );
+    }
+
+    struct RegistryPublicModuleA;
+    impl ModuleExt for RegistryPublicModuleA {}
+    struct RegistryPublicModuleB;
+    impl ModuleExt for RegistryPublicModuleB {}
 }

@@ -166,7 +166,9 @@ fn status_reason(status: u16) -> &'static str {
 ///
 /// This holds all the buffers that make up an HTTP response,
 /// ready to be written with a single `writev()` call.
-#[derive(Debug)]
+///
+/// `Debug` prints the status line and buffer lengths only: the pre-formatted
+/// header block holds `Set-Cookie`/`Authorization` values verbatim.
 pub struct ResponseChunks {
     /// Status line buffer (either static or formatted)
     status_line: StatusLine,
@@ -190,6 +192,19 @@ impl StatusLine {
             StatusLine::Static(s) => s,
             StatusLine::Dynamic(b) => b,
         }
+    }
+}
+
+impl std::fmt::Debug for ResponseChunks {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ResponseChunks")
+            .field(
+                "status_line",
+                &String::from_utf8_lossy(self.status_line.as_slice()).trim_end(),
+            )
+            .field("headers_len", &self.headers.len())
+            .field("body_len", &self.body.len())
+            .finish()
     }
 }
 
@@ -334,11 +349,30 @@ fn format_usize(n: usize, buf: &mut [u8; 20]) -> &[u8] {
 /// A response builder optimized for vectored I/O.
 ///
 /// Builds responses with separate buffers for efficient `writev()`.
-#[derive(Debug)]
+///
+/// `Debug` redacts sensitive header values and prints the body length only.
 pub struct VectoredResponse {
     status: u16,
     headers: Vec<(String, String)>,
     body: Option<Bytes>,
+}
+
+impl std::fmt::Debug for VectoredResponse {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("VectoredResponse")
+            .field("status", &self.status)
+            .field(
+                "headers",
+                &crate::headers::RedactedHeaders(
+                    self.headers
+                        .iter()
+                        .map(|(k, v)| (k.as_str(), v.as_bytes()))
+                        .collect(),
+                ),
+            )
+            .field("body_len", &self.body.as_ref().map(Bytes::len))
+            .finish()
+    }
 }
 
 impl VectoredResponse {
@@ -528,6 +562,33 @@ pub fn vectored_stats() -> &'static VectoredIoStats {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_debug_does_not_print_headers_or_body() {
+        let resp = VectoredResponse::ok()
+            .header("Authorization", "Bearer tok123")
+            .header("Content-Type", "text/plain")
+            .body("secret-body");
+        let dbg = format!("{resp:?}");
+        assert!(
+            !dbg.contains("tok123") && !dbg.contains("secret-body"),
+            "{dbg}"
+        );
+        assert!(dbg.contains("text/plain"), "{dbg}");
+
+        let chunks = ResponseChunks::with_cookies(
+            200,
+            &HashMap::new(),
+            &["session=abc123".to_string()],
+            Bytes::from_static(b"secret-body"),
+        );
+        let dbg = format!("{chunks:?}");
+        assert!(
+            !dbg.contains("abc123") && !dbg.contains("secret-body"),
+            "{dbg}"
+        );
+        assert!(dbg.contains("200 OK"), "{dbg}");
+    }
 
     #[test]
     fn test_status_line_precomputed() {

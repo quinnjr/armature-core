@@ -5,10 +5,18 @@
 //! - ETag support for conditional requests
 //! - Compression support (gzip, brotli, zstd)
 //! - Content-Type detection
-//! - Security (path traversal prevention)
+//! - Security (path traversal prevention, hidden files refused by default,
+//!   `X-Content-Type-Options: nosniff` on every file)
 //! - File type-based cache policies
+//!
+//! Files no larger than [`StaticAssetsConfig::max_serve_size`] are read into
+//! memory (and cached); larger ones are only ever streamed from disk through
+//! [`StaticAssetServer::serve_streaming`]. [`StaticAssetServer::serve`] returns
+//! a buffered [`HttpResponse`], so it refuses oversized files rather than
+//! loading them whole.
 
 use crate::logging::debug;
+use crate::streaming::{StreamingResponse, stream_reader};
 use crate::{Error, HttpRequest, HttpResponse};
 use bytes::Bytes;
 use lru::LruCache;
@@ -28,6 +36,22 @@ pub const DEFAULT_CONTENT_CACHE_CAPACITY: usize = 128;
 /// cached. Larger files are streamed fresh on every request and never cached
 /// to keep memory bounded.
 pub const DEFAULT_MAX_SERVE_SIZE: usize = 16 * 1024 * 1024; // 16 MiB
+
+/// Default total size (bytes) of all bodies held by the content cache.
+///
+/// The entry count alone does not bound memory: 128 entries of up to
+/// [`DEFAULT_MAX_SERVE_SIZE`] each is 2 GiB.
+pub const DEFAULT_CACHE_MAX_BYTES: usize = 64 * 1024 * 1024; // 64 MiB
+
+/// Default largest file (bytes) compressed on the fly. Bigger files are only
+/// sent compressed when a pre-compressed sibling exists.
+pub const DEFAULT_MAX_DYNAMIC_COMPRESSION_SIZE: usize = 1024 * 1024; // 1 MiB
+
+/// Default number of on-the-fly compressions allowed to run at once.
+pub const DEFAULT_MAX_CONCURRENT_COMPRESSIONS: usize = 4;
+
+/// Chunk size used when streaming a file larger than `max_serve_size`.
+const STREAM_CHUNK_SIZE: usize = 64 * 1024;
 
 /// Identity of a pre-compressed sibling (`app.js.gz`) that is actually served:
 /// its own modification time and length.
@@ -202,6 +226,18 @@ pub struct CompressionConfig {
     /// Maximum file size to compress (bytes)
     pub max_size: usize,
 
+    /// Largest file (bytes) compressed on the fly, per request. Compression is
+    /// CPU-bound and runs off the executor, but an attacker can still force a
+    /// cache miss per request (distinct `Accept-Encoding` values, cold cache),
+    /// so the per-request cost is capped well below `max_size`. Files between
+    /// the two are compressed only via a pre-compressed sibling.
+    pub max_dynamic_size: usize,
+
+    /// Maximum number of on-the-fly compressions running at once. When all
+    /// slots are busy the file is served uncompressed instead of queueing.
+    /// `0` disables on-the-fly compression (pre-compressed siblings still work).
+    pub max_concurrent: usize,
+
     /// File types to compress (if None, compress all compressible types)
     pub compress_types: Option<Vec<FileType>>,
 }
@@ -214,8 +250,10 @@ impl CompressionConfig {
             level: CompressionLevel::Default,
             prefer_brotli: true,
             serve_precompressed: true,
-            min_size: 1024,       // 1 KB
-            max_size: 10485760,   // 10 MB
+            min_size: 1024,     // 1 KB
+            max_size: 10485760, // 10 MB
+            max_dynamic_size: DEFAULT_MAX_DYNAMIC_COMPRESSION_SIZE,
+            max_concurrent: DEFAULT_MAX_CONCURRENT_COMPRESSIONS,
             compress_types: None, // Compress all compressible types
         }
     }
@@ -255,6 +293,19 @@ impl CompressionConfig {
     /// Set maximum file size to compress
     pub fn with_max_size(mut self, size: usize) -> Self {
         self.max_size = size;
+        self
+    }
+
+    /// Set the largest file size compressed on the fly
+    pub fn with_max_dynamic_size(mut self, size: usize) -> Self {
+        self.max_dynamic_size = size;
+        self
+    }
+
+    /// Set how many on-the-fly compressions may run at once (`0` disables
+    /// on-the-fly compression)
+    pub fn with_max_concurrent(mut self, n: usize) -> Self {
+        self.max_concurrent = n;
         self
     }
 
@@ -333,10 +384,19 @@ pub enum FileType {
     Other,
 }
 
+/// The path's extension, ASCII-lowercased: `APP.JS` is the same file type as
+/// `app.js`, and serving it as `application/octet-stream` (or worse, sniffable)
+/// just because of its case helps nobody.
+fn lower_extension(path: &Path) -> Option<String> {
+    path.extension()
+        .and_then(|ext| ext.to_str())
+        .map(str::to_ascii_lowercase)
+}
+
 impl FileType {
-    /// Detect file type from path extension
+    /// Detect file type from path extension (case-insensitive)
     pub fn from_path(path: &Path) -> Self {
-        match path.extension().and_then(|ext| ext.to_str()) {
+        match lower_extension(path).as_deref() {
             Some("js") | Some("mjs") => FileType::JavaScript,
             Some("css") => FileType::Stylesheet,
             Some("png") | Some("jpg") | Some("jpeg") | Some("gif") | Some("svg") | Some("webp")
@@ -352,12 +412,15 @@ impl FileType {
         }
     }
 
-    /// Get MIME type for file type
+    /// Get MIME type for file type.
+    ///
+    /// Text types carry `charset=utf-8`: without it a browser guesses the
+    /// encoding, and a guessed UTF-7 or similar is an old XSS vector.
     pub fn mime_type(&self, path: &Path) -> String {
         match self {
-            FileType::JavaScript => "application/javascript".to_string(),
-            FileType::Stylesheet => "text/css".to_string(),
-            FileType::Image => match path.extension().and_then(|ext| ext.to_str()) {
+            FileType::JavaScript => "text/javascript; charset=utf-8".to_string(),
+            FileType::Stylesheet => "text/css; charset=utf-8".to_string(),
+            FileType::Image => match lower_extension(path).as_deref() {
                 Some("png") => "image/png",
                 Some("jpg") | Some("jpeg") => "image/jpeg",
                 Some("gif") => "image/gif",
@@ -368,7 +431,7 @@ impl FileType {
                 _ => "image/*",
             }
             .to_string(),
-            FileType::Font => match path.extension().and_then(|ext| ext.to_str()) {
+            FileType::Font => match lower_extension(path).as_deref() {
                 Some("woff") => "font/woff",
                 Some("woff2") => "font/woff2",
                 Some("ttf") => "font/ttf",
@@ -377,7 +440,7 @@ impl FileType {
                 _ => "font/*",
             }
             .to_string(),
-            FileType::Html => "text/html".to_string(),
+            FileType::Html => "text/html; charset=utf-8".to_string(),
             FileType::Json => "application/json".to_string(),
             FileType::Video => "video/mp4".to_string(),
             FileType::Audio => "audio/mpeg".to_string(),
@@ -423,9 +486,21 @@ pub struct StaticAssetsConfig {
     /// in-memory content cache. `0` disables the cache.
     pub cache_capacity: usize,
 
-    /// Files larger than this (bytes) are read fresh on every request and are
-    /// never cached, keeping memory usage bounded for large assets.
+    /// Files larger than this (bytes) are never read into memory: they are
+    /// streamed from disk by [`StaticAssetServer::serve_streaming`], never
+    /// compressed on the fly and never cached. [`StaticAssetServer::serve`]
+    /// cannot stream and refuses them.
     pub max_serve_size: usize,
+
+    /// Upper bound (bytes) on the total size of all bodies in the content
+    /// cache, on top of the `cache_capacity` entry bound.
+    pub cache_max_bytes: usize,
+
+    /// Serve hidden files and directories (any path component starting with
+    /// `.`, e.g. `.env`, `.git/config`). Off by default: a build that copies
+    /// a dotfile into the public root should not publish it. `.well-known` is
+    /// always served.
+    pub serve_hidden: bool,
 }
 
 impl StaticAssetsConfig {
@@ -471,6 +546,8 @@ impl StaticAssetsConfig {
             compression: CompressionConfig::new(),
             cache_capacity: DEFAULT_CONTENT_CACHE_CAPACITY,
             max_serve_size: DEFAULT_MAX_SERVE_SIZE,
+            cache_max_bytes: DEFAULT_CACHE_MAX_BYTES,
+            serve_hidden: false,
         }
     }
 
@@ -482,9 +559,22 @@ impl StaticAssetsConfig {
     }
 
     /// Set the maximum file size (bytes) that will be read fully into memory
-    /// and cached. Larger files are streamed fresh on every request.
+    /// and cached. Larger files are only streamed (see
+    /// [`StaticAssetServer::serve_streaming`]).
     pub fn with_max_serve_size(mut self, size: usize) -> Self {
         self.max_serve_size = size;
+        self
+    }
+
+    /// Set the total byte budget of the in-memory content cache.
+    pub fn with_cache_max_bytes(mut self, bytes: usize) -> Self {
+        self.cache_max_bytes = bytes;
+        self
+    }
+
+    /// Allow serving hidden (dot-prefixed) files and directories.
+    pub fn with_serve_hidden(mut self, serve: bool) -> Self {
+        self.serve_hidden = serve;
         self
     }
 
@@ -592,6 +682,54 @@ impl Default for StaticAssetsConfig {
     }
 }
 
+/// A static-file response from [`StaticAssetServer::serve_streaming`].
+pub enum StaticFileResponse {
+    /// The body is in memory (files up to `max_serve_size`, and 304s).
+    Buffered(HttpResponse),
+    /// The body is streamed from disk (files above `max_serve_size`).
+    Streamed(StreamingResponse),
+}
+
+/// The LRU of cached bodies plus the running total of their sizes, so the
+/// cache is bounded by bytes as well as by entry count.
+struct ContentCache {
+    entries: LruCache<ContentCacheKey, CachedContent>,
+    bytes: usize,
+    max_bytes: usize,
+}
+
+impl ContentCache {
+    fn get(&mut self, key: &ContentCacheKey) -> Option<CachedContent> {
+        self.entries.get(key).cloned()
+    }
+
+    fn put(&mut self, key: ContentCacheKey, value: CachedContent) {
+        let len = value.body.len();
+        // A body that alone exceeds the budget would evict everything else and
+        // then itself; not worth the churn.
+        if len > self.max_bytes {
+            return;
+        }
+        self.bytes += len;
+        // `push` hands back whatever left the cache: the old value under the
+        // same key, or the LRU entry evicted by the count bound.
+        if let Some((_, old)) = self.entries.push(key, value) {
+            self.bytes -= old.body.len();
+        }
+        while self.bytes > self.max_bytes {
+            match self.entries.pop_lru() {
+                Some((_, old)) => self.bytes -= old.body.len(),
+                None => break,
+            }
+        }
+    }
+
+    #[cfg(test)]
+    fn len(&self) -> usize {
+        self.entries.len()
+    }
+}
+
 /// Static asset server
 #[derive(Clone)]
 pub struct StaticAssetServer {
@@ -606,7 +744,11 @@ pub struct StaticAssetServer {
     /// Bounded in-memory cache of already-compressed (or raw) file bodies,
     /// shared across clones. `None` when caching is disabled
     /// (`cache_capacity == 0`).
-    cache: Option<Arc<Mutex<LruCache<ContentCacheKey, CachedContent>>>>,
+    cache: Option<Arc<Mutex<ContentCache>>>,
+    /// Slots for on-the-fly compression. Taken with `try_acquire`, never
+    /// awaited: when every slot is busy the response goes out uncompressed,
+    /// so a burst of cache-missing requests cannot queue up CPU work.
+    compress_permits: Arc<tokio::sync::Semaphore>,
 }
 
 impl StaticAssetServer {
@@ -621,20 +763,33 @@ impl StaticAssetServer {
             ))
         })?;
 
-        let cache = NonZeroUsize::new(config.cache_capacity)
-            .map(|cap| Arc::new(Mutex::new(LruCache::new(cap))));
+        let cache = NonZeroUsize::new(config.cache_capacity).map(|cap| {
+            Arc::new(Mutex::new(ContentCache {
+                entries: LruCache::new(cap),
+                bytes: 0,
+                max_bytes: config.cache_max_bytes,
+            }))
+        });
+
+        let compress_permits = Arc::new(tokio::sync::Semaphore::new(
+            config
+                .compression
+                .max_concurrent
+                .min(tokio::sync::Semaphore::MAX_PERMITS),
+        ));
 
         Ok(Self {
             config,
             canonical_root,
             cache,
+            compress_permits,
         })
     }
 
     /// Look up a cached body for this `(path, mtime, encoding)` key.
     fn cache_get(&self, key: &ContentCacheKey) -> Option<CachedContent> {
         let cache = self.cache.as_ref()?;
-        cache.lock().get(key).cloned()
+        cache.lock().get(key)
     }
 
     /// Store a body in the cache (no-op when caching is disabled).
@@ -652,32 +807,123 @@ impl StaticAssetServer {
     /// source's are known and the sibling is at least as new; unknown freshness
     /// declines the sibling and compresses the source instead, which is always
     /// correct if slower.
+    ///
+    /// The body is stored under `cache_entry` (key and ETag) when one is
+    /// given. `permit` is the compression slot for an on-the-fly compression;
+    /// see [`spawn_compression`](Self::spawn_compression) for why it is handed
+    /// over rather than held by the caller.
     async fn load_body(
         &self,
         path: &Path,
         compression: Option<CompressionAlgorithm>,
         precompressed: Option<&Path>,
+        permit: Option<tokio::sync::OwnedSemaphorePermit>,
+        cache_entry: Option<(ContentCacheKey, Option<String>)>,
     ) -> Result<Bytes, Error> {
-        if let Some(sibling) = precompressed {
+        let body = if let Some(sibling) = precompressed {
             let content = tokio::fs::read(sibling)
                 .await
                 .map_err(|e| Error::Internal(format!("Failed to read pre-compressed file: {e}")))?;
-            return Ok(Bytes::from(content));
-        }
-
-        let raw_content = tokio::fs::read(path)
-            .await
-            .map_err(|e| Error::Internal(format!("Failed to read file: {}", e)))?;
-
-        let bytes = match compression {
-            Some(algo) => self.compress_content(&raw_content, algo)?,
-            None => raw_content,
+            Bytes::from(content)
+        } else {
+            let raw_content = tokio::fs::read(path)
+                .await
+                .map_err(|e| Error::Internal(format!("Failed to read file: {}", e)))?;
+            match compression {
+                // The compressed body is cached by the blocking task itself.
+                Some(algo) => {
+                    return self
+                        .spawn_compression(raw_content, algo, permit, cache_entry)
+                        .await
+                        .map_err(|e| Error::Internal(format!("Compression task failed: {e}")))?;
+                }
+                None => Bytes::from(raw_content),
+            }
         };
-        Ok(Bytes::from(bytes))
+        if let Some((key, etag)) = cache_entry {
+            self.cache_put(
+                key,
+                CachedContent {
+                    body: body.clone(),
+                    etag,
+                },
+            );
+        }
+        Ok(body)
     }
 
-    /// Serve a static file
+    /// Compress `raw` on the blocking pool, caching the result from inside the
+    /// blocking task.
+    ///
+    /// Brotli at high quality runs to hundreds of milliseconds per MiB; on the
+    /// executor thread that stalls every other connection it owns. A blocking
+    /// task, though, cannot be cancelled: if the request awaiting it goes away
+    /// (client reset, connection closed) the compression runs to completion
+    /// regardless. So the task owns both the compression slot and the cache
+    /// write. Were the permit held by the request future instead, dropping
+    /// that future would free the slot while the CPU work kept going, and a
+    /// client opening and abandoning requests could run any number of
+    /// compressions at once past `max_concurrent`, saturating the blocking
+    /// pool; and caching here means abandoned work still serves the next
+    /// request instead of being thrown away.
+    fn spawn_compression(
+        &self,
+        raw: Vec<u8>,
+        algo: CompressionAlgorithm,
+        permit: Option<tokio::sync::OwnedSemaphorePermit>,
+        cache_entry: Option<(ContentCacheKey, Option<String>)>,
+    ) -> tokio::task::JoinHandle<Result<Bytes, Error>> {
+        let level = self.config.compression.level;
+        let cache = self.cache.clone();
+        tokio::task::spawn_blocking(move || {
+            // Released when this closure returns, i.e. when the CPU work is
+            // actually over -- not when a request stops waiting for it.
+            let _permit = permit;
+            let body = Bytes::from(compress_bytes(&raw, algo, level)?);
+            if let (Some(cache), Some((key, etag))) = (cache, cache_entry) {
+                cache.lock().put(
+                    key,
+                    CachedContent {
+                        body: body.clone(),
+                        etag,
+                    },
+                );
+            }
+            Ok(body)
+        })
+    }
+
+    /// Serve a static file as a buffered response.
+    ///
+    /// Files larger than [`StaticAssetsConfig::max_serve_size`] are refused
+    /// with an internal error rather than read into memory whole; use
+    /// [`serve_streaming`](Self::serve_streaming) when such files must be
+    /// served.
     pub async fn serve(&self, req: &HttpRequest) -> Result<HttpResponse, Error> {
+        match self.serve_inner(req, false).await? {
+            StaticFileResponse::Buffered(response) => Ok(response),
+            // `serve_inner` with `allow_stream == false` never streams.
+            StaticFileResponse::Streamed(_) => Err(Error::Internal(
+                "static file exceeds max_serve_size; use serve_streaming".to_string(),
+            )),
+        }
+    }
+
+    /// Serve a static file, streaming it from disk when it is larger than
+    /// [`StaticAssetsConfig::max_serve_size`].
+    ///
+    /// Streamed files are never compressed on the fly or cached, so the memory
+    /// a request can pin is bounded by `max_serve_size` regardless of what is
+    /// in the root directory.
+    pub async fn serve_streaming(&self, req: &HttpRequest) -> Result<StaticFileResponse, Error> {
+        self.serve_inner(req, true).await
+    }
+
+    async fn serve_inner(
+        &self,
+        req: &HttpRequest,
+        allow_stream: bool,
+    ) -> Result<StaticFileResponse, Error> {
         // `path_only`, not `path`: the raw target includes the query string, and
         // `/static/app.js?v=2` names no file on disk.
         let path = self.resolve_path(req.path_only()).await?;
@@ -701,7 +947,7 @@ impl StaticAssetServer {
                 && let Some(fallback_meta) = stat_optional(&fallback_path).await
             {
                 return self
-                    .serve_file_with_metadata(&fallback_path, &fallback_meta, req)
+                    .serve_file_with_metadata(&fallback_path, &fallback_meta, req, allow_stream)
                     .await;
             }
             // Neither the path nor the query is echoed back (M9).
@@ -721,14 +967,15 @@ impl StaticAssetServer {
                     && index_meta.is_file()
                 {
                     return self
-                        .serve_file_with_metadata(&index_path, &index_meta, req)
+                        .serve_file_with_metadata(&index_path, &index_meta, req, allow_stream)
                         .await;
                 }
             }
             return Err(Error::Forbidden("Directory listing disabled".to_string()));
         }
 
-        self.serve_file_with_metadata(&path, &metadata, req).await
+        self.serve_file_with_metadata(&path, &metadata, req, allow_stream)
+            .await
     }
 
     /// Serve a specific file whose metadata the caller has already read.
@@ -737,13 +984,24 @@ impl StaticAssetServer {
         path: &Path,
         metadata: &std::fs::Metadata,
         req: &HttpRequest,
-    ) -> Result<HttpResponse, Error> {
+        allow_stream: bool,
+    ) -> Result<StaticFileResponse, Error> {
         let modified = metadata.modified().ok();
-        let file_size = metadata.len() as usize;
+        let file_len = metadata.len();
+        let file_size = usize::try_from(file_len).unwrap_or(usize::MAX);
         let file_type = FileType::from_path(path);
 
+        // Above `max_serve_size` the file is never held in memory, so it can be
+        // neither compressed on the fly nor cached: it is streamed as stored.
+        let oversize = file_size > self.config.max_serve_size;
+
         // Determine compression
-        let compression = self.select_compression(req, file_type, file_size);
+        let negotiated = if oversize {
+            None
+        } else {
+            self.select_compression(req, file_type, file_size)
+        };
+        let mut compression = negotiated;
 
         // Resolve the pre-compressed sibling up front: whether one is used
         // changes the bytes on the wire, so its stamp has to reach the ETag and
@@ -754,15 +1012,45 @@ impl StaticAssetServer {
             }
             _ => None,
         };
+        let stamp = precompressed.as_ref().map(|(_, stamp)| *stamp);
+
+        // Without a sibling the compression would happen per cache miss, which
+        // a client can force; cap what one request can make the server chew.
+        if precompressed.is_none() && file_size > self.config.compression.max_dynamic_size {
+            compression = None;
+        }
+
+        // Caching requires a known mtime for invalidation.
+        let cacheable = !oversize && modified.is_some();
+        let cache_key = |compression| -> Option<ContentCacheKey> {
+            let modified = modified?;
+            cacheable.then(|| (path.to_path_buf(), modified, compression, stamp))
+        };
+
+        let mut cached = cache_key(compression).and_then(|key| self.cache_get(&key));
+
+        // An on-the-fly compression is about to run: take a slot, or fall back
+        // to the identity encoding rather than wait for one.
+        let mut permit = None;
+        if cached.is_none() && compression.is_some() && precompressed.is_none() {
+            match self.compress_permits.clone().try_acquire_owned() {
+                Ok(p) => permit = Some(p),
+                Err(_) => {
+                    debug!(
+                        path = %path.display(),
+                        "compression slots busy; serving uncompressed"
+                    );
+                    compression = None;
+                    cached = cache_key(None).and_then(|key| self.cache_get(&key));
+                }
+            }
+        }
+        // `stamp` is only `Some` when a sibling is in use, and the compression
+        // is only ever dropped when there is none, so the two stay consistent.
 
         // Generate ETag (include compression, and the sibling actually served)
         let etag = if self.config.enable_etag {
-            Some(self.generate_etag_with_compression(
-                path,
-                metadata,
-                compression.as_ref(),
-                precompressed.as_ref().map(|(_, stamp)| *stamp),
-            ))
+            Some(self.generate_etag_with_compression(path, metadata, compression.as_ref(), stamp))
         } else {
             None
         };
@@ -772,7 +1060,9 @@ impl StaticAssetServer {
             && let Some(if_none_match) = req.headers.get("If-None-Match")
             && if_none_match == etag_value
         {
-            return Ok(self.not_modified_response(etag_value));
+            return Ok(StaticFileResponse::Buffered(
+                self.not_modified_response(etag_value),
+            ));
         }
 
         if self.config.enable_last_modified
@@ -781,64 +1071,102 @@ impl StaticAssetServer {
             && let Ok(since_time) = httpdate::parse_http_date(if_modified_since)
             && modified_time <= since_time
         {
-            return Ok(self.not_modified_response(etag.as_deref().unwrap_or("")));
+            return Ok(StaticFileResponse::Buffered(
+                self.not_modified_response(etag.as_deref().unwrap_or("")),
+            ));
         }
 
-        // Decide whether this response is cacheable. Files above
-        // `max_serve_size` are read fresh every time and never cached so a few
-        // huge assets cannot exhaust memory; caching also requires a known
-        // mtime for invalidation.
-        let used_compression = compression;
-        let cacheable = file_size <= self.config.max_serve_size && modified.is_some();
+        let headers = self.file_headers(
+            path,
+            file_type,
+            negotiated.is_some(),
+            compression,
+            etag.clone(),
+            modified,
+        );
+
+        if oversize {
+            if !allow_stream {
+                return Err(Error::Internal(
+                    "static file exceeds max_serve_size; use serve_streaming".to_string(),
+                ));
+            }
+            let file = tokio::fs::File::open(path)
+                .await
+                .map_err(|e| Error::Internal(format!("Failed to open file: {e}")))?;
+            let (stream, _reader) = stream_reader(file, STREAM_CHUNK_SIZE);
+            let mut response = StreamingResponse::new(stream)
+                .status(200)
+                .header("Content-Length", file_len.to_string());
+            for (name, value) in headers {
+                response = response.header(name, value);
+            }
+            return Ok(StaticFileResponse::Streamed(response));
+        }
 
         let sibling_path = precompressed.as_ref().map(|(p, _)| p.as_path());
 
-        let content: Bytes = if cacheable {
-            let key: ContentCacheKey = (
-                path.to_path_buf(),
-                modified.unwrap(),
-                compression,
-                precompressed.as_ref().map(|(_, stamp)| *stamp),
-            );
-            if let Some(entry) = self.cache_get(&key) {
+        let content: Bytes = match cached {
+            Some(entry) => {
                 // Cache hit: skip the read + compression entirely. The ETag is
                 // derived from the same key, so the cached one must match the
                 // freshly computed one.
                 debug_assert_eq!(entry.etag, etag);
                 entry.body
-            } else {
-                let body = self.load_body(path, compression, sibling_path).await?;
-                self.cache_put(
-                    key,
-                    CachedContent {
-                        body: body.clone(),
-                        etag: etag.clone(),
-                    },
-                );
-                body
             }
-        } else {
-            self.load_body(path, compression, sibling_path).await?
+            None => {
+                // The permit moves into the body load: an on-the-fly
+                // compression owns its slot until the CPU work ends, even if
+                // this request is dropped while waiting for it.
+                let cache_entry = cache_key(compression).map(|key| (key, etag.clone()));
+                self.load_body(path, compression, sibling_path, permit, cache_entry)
+                    .await?
+            }
         };
 
-        // Build response
         let mut response = HttpResponse::ok().with_bytes_body(content);
+        for (name, value) in headers {
+            response.headers.insert(name, value);
+        }
+        Ok(StaticFileResponse::Buffered(response))
+    }
 
-        // Content-Type
-        let content_type = file_type.mime_type(path);
-        response
-            .headers
-            .insert("Content-Type".to_string(), content_type);
+    /// The headers every 200 for this file carries, buffered or streamed.
+    fn file_headers(
+        &self,
+        path: &Path,
+        file_type: FileType,
+        negotiated: bool,
+        compression: Option<CompressionAlgorithm>,
+        etag: Option<String>,
+        modified: Option<SystemTime>,
+    ) -> Vec<(String, String)> {
+        let mut headers = Vec::with_capacity(10);
 
-        // Content-Encoding
-        if let Some(algo) = used_compression {
-            response.headers.insert(
+        headers.push(("Content-Type".to_string(), file_type.mime_type(path)));
+        // Without it a browser may sniff an uploaded `.txt` or `.json` as HTML
+        // and run script from this origin.
+        headers.push(("X-Content-Type-Options".to_string(), "nosniff".to_string()));
+        // An SVG opened directly is a document that can run script, with this
+        // origin's privileges; as an `<img>` the CSP does not apply and nothing
+        // changes.
+        if lower_extension(path).as_deref() == Some("svg") {
+            headers.push((
+                "Content-Security-Policy".to_string(),
+                "default-src 'none'; style-src 'unsafe-inline'; sandbox".to_string(),
+            ));
+        }
+
+        if let Some(algo) = compression {
+            headers.push((
                 "Content-Encoding".to_string(),
                 algo.to_header_value().to_string(),
-            );
-            response
-                .headers
-                .insert("Vary".to_string(), "Accept-Encoding".to_string());
+            ));
+        }
+        // The representation depends on Accept-Encoding whenever compression
+        // was negotiable, including when it fell back to identity.
+        if negotiated {
+            headers.push(("Vary".to_string(), "Accept-Encoding".to_string()));
         }
 
         // Cache-Control
@@ -848,40 +1176,37 @@ impl StaticAssetServer {
             .get(&file_type)
             .copied()
             .unwrap_or(self.config.default_strategy);
-        response.headers.insert(
+        headers.push((
             "Cache-Control".to_string(),
             cache_strategy.to_header_value(),
-        );
+        ));
 
-        // ETag
         if let Some(etag_value) = etag {
-            response.headers.insert("ETag".to_string(), etag_value);
+            headers.push(("ETag".to_string(), etag_value));
         }
 
-        // Last-Modified
         if self.config.enable_last_modified
             && let Some(modified_time) = modified
         {
-            let formatted = httpdate::fmt_http_date(modified_time);
-            response
-                .headers
-                .insert("Last-Modified".to_string(), formatted);
+            headers.push((
+                "Last-Modified".to_string(),
+                httpdate::fmt_http_date(modified_time),
+            ));
         }
 
-        // CORS
         if self.config.enable_cors {
             let origin = self.config.cors_origin.as_deref().unwrap_or("*");
-            response.headers.insert(
+            headers.push((
                 "Access-Control-Allow-Origin".to_string(),
                 origin.to_string(),
-            );
-            response.headers.insert(
+            ));
+            headers.push((
                 "Access-Control-Allow-Methods".to_string(),
                 "GET, HEAD, OPTIONS".to_string(),
-            );
+            ));
         }
 
-        Ok(response)
+        headers
     }
 
     /// Select compression algorithm based on Accept-Encoding header and configuration
@@ -992,43 +1317,15 @@ impl StaticAssetServer {
         Ok(Some((compressed_path, (compressed, meta.len()))))
     }
 
-    /// Compress content on-the-fly
+    /// Compress content on-the-fly, synchronously. Request paths go through
+    /// `load_body`, which runs `compress_bytes` off the executor instead.
+    #[cfg(test)]
     fn compress_content(
         &self,
         content: &[u8],
         algo: CompressionAlgorithm,
     ) -> Result<Vec<u8>, Error> {
-        match algo {
-            CompressionAlgorithm::Gzip => {
-                use flate2::write::GzEncoder;
-
-                let mut encoder =
-                    GzEncoder::new(Vec::new(), self.config.compression.level.gzip_level());
-                encoder
-                    .write_all(content)
-                    .map_err(|e| Error::Internal(format!("Gzip compression failed: {}", e)))?;
-                encoder
-                    .finish()
-                    .map_err(|e| Error::Internal(format!("Gzip compression failed: {}", e)))
-            }
-            CompressionAlgorithm::Brotli => {
-                let mut output = Vec::new();
-                let params = brotli::enc::BrotliEncoderParams {
-                    quality: self.config.compression.level.brotli_level() as i32,
-                    ..Default::default()
-                };
-
-                brotli::BrotliCompress(&mut std::io::Cursor::new(content), &mut output, &params)
-                    .map_err(|e| Error::Internal(format!("Brotli compression failed: {}", e)))?;
-
-                Ok(output)
-            }
-            CompressionAlgorithm::Zstd => {
-                let level = self.config.compression.level.zstd_level();
-                zstd::encode_all(std::io::Cursor::new(content), level)
-                    .map_err(|e| Error::Internal(format!("Zstd compression failed: {}", e)))
-            }
-        }
+        compress_bytes(content, algo, self.config.compression.level)
     }
 
     /// Resolve request path to file system path
@@ -1046,6 +1343,13 @@ impl StaticAssetServer {
         // Remove leading slash
         let clean_path = request_path.trim_start_matches('/');
 
+        // Hidden files are refused on the name the client asked for, before
+        // the filesystem is touched, so the answer does not reveal whether
+        // `/.env` exists. No SPA fallback either: a 404 is the honest answer.
+        if !self.config.serve_hidden && has_hidden_component(Path::new(clean_path)) {
+            return Err(Error::NotFound("File not found".to_string()));
+        }
+
         // Build full path
         let full_path = self.config.root_dir.join(clean_path);
 
@@ -1056,10 +1360,16 @@ impl StaticAssetServer {
             return Ok(None);
         };
 
-        if !canonical_path.starts_with(&self.canonical_root) {
-            return Err(Error::Forbidden(
-                "Access denied: path traversal attempt".to_string(),
-            ));
+        // Outside the root is "not found", like a missing file: a distinct
+        // 403 would tell the client that the target exists out there.
+        let Ok(relative) = canonical_path.strip_prefix(&self.canonical_root) else {
+            return Ok(None);
+        };
+
+        // And on what it resolved to: `public/config -> .git/config` is a
+        // visible name for a hidden file.
+        if !self.config.serve_hidden && has_hidden_component(relative) {
+            return Ok(None);
         }
 
         Ok(Some(canonical_path))
@@ -1067,13 +1377,19 @@ impl StaticAssetServer {
 
     /// Canonicalize `path` and return it only if it resolves inside the root.
     ///
-    /// `None` when it does not exist, cannot be resolved, or escapes the root
-    /// (e.g. through a symlink) — every case where serving it is unproven safe.
+    /// `None` when it does not exist, cannot be resolved, escapes the root
+    /// (e.g. through a symlink), or — unless hidden files are served — resolves
+    /// to a hidden file: every case where serving it is unproven safe. The
+    /// hidden check runs on the *resolved* path for the same reason
+    /// `resolve_path` does: `docs/index.html -> ../.git/config` or
+    /// `app.js.gz -> .env` is a visible name for a hidden file.
     async fn contained(&self, path: &Path) -> Option<PathBuf> {
         let canonical = tokio::fs::canonicalize(path).await.ok()?;
-        canonical
-            .starts_with(&self.canonical_root)
-            .then_some(canonical)
+        let relative = canonical.strip_prefix(&self.canonical_root).ok()?;
+        if !self.config.serve_hidden && has_hidden_component(relative) {
+            return None;
+        }
+        Some(canonical)
     }
 
     /// Generate ETag for a file with compression info.
@@ -1088,39 +1404,54 @@ impl StaticAssetServer {
         compression: Option<&CompressionAlgorithm>,
         precompressed: Option<PrecompressedStamp>,
     ) -> String {
-        use std::collections::hash_map::DefaultHasher;
-        use std::hash::{Hash, Hasher};
+        // SHA-256 rather than `DefaultHasher`: SipHash's output is not a
+        // stable contract across Rust releases, so an upgrade would silently
+        // invalidate every client's cached ETag, and the rest of the crate
+        // already standardises on sha2 for ETags.
+        use sha2::{Digest, Sha256};
 
-        let mut hasher = DefaultHasher::new();
+        let mut hasher = Sha256::new();
 
-        // Hash file path
-        path.to_string_lossy().hash(&mut hasher);
+        // File path (length-prefixed so adjacent fields cannot run together)
+        let path_bytes = path.as_os_str().as_encoded_bytes();
+        hasher.update((path_bytes.len() as u64).to_le_bytes());
+        hasher.update(path_bytes);
 
-        // Hash file size
-        metadata.len().hash(&mut hasher);
+        // File size
+        hasher.update(metadata.len().to_le_bytes());
 
-        // Hash modification time
+        // Modification time
         if let Ok(modified) = metadata.modified()
             && let Ok(duration) = modified.duration_since(SystemTime::UNIX_EPOCH)
         {
-            duration.as_secs().hash(&mut hasher);
+            hasher.update(duration.as_nanos().to_le_bytes());
         }
 
-        // Hash compression algorithm
+        // Compression algorithm
         if let Some(algo) = compression {
-            algo.to_header_value().hash(&mut hasher);
+            hasher.update(algo.to_header_value().as_bytes());
         }
 
         // Hash the pre-compressed sibling's own mtime and length so rewriting
         // the artifact alone still yields a different ETag.
         if let Some((sibling_modified, sibling_len)) = precompressed {
+            hasher.update(b"precompressed");
             if let Ok(duration) = sibling_modified.duration_since(SystemTime::UNIX_EPOCH) {
-                duration.as_secs().hash(&mut hasher);
+                hasher.update(duration.as_nanos().to_le_bytes());
             }
-            sibling_len.hash(&mut hasher);
+            hasher.update(sibling_len.to_le_bytes());
         }
 
-        format!("\"{}\"", hasher.finish())
+        // 128 bits is ample for change detection and keeps the header short.
+        let digest = hasher.finalize();
+        let mut etag = String::with_capacity(34);
+        etag.push('"');
+        for byte in &digest[..16] {
+            use std::fmt::Write as _;
+            let _ = write!(etag, "{byte:02x}");
+        }
+        etag.push('"');
+        etag
     }
 
     /// Create a 304 Not Modified response
@@ -1143,6 +1474,58 @@ impl StaticAssetServer {
 
         response
     }
+}
+
+/// Compress `content` with `algo` at `level`.
+fn compress_bytes(
+    content: &[u8],
+    algo: CompressionAlgorithm,
+    level: CompressionLevel,
+) -> Result<Vec<u8>, Error> {
+    match algo {
+        CompressionAlgorithm::Gzip => {
+            use flate2::write::GzEncoder;
+
+            let mut encoder = GzEncoder::new(Vec::new(), level.gzip_level());
+            encoder
+                .write_all(content)
+                .map_err(|e| Error::Internal(format!("Gzip compression failed: {}", e)))?;
+            encoder
+                .finish()
+                .map_err(|e| Error::Internal(format!("Gzip compression failed: {}", e)))
+        }
+        CompressionAlgorithm::Brotli => {
+            let mut output = Vec::new();
+            let params = brotli::enc::BrotliEncoderParams {
+                quality: level.brotli_level() as i32,
+                ..Default::default()
+            };
+
+            brotli::BrotliCompress(&mut std::io::Cursor::new(content), &mut output, &params)
+                .map_err(|e| Error::Internal(format!("Brotli compression failed: {}", e)))?;
+
+            Ok(output)
+        }
+        CompressionAlgorithm::Zstd => {
+            zstd::encode_all(std::io::Cursor::new(content), level.zstd_level())
+                .map_err(|e| Error::Internal(format!("Zstd compression failed: {}", e)))
+        }
+    }
+}
+
+/// Whether any component of `path` is hidden (starts with `.`).
+///
+/// `.well-known` (RFC 8615) is exempt: ACME challenges, `security.txt` and
+/// friends live there and are meant to be public. `..` is not a `Normal`
+/// component and is left to the traversal check.
+fn has_hidden_component(path: &Path) -> bool {
+    path.components().any(|c| match c {
+        std::path::Component::Normal(name) => {
+            let name = name.as_encoded_bytes();
+            name.first() == Some(&b'.') && name != b".well-known"
+        }
+        _ => false,
+    })
 }
 
 /// Stat a candidate path without blocking the executor, treating every failure
@@ -1425,7 +1808,7 @@ mod tests {
             return Ok(None);
         };
         let body = server
-            .load_body(path, Some(algo), Some(sibling.as_path()))
+            .load_body(path, Some(algo), Some(sibling.as_path()), None, None)
             .await?;
         Ok(Some(body.to_vec()))
     }
@@ -1591,19 +1974,324 @@ mod tests {
     #[tokio::test]
     async fn test_large_file_not_cached() {
         let dir = TempDir::new();
-        dir.write("big.bin", &vec![0u8; 1024]);
+        dir.write("big.bin", &vec![7u8; 1024]);
 
-        // max_serve_size below the file size => never cached.
+        // max_serve_size below the file size => streamed, never cached.
         let config = StaticAssetsConfig::new(dir.path.clone()).with_max_serve_size(10);
         let server = StaticAssetServer::new(config).unwrap();
 
-        let resp = server.serve(&get_req("/big.bin")).await.unwrap();
+        let StaticFileResponse::Streamed(resp) =
+            server.serve_streaming(&get_req("/big.bin")).await.unwrap()
+        else {
+            panic!("an oversized file must be streamed");
+        };
         assert_eq!(resp.status, 200);
-        assert_eq!(resp.body_ref().len(), 1024);
+        assert_eq!(resp.headers.get("Content-Length").unwrap(), "1024");
+        let crate::streaming::StreamBody::Bytes(mut stream) = resp.into_body() else {
+            panic!("expected a byte stream");
+        };
+        let mut body = Vec::new();
+        while let Some(chunk) = futures_util::StreamExt::next(&mut stream).await {
+            body.extend_from_slice(&chunk.unwrap());
+        }
+        assert_eq!(body, vec![7u8; 1024]);
 
         // Nothing cached for oversized files.
         let cache = server.cache.as_ref().unwrap();
         assert_eq!(cache.lock().len(), 0);
+    }
+
+    /// The buffered API cannot stream, so it refuses an oversized file instead
+    /// of reading it into memory whole.
+    #[tokio::test]
+    async fn buffered_serve_refuses_oversized_file() {
+        let dir = TempDir::new();
+        dir.write("big.bin", &vec![0u8; 1024]);
+        let config = StaticAssetsConfig::new(dir.path.clone()).with_max_serve_size(10);
+        let server = StaticAssetServer::new(config).unwrap();
+        let err = server.serve(&get_req("/big.bin")).await.unwrap_err();
+        assert_eq!(err.status_code(), 500);
+    }
+
+    /// An oversized file is never compressed on the fly, even when the client
+    /// accepts it and the type is compressible.
+    #[tokio::test]
+    async fn streamed_file_is_not_compressed() {
+        let dir = TempDir::new();
+        dir.write("big.js", &vec![b'x'; 4096]);
+        let config = StaticAssetsConfig::new(dir.path.clone()).with_max_serve_size(2048);
+        let server = StaticAssetServer::new(config).unwrap();
+        let mut req = get_req("/big.js");
+        req.headers
+            .insert("Accept-Encoding", "gzip, br".to_string());
+        let StaticFileResponse::Streamed(resp) = server.serve_streaming(&req).await.unwrap() else {
+            panic!("an oversized file must be streamed");
+        };
+        assert!(!resp.headers.contains_key("Content-Encoding"));
+    }
+
+    #[tokio::test]
+    async fn hidden_files_are_not_served_by_default() {
+        let dir = TempDir::new();
+        dir.write(".env", b"SECRET=1");
+        std::fs::create_dir(dir.path.join(".git")).unwrap();
+        dir.write(".git/config", b"[core]");
+        std::fs::create_dir(dir.path.join(".well-known")).unwrap();
+        dir.write(".well-known/security.txt", b"Contact: x");
+        dir.write("index.html", b"spa");
+
+        let server =
+            StaticAssetServer::new(StaticAssetsConfig::new(dir.path.clone()).spa_mode()).unwrap();
+        for target in ["/.env", "/.git/config", "/sub/../.env"] {
+            let err = server.serve(&get_req(target)).await.unwrap_err();
+            assert_eq!(err.status_code(), 404, "{target}");
+        }
+        let ok = server
+            .serve(&get_req("/.well-known/security.txt"))
+            .await
+            .unwrap();
+        assert_eq!(ok.body_ref(), b"Contact: x");
+
+        let open = StaticAssetServer::new(
+            StaticAssetsConfig::new(dir.path.clone()).with_serve_hidden(true),
+        )
+        .unwrap();
+        assert_eq!(
+            open.serve(&get_req("/.env")).await.unwrap().body_ref(),
+            b"SECRET=1"
+        );
+    }
+
+    /// A visible name that resolves to a hidden file is refused too.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn symlink_to_hidden_file_is_not_served() {
+        let dir = TempDir::new();
+        dir.write(".env", b"SECRET=1");
+        std::os::unix::fs::symlink(dir.path.join(".env"), dir.path.join("config.txt")).unwrap();
+        let server = StaticAssetServer::new(StaticAssetsConfig::new(dir.path.clone())).unwrap();
+        let err = server.serve(&get_req("/config.txt")).await.unwrap_err();
+        assert_eq!(err.status_code(), 404);
+    }
+
+    /// Index files, pre-compressed siblings and the SPA fallback are resolved
+    /// through `contained`, which must refuse a visible name resolving to a
+    /// hidden file just as `resolve_path` does for the request path.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn contained_candidates_resolving_to_hidden_files_are_not_served() {
+        let dir = TempDir::new();
+        dir.write(".env", b"SECRET=1");
+        std::fs::create_dir(dir.path.join(".git")).unwrap();
+        dir.write(".git/config", b"[core] leaked");
+        std::fs::create_dir(dir.path.join("docs")).unwrap();
+        std::os::unix::fs::symlink("../.git/config", dir.path.join("docs/index.html")).unwrap();
+        dir.write("app.js", b"inside");
+        std::os::unix::fs::symlink(".env", dir.path.join("app.js.gz")).unwrap();
+        std::os::unix::fs::symlink(".env", dir.path.join("fallback.html")).unwrap();
+
+        let server = StaticAssetServer::new(
+            StaticAssetsConfig::new(dir.path.clone()).with_fallback("fallback.html"),
+        )
+        .unwrap();
+
+        match server.serve(&get_req("/docs/")).await {
+            Ok(resp) => panic!("index served {:?}", resp.body_ref()),
+            Err(e) => assert!(e.status_code() == 403 || e.status_code() == 404, "{e}"),
+        }
+
+        let source = dir.path.join("app.js").canonicalize().unwrap();
+        let modified = std::fs::metadata(&source).unwrap().modified().ok();
+        let got = server
+            .locate_precompressed(&source, CompressionAlgorithm::Gzip, modified)
+            .await
+            .unwrap();
+        assert!(got.is_none(), "{got:?}");
+
+        let err = server.serve(&get_req("/missing")).await.unwrap_err();
+        assert_eq!(err.status_code(), 404);
+    }
+
+    /// A request resolving outside the root answers exactly like a missing
+    /// file, so the status does not reveal what exists beyond the root.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn symlink_outside_root_is_not_found_not_forbidden() {
+        let outside = TempDir::new();
+        outside.write("secret.txt", b"outside the root");
+        let dir = TempDir::new();
+        std::os::unix::fs::symlink(outside.path.join("secret.txt"), dir.path.join("out")).unwrap();
+        std::os::unix::fs::symlink(outside.path.join("absent.txt"), dir.path.join("gone")).unwrap();
+        let server = StaticAssetServer::new(StaticAssetsConfig::new(dir.path.clone())).unwrap();
+        for target in ["/out", "/gone"] {
+            let err = server.serve(&get_req(target)).await.unwrap_err();
+            assert_eq!(err.status_code(), 404, "{target}");
+        }
+    }
+
+    /// A request that stops waiting for an on-the-fly compression must not
+    /// free its slot while the (uncancellable) blocking work still runs, and
+    /// the finished body must still land in the cache.
+    #[tokio::test]
+    async fn abandoned_compression_keeps_its_slot_and_caches_the_result() {
+        let dir = TempDir::new();
+        dir.write("app.js", &vec![b'x'; 4096]);
+        let config = StaticAssetsConfig::new(dir.path.clone())
+            .with_compression(CompressionConfig::new().with_max_concurrent(1));
+        let server = StaticAssetServer::new(config).unwrap();
+        let path = dir.path.join("app.js").canonicalize().unwrap();
+        let modified = std::fs::metadata(&path).unwrap().modified().unwrap();
+        let key: ContentCacheKey = (path, modified, Some(CompressionAlgorithm::Gzip), None);
+
+        let permit = server.compress_permits.clone().try_acquire_owned().unwrap();
+        let handle = server.spawn_compression(
+            vec![b'x'; 4096],
+            CompressionAlgorithm::Gzip,
+            Some(permit),
+            Some((key.clone(), Some("\"etag\"".to_string()))),
+        );
+        // The request is gone; nothing awaits the result any more.
+        drop(handle);
+
+        // The slot comes back only once the work is over, and by then the
+        // result has been cached (the cache write precedes the release).
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        while server.compress_permits.available_permits() == 0 {
+            assert!(std::time::Instant::now() < deadline, "slot never released");
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        let cached = server
+            .cache_get(&key)
+            .expect("abandoned work was discarded");
+        assert_eq!(cached.etag.as_deref(), Some("\"etag\""));
+        assert!(!cached.body.is_empty());
+    }
+
+    #[tokio::test]
+    async fn text_types_carry_charset_and_nosniff() {
+        let dir = TempDir::new();
+        dir.write("PAGE.HTML", b"<p>hi</p>");
+        dir.write("logo.svg", b"<svg/>");
+        let server = StaticAssetServer::new(StaticAssetsConfig::new(dir.path.clone())).unwrap();
+
+        let html = server.serve(&get_req("/PAGE.HTML")).await.unwrap();
+        assert_eq!(
+            html.headers.get("Content-Type").map(String::as_str),
+            Some("text/html; charset=utf-8")
+        );
+        assert_eq!(
+            html.headers
+                .get("X-Content-Type-Options")
+                .map(String::as_str),
+            Some("nosniff")
+        );
+        assert!(html.headers.get("Content-Security-Policy").is_none());
+
+        let svg = server.serve(&get_req("/logo.svg")).await.unwrap();
+        assert_eq!(
+            svg.headers.get("Content-Type").map(String::as_str),
+            Some("image/svg+xml")
+        );
+        let csp = svg.headers.get("Content-Security-Policy").unwrap();
+        assert!(
+            csp.contains("default-src 'none'") && csp.contains("sandbox"),
+            "{csp}"
+        );
+    }
+
+    #[test]
+    fn file_type_detection_is_case_insensitive() {
+        assert_eq!(
+            FileType::from_path(Path::new("APP.JS")),
+            FileType::JavaScript
+        );
+        assert_eq!(
+            FileType::Image.mime_type(Path::new("A.PNG")),
+            "image/png".to_string()
+        );
+    }
+
+    /// Above `max_dynamic_size` there is no on-the-fly compression.
+    #[tokio::test]
+    async fn on_the_fly_compression_is_size_capped() {
+        let dir = TempDir::new();
+        dir.write("app.js", &vec![b'x'; 8192]);
+        let config = StaticAssetsConfig::new(dir.path.clone())
+            .with_compression(CompressionConfig::new().with_max_dynamic_size(4096));
+        let server = StaticAssetServer::new(config).unwrap();
+        let mut req = get_req("/app.js");
+        req.headers.insert("Accept-Encoding", "gzip".to_string());
+        let resp = server.serve(&req).await.unwrap();
+        assert!(resp.headers.get("Content-Encoding").is_none());
+        assert_eq!(resp.body_ref().len(), 8192);
+        assert_eq!(
+            resp.headers.get("Vary").map(String::as_str),
+            Some("Accept-Encoding")
+        );
+    }
+
+    /// With every compression slot taken the response goes out uncompressed
+    /// instead of waiting.
+    #[tokio::test]
+    async fn saturated_compression_slots_serve_uncompressed() {
+        let dir = TempDir::new();
+        dir.write("app.js", &vec![b'x'; 4096]);
+        let config = StaticAssetsConfig::new(dir.path.clone())
+            .with_compression(CompressionConfig::new().with_max_concurrent(1));
+        let server = StaticAssetServer::new(config).unwrap();
+        let _held = server.compress_permits.clone().try_acquire_owned().unwrap();
+
+        let mut req = get_req("/app.js");
+        req.headers.insert("Accept-Encoding", "gzip".to_string());
+        let resp = server.serve(&req).await.unwrap();
+        assert!(resp.headers.get("Content-Encoding").is_none());
+        assert_eq!(resp.body_ref(), &vec![b'x'; 4096][..]);
+
+        // Once a slot frees up, compression resumes.
+        drop(_held);
+        let resp = server.serve(&req).await.unwrap();
+        assert_eq!(
+            resp.headers.get("Content-Encoding").map(String::as_str),
+            Some("gzip")
+        );
+    }
+
+    /// The content cache is bounded by total bytes, not only by entry count.
+    #[tokio::test]
+    async fn content_cache_is_bounded_by_bytes() {
+        let dir = TempDir::new();
+        for name in ["a.bin", "b.bin", "c.bin"] {
+            dir.write(name, &vec![0u8; 1000]);
+        }
+        let config = StaticAssetsConfig::new(dir.path.clone()).with_cache_max_bytes(2500);
+        let server = StaticAssetServer::new(config).unwrap();
+        for name in ["/a.bin", "/b.bin", "/c.bin"] {
+            server.serve(&get_req(name)).await.unwrap();
+        }
+        let cache = server.cache.as_ref().unwrap().lock();
+        assert_eq!(cache.len(), 2);
+        assert!(cache.bytes <= 2500);
+    }
+
+    #[test]
+    fn etag_is_a_stable_sha256_prefix() {
+        let dir = TempDir::new();
+        dir.write("a.txt", b"x");
+        let server = StaticAssetServer::new(StaticAssetsConfig::new(dir.path.clone())).unwrap();
+        let path = dir.path.join("a.txt");
+        let meta = std::fs::metadata(&path).unwrap();
+        let e1 = server.generate_etag_with_compression(&path, &meta, None, None);
+        let e2 = server.generate_etag_with_compression(&path, &meta, None, None);
+        let gz = server.generate_etag_with_compression(
+            &path,
+            &meta,
+            Some(&CompressionAlgorithm::Gzip),
+            None,
+        );
+        assert_eq!(e1, e2);
+        assert_ne!(e1, gz);
+        assert_eq!(e1.len(), 34);
+        assert!(e1[1..33].bytes().all(|b| b.is_ascii_hexdigit()));
     }
 
     #[test]

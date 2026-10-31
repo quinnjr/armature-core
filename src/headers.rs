@@ -113,31 +113,282 @@ impl Header {
 }
 
 /// Header names whose values are credentials and must never reach a log
-/// through `Debug`: `authorization`, `proxy-authorization`, `cookie`,
-/// `set-cookie` and `x-api-key`. Compared case-insensitively.
+/// through `Debug`. Compared case-insensitively.
+///
+/// This is the exact-name list; [`is_sensitive_header`] additionally treats
+/// any name containing one of [`SENSITIVE_HEADER_FRAGMENTS`] as sensitive, so
+/// application-specific headers such as `x-session-token` are covered too.
 pub const SENSITIVE_HEADERS: &[&str] = &[
     "authorization",
     "proxy-authorization",
     "cookie",
     "set-cookie",
     "x-api-key",
+    "x-auth-token",
+    "x-access-token",
+    "x-csrf-token",
+    "x-xsrf-token",
+    "x-amz-security-token",
+    "x-goog-api-key",
+    "x-hub-signature",
+    "x-hub-signature-256",
+    "authentication-info",
+    "proxy-authentication-info",
+    // Identity asserted by an authenticating gateway or load balancer. Also
+    // matched by a fragment below; listed so the set is explicit.
+    "x-forwarded-client-cert",
+    "x-remote-user",
+    "remote-user",
+    "x-ms-client-principal",
+    "x-ms-client-principal-id",
+    "x-ms-client-principal-name",
+    "x-ms-client-principal-idp",
+    "cf-access-jwt-assertion",
+    "x-goog-iap-jwt-assertion",
+    "x-amzn-oidc-data",
+    "x-amzn-oidc-identity",
+    "x-amzn-oidc-accesstoken",
+    // Authelia (and other forward-auth proxies) name the caller with bare
+    // `Remote-*` headers. Listed exactly rather than as a `remote-` fragment,
+    // which would also catch `Remote-Addr`-style routing headers.
+    "remote-email",
+    "remote-groups",
+    "remote-name",
+];
+
+/// Substrings that mark a header name as sensitive wherever they appear in it
+/// (case-insensitively).
+///
+/// Deliberately broad: a false positive costs a `<redacted>` in a debug log
+/// (or a cache bypass), a false negative leaks a credential. `auth` covers
+/// `x-auth-user`/`x-authz-*` style gateway headers, `session` covers
+/// `x-session-id`, and `-key` covers `x-client-key`, `x-license-key` and
+/// friends.
+///
+/// The identity fragments (`client-cert`, `principal`, `assertion`, `oidc`,
+/// `jwt`, `forwarded-user`, `forwarded-email`, `remote-user`) cover headers
+/// an authenticating proxy injects to name the caller (Envoy's
+/// `X-Forwarded-Client-Cert`, Azure's `X-MS-Client-Principal*`, Cloudflare
+/// Access and Google IAP JWT assertions, AWS ALB's `X-Amzn-OIDC-*`,
+/// oauth2-proxy's `X-Forwarded-User`/`-Email`, `Remote-User`). A response to
+/// such a request is per-caller, so the caches must bypass it like any other
+/// credential. None of them occurs in the routing headers (`X-Forwarded-For`,
+/// `-Proto`, `-Host`, `-Port`, `Forwarded`).
+///
+/// The gateway-identity fragments (`credential`, `consumer`, `userinfo`,
+/// `claim`, `client-dn`, `client-s-dn`, `client-verify`, `ssl-client`,
+/// `vouch`, `forwarded-groups`, `preferred-username`) cover Kong's
+/// `X-Consumer-ID`/`-Username`, `X-Credential-Identifier` and `X-Userinfo`,
+/// GCP's `X-Endpoint-API-UserInfo` and `X-Apigateway-Api-Userinfo`, nginx's
+/// `X-SSL-Client-S-DN`/`-Verify` and `X-Client-DN`, Pomerium's
+/// `X-Pomerium-Claim-*`, Vouch's `X-Vouch-User`, and oauth2-proxy's
+/// `X-Forwarded-Groups`/`-Preferred-Username`. No name list can be complete,
+/// which is why [`CacheInterceptor`](crate::interceptor::CacheInterceptor)
+/// also refuses to store a response that is not explicitly `public`.
+pub const SENSITIVE_HEADER_FRAGMENTS: &[&str] = &[
+    "token",
+    "secret",
+    "api-key",
+    "apikey",
+    "-key",
+    "signature",
+    "password",
+    "session",
+    "auth",
+    "client-cert",
+    "principal",
+    "assertion",
+    "oidc",
+    "jwt",
+    "forwarded-user",
+    "forwarded-email",
+    "remote-user",
+    "credential",
+    "consumer",
+    "userinfo",
+    "claim",
+    "client-dn",
+    "client-s-dn",
+    "client-verify",
+    "ssl-client",
+    "vouch",
+    "forwarded-groups",
+    "preferred-username",
 ];
 
 /// What `Debug` prints in place of a sensitive header's value.
 pub const REDACTED: &str = "<redacted>";
 
-/// Whether `name` is one of [`SENSITIVE_HEADERS`] (case-insensitively).
+/// Whether `name` is one of [`SENSITIVE_HEADERS`], or contains one of
+/// [`SENSITIVE_HEADER_FRAGMENTS`] (case-insensitively).
 ///
 /// ```
 /// use armature_core::headers::is_sensitive_header;
 /// assert!(is_sensitive_header("Authorization"));
+/// assert!(is_sensitive_header("X-Session-Token"));
 /// assert!(!is_sensitive_header("content-type"));
 /// ```
 #[inline]
 pub fn is_sensitive_header(name: &str) -> bool {
-    SENSITIVE_HEADERS
+    if SENSITIVE_HEADERS
         .iter()
         .any(|s| s.eq_ignore_ascii_case(name))
+    {
+        return true;
+    }
+    // Compared in place rather than via a lowercased copy: the response caches
+    // call this for every request header, so it must not allocate.
+    SENSITIVE_HEADER_FRAGMENTS
+        .iter()
+        .any(|frag| contains_ignore_ascii_case(name, frag))
+}
+
+/// Whether `haystack` contains `needle`, ASCII-case-insensitively. `needle`
+/// must be lowercase (every fragment above is).
+#[inline]
+fn contains_ignore_ascii_case(haystack: &str, needle: &str) -> bool {
+    haystack
+        .as_bytes()
+        .windows(needle.len())
+        .any(|w| w.eq_ignore_ascii_case(needle.as_bytes()))
+}
+
+/// Whether a request header carries a credential that makes the response to
+/// it caller-specific — i.e. a [sensitive](is_sensitive_header) header other
+/// than an anti-CSRF token.
+///
+/// CSRF tokens are excluded because they authenticate nothing on their own:
+/// they ride alongside a `Cookie`, which already counts. Everything else in
+/// the sensitive set (`Authorization`, `Cookie`, `X-Api-Key`, `X-Auth-Token`,
+/// `X-Session-Id`, ...) names *who* is asking, which a shared cache key does
+/// not.
+#[inline]
+pub(crate) fn is_credential_header(name: &str) -> bool {
+    is_sensitive_header(name)
+        && !contains_ignore_ascii_case(name, "csrf")
+        && !contains_ignore_ascii_case(name, "xsrf")
+}
+
+/// `Debug` adapter for a list of header `(name, value)` pairs that applies
+/// [`HeaderMap`]'s redaction rule: sensitive values print as [`REDACTED`],
+/// non-UTF-8 values as `<non-utf8>`. For the request/response shapes outside
+/// `HttpRequest` (arena, batch, pooled) that keep headers in their own
+/// containers.
+pub(crate) struct RedactedHeaders<'a>(pub Vec<(&'a str, &'a [u8])>);
+
+impl fmt::Debug for RedactedHeaders<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_map()
+            .entries(self.0.iter().map(|&(name, value)| {
+                let value = if is_sensitive_header(name) {
+                    REDACTED
+                } else {
+                    std::str::from_utf8(value).unwrap_or("<non-utf8>")
+                };
+                (name, value)
+            }))
+            .finish()
+    }
+}
+
+/// `Debug` stand-in for a payload — a body, a chunk, a serialized
+/// response — that prints `<N bytes>` instead of the bytes. Payloads carry
+/// passwords, tokens and `Set-Cookie` lines, and a `{:?}` in an error path
+/// ends up in logs.
+pub(crate) struct RedactedLen(pub usize);
+
+impl fmt::Debug for RedactedLen {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "<{} bytes>", self.0)
+    }
+}
+
+/// `Debug` adapter for decoded key/value pairs (a parsed query or form):
+/// key names, with each value replaced by its [length](RedactedLen).
+pub(crate) struct RedactedPairs<'a>(pub &'a [(String, String)]);
+
+impl fmt::Debug for RedactedPairs<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_list()
+            .entries(
+                self.0
+                    .iter()
+                    .map(|(k, v)| (k.as_str(), RedactedLen(v.len()))),
+            )
+            .finish()
+    }
+}
+
+/// The grammar [`HeaderMap::host_strict`] accepts: a name of
+/// `[A-Za-z0-9.-]` or a bracketed IPv6 literal, then an optional `:port`.
+fn is_strict_host(host: &[u8]) -> bool {
+    let rest = if let Some(literal) = host.strip_prefix(b"[") {
+        let Some(close) = literal.iter().position(|&b| b == b']') else {
+            return false;
+        };
+        let inner = &literal[..close];
+        if inner.is_empty()
+            || !inner
+                .iter()
+                .all(|b| b.is_ascii_hexdigit() || matches!(b, b':' | b'.'))
+        {
+            return false;
+        }
+        &literal[close + 1..]
+    } else {
+        let end = host.iter().position(|&b| b == b':').unwrap_or(host.len());
+        let name = &host[..end];
+        if name.is_empty()
+            || !name
+                .iter()
+                .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'-'))
+        {
+            return false;
+        }
+        &host[end..]
+    };
+    match rest {
+        [] => true,
+        [b':', digits @ ..] => {
+            (1..=5).contains(&digits.len())
+                && digits.iter().all(u8::is_ascii_digit)
+                && digits
+                    .iter()
+                    .fold(0u32, |n, d| n * 10 + u32::from(d - b'0'))
+                    <= u32::from(u16::MAX)
+        }
+        _ => false,
+    }
+}
+
+/// The part of a request target a `Debug` impl may print: everything before
+/// the `?`. The query string routinely carries tokens.
+#[inline]
+pub(crate) fn path_without_query(target: &str) -> &str {
+    target.split_once('?').map_or(target, |(p, _)| p)
+}
+
+/// Whether an inbound request/correlation ID is safe to adopt and echo back.
+///
+/// IDs taken from `X-Request-ID`, `X-Correlation-ID` and similar headers are
+/// chosen by the client. Reflecting them unchecked lets a caller plant
+/// arbitrary text (control characters, log-forging payloads, oversized
+/// values) in response headers and logs. Only `^[A-Za-z0-9._-]{1,128}$` is
+/// accepted; callers generate a fresh ID for anything else.
+///
+/// ```
+/// use armature_core::headers::is_valid_request_id;
+/// assert!(is_valid_request_id("req-123_abc.DEF"));
+/// assert!(!is_valid_request_id(""));
+/// assert!(!is_valid_request_id("a b"));
+/// assert!(!is_valid_request_id("x\r\nSet-Cookie: y"));
+/// ```
+#[inline]
+pub fn is_valid_request_id(id: &str) -> bool {
+    (1..=128).contains(&id.len())
+        && id
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-'))
 }
 
 impl fmt::Debug for Header {
@@ -565,6 +816,33 @@ impl HeaderMap {
         self.inner.iter().filter_map(|h| h.value_str())
     }
 
+    /// Every value for a header name as raw bytes, including values that are
+    /// not valid UTF-8.
+    ///
+    /// [`get_all`](Self::get_all) skips non-UTF-8 lines, which is the wrong
+    /// answer for a list whose meaning depends on position (such as
+    /// `X-Forwarded-For`, read by counting from the right): a dropped line
+    /// silently shifts every index. Callers that need to see every line, or to
+    /// reject the field when one is unreadable, use this.
+    ///
+    /// ```
+    /// use armature_core::HeaderMap;
+    /// let mut h = HeaderMap::new();
+    /// h.append("X-Forwarded-For", "203.0.113.7");
+    /// h.append("X-Forwarded-For", &b"\xff"[..]);
+    /// assert_eq!(h.get_all("x-forwarded-for").len(), 1);
+    /// assert_eq!(h.get_all_bytes("x-forwarded-for").len(), 2);
+    /// ```
+    #[inline]
+    pub fn get_all_bytes(&self, name: &str) -> Vec<&[u8]> {
+        let needle = Needle::new(name);
+        self.inner
+            .iter()
+            .filter(|h| needle.matches(&h.id))
+            .map(|h| h.value.as_ref())
+            .collect()
+    }
+
     /// Every value for a header name, for multi-value fields.
     #[inline]
     pub fn get_all(&self, name: &str) -> Vec<&str> {
@@ -671,9 +949,40 @@ impl HeaderMap {
     /// picks the origin the request is addressed to, so two disagreeing lines
     /// let this process route or cache under one authority while an upstream
     /// used the other; RFC 9112 §3.2 requires such a message be rejected.
+    ///
+    /// # Untrusted, and not necessarily a plain host name
+    ///
+    /// The server accepts any RFC 3986 `uri-host [":" port]` here (the same
+    /// grammar `armature-h1` enforces), and a `reg-name` may legally contain
+    /// sub-delims (`! $ & ' ( ) * + , ; =`), `_`, `~` and percent-encodings
+    /// (`%3C`). So this value is client-chosen text: never percent-decode it,
+    /// and never reflect it into HTML, a redirect `Location`, or a link
+    /// without escaping. When only a conventional name is acceptable — for
+    /// building absolute URLs, say — use [`host_strict`](Self::host_strict).
     #[inline]
     pub fn host(&self) -> Option<&str> {
         self.unique_str_of(&HeaderId::Host)
+    }
+
+    /// The [`host`](Self::host) value, but only when it is a conventional
+    /// host: a DNS-style name or IPv4 address (`[A-Za-z0-9.-]`), or a
+    /// bracketed IPv6 literal (`[` hex digits, `:` and `.` `]`), optionally
+    /// followed by `:port` (1-5 digits, at most 65535). `None` for anything
+    /// else, including the sub-delims and percent-encodings
+    /// [`host`](Self::host) admits.
+    ///
+    /// ```
+    /// use armature_core::HeaderMap;
+    /// let mut h = HeaderMap::new();
+    /// h.insert("host", "api.example.com:8443");
+    /// assert_eq!(h.host_strict(), Some("api.example.com:8443"));
+    /// h.insert("host", "evil%2Ecom");
+    /// assert_eq!(h.host_strict(), None);
+    /// h.insert("host", "[::1]:80");
+    /// assert_eq!(h.host_strict(), Some("[::1]:80"));
+    /// ```
+    pub fn host_strict(&self) -> Option<&str> {
+        self.host().filter(|h| is_strict_host(h.as_bytes()))
     }
 
     /// Get the `Cookie` header.
@@ -920,6 +1229,171 @@ impl From<HeaderMap> for HashMap<String, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn host_strict_accepts_only_conventional_hosts() {
+        for ok in [
+            "example.com",
+            "a-b.example.com:443",
+            "127.0.0.1",
+            "127.0.0.1:65535",
+            "[::1]",
+            "[2001:db8::1]:8080",
+        ] {
+            assert!(is_strict_host(ok.as_bytes()), "{ok}");
+        }
+        for bad in [
+            "",
+            "evil%2Ecom",
+            "a!b.com",
+            "a$b",
+            "a_b.com",
+            "a~b",
+            "x.com:",
+            "x.com:65536",
+            "x.com:123456",
+            "x.com:8a",
+            "[]",
+            "[::1",
+            "[::1]x",
+            "[zz::1]",
+            "user@x.com",
+            "x.com/path",
+            "x .com",
+        ] {
+            assert!(!is_strict_host(bad.as_bytes()), "{bad}");
+        }
+        let mut h = HeaderMap::new();
+        h.insert("host", "x.com");
+        h.append("host", "y.com");
+        assert_eq!(h.host_strict(), None, "duplicate Host");
+    }
+
+    #[test]
+    fn sensitive_header_list_and_fragments() {
+        for name in [
+            "X-Auth-Token",
+            "x-csrf-token",
+            "X-Amz-Security-Token",
+            "x-goog-api-key",
+            "X-Hub-Signature-256",
+            "Authentication-Info",
+            "X-Session-Token",
+            "X-Client-Secret",
+            "X-Service-ApiKey",
+            "X-Db-Password",
+            "X-Session-Id",
+            "X-Auth-User",
+            "X-Client-Key",
+            "Proxy-Authorization",
+            "X-Forwarded-Client-Cert",
+            "X-SSL-Client-Cert",
+            "X-Remote-User",
+            "Remote-User",
+            "X-MS-Client-Principal",
+            "X-MS-Client-Principal-Name",
+            "Cf-Access-Jwt-Assertion",
+            "X-Goog-IAP-JWT-Assertion",
+            "X-Amzn-OIDC-Data",
+            "X-Amzn-OIDC-Identity",
+            "X-Forwarded-User",
+            "X-Forwarded-Email",
+            // Gateway-asserted identity (Kong, GCP, nginx, Pomerium, Vouch,
+            // Authelia, oauth2-proxy).
+            "X-Consumer-ID",
+            "X-Consumer-Username",
+            "X-Credential-Identifier",
+            "X-Userinfo",
+            "X-Endpoint-API-UserInfo",
+            "X-Apigateway-Api-Userinfo",
+            "X-SSL-Client-S-DN",
+            "X-SSL-Client-Verify",
+            "X-Client-DN",
+            "X-Client-Verify",
+            "X-Pomerium-Claim-Email",
+            "X-Vouch-User",
+            "Remote-Email",
+            "Remote-Groups",
+            "Remote-Name",
+            "X-Forwarded-Groups",
+            "X-Forwarded-Preferred-Username",
+        ] {
+            assert!(is_sensitive_header(name), "{name} must be redacted");
+            let anti_csrf = name.to_ascii_lowercase().contains("srf-");
+            assert_eq!(is_credential_header(name), !anti_csrf, "{name}");
+        }
+        for name in [
+            "content-type",
+            "accept",
+            "x-request-id",
+            "user-agent",
+            "host",
+            "x-forwarded-for",
+            "x-forwarded-proto",
+            "x-forwarded-host",
+            "x-forwarded-port",
+            "x-forwarded-prefix",
+            "forwarded",
+            "x-real-ip",
+            "via",
+            "accept-encoding",
+            "accept-language",
+            "if-none-match",
+            "if-modified-since",
+            "cache-control",
+            "content-length",
+            "origin",
+            "referer",
+            "keep-alive",
+            "remote-addr",
+            "x-remote-addr",
+            "x-remote-ip",
+            "x-client-ip",
+            "true-client-ip",
+            "cf-connecting-ip",
+            "x-cluster-client-ip",
+            "x-original-forwarded-for",
+            "content-encoding",
+            "x-content-type-options",
+            "x-requested-with",
+            "x-correlation-id",
+            "traceparent",
+            "tracestate",
+            "if-match",
+            "range",
+            "te",
+            "upgrade",
+            "dnt",
+        ] {
+            assert!(!is_sensitive_header(name), "{name} is not a credential");
+        }
+
+        // Credential headers for cache purposes: everything sensitive except
+        // anti-CSRF tokens.
+        assert!(is_credential_header("X-Api-Key"));
+        assert!(is_credential_header("X-Auth-Token"));
+        assert!(is_credential_header("cookie"));
+        assert!(!is_credential_header("X-CSRF-Token"));
+        assert!(!is_credential_header("x-xsrf-token"));
+        assert!(!is_credential_header("content-type"));
+        assert!(is_credential_header("X-Forwarded-Client-Cert"));
+        assert!(is_credential_header("X-MS-Client-Principal-Id"));
+        assert!(!is_credential_header("x-forwarded-for"));
+
+        let mut map = HeaderMap::new();
+        map.insert("x-session-token", "s3cret");
+        assert!(!format!("{map:?}").contains("s3cret"));
+    }
+
+    #[test]
+    fn request_id_validation() {
+        assert!(is_valid_request_id("abc-123"));
+        assert!(is_valid_request_id(&"a".repeat(128)));
+        assert!(!is_valid_request_id(&"a".repeat(129)));
+        assert!(!is_valid_request_id(""));
+        assert!(!is_valid_request_id("abc\r\nx: y"));
+        assert!(!is_valid_request_id("<script>"));
+    }
 
     /// H27: credentials never reach a log through `{:?}`.
     #[test]

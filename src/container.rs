@@ -64,7 +64,7 @@ impl Container {
     /// Attach a [`LifecycleManager`] to this container.
     ///
     /// Once attached, providers registered afterward through the provider
-    /// registration path (see [`crate::module::provider_registration`] and
+    /// registration path (see `provider_registration!` and
     /// `armature_proc_macro`'s `#[module(...)]` codegen) are probed for
     /// lifecycle hook trait implementations (`OnModuleInit`,
     /// `OnModuleDestroy`, `OnApplicationBootstrap`, `OnApplicationShutdown`)

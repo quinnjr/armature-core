@@ -46,7 +46,9 @@ use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 // ============================================================================
 
 /// A response item in the pipeline queue.
-#[derive(Debug)]
+///
+/// `Debug` omits `data`: it is the serialized response, headers (including
+/// `Set-Cookie`) and body verbatim.
 pub struct ResponseItem {
     /// Request sequence number (for ordering)
     pub sequence: u64,
@@ -54,6 +56,15 @@ pub struct ResponseItem {
     pub data: Bytes,
     /// Response size in bytes
     pub size: usize,
+}
+
+impl std::fmt::Debug for ResponseItem {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ResponseItem")
+            .field("sequence", &self.sequence)
+            .field("size", &self.size)
+            .finish_non_exhaustive()
+    }
 }
 
 impl ResponseItem {
@@ -887,6 +898,14 @@ pub fn global_pipeline_stats() -> &'static GlobalPipelineStats {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_response_item_debug_omits_data() {
+        let item = ResponseItem::new(3, Bytes::from("Set-Cookie: session=abc123\r\n"));
+        let dbg = format!("{item:?}");
+        assert!(!dbg.contains("abc123"), "{dbg}");
+        assert!(dbg.contains("sequence: 3"), "{dbg}");
+    }
 
     #[test]
     fn test_response_item_creation() {

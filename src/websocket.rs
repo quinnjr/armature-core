@@ -10,13 +10,30 @@ use tokio_tungstenite::tungstenite::Message as WsMessage;
 use tracing::Instrument;
 
 /// WebSocket message type
-#[derive(Debug, Clone)]
+///
+/// `Debug` shows each frame's kind and length, never its payload: messages
+/// carry chat text, tokens and other user data, and a `{:?}` in a log line or
+/// error message should not copy them into logs.
+#[derive(Clone)]
 pub enum WebSocketMessage {
     Text(String),
     Binary(Vec<u8>),
     Ping(Vec<u8>),
     Pong(Vec<u8>),
     Close,
+}
+
+impl std::fmt::Debug for WebSocketMessage {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let (kind, len) = match self {
+            Self::Text(text) => ("Text", text.len()),
+            Self::Binary(data) => ("Binary", data.len()),
+            Self::Ping(data) => ("Ping", data.len()),
+            Self::Pong(data) => ("Pong", data.len()),
+            Self::Close => return f.write_str("Close"),
+        };
+        f.debug_struct(kind).field("len", &len).finish()
+    }
 }
 
 impl From<WsMessage> for WebSocketMessage {
@@ -123,7 +140,7 @@ impl WebSocketRoom {
 
         if !dead.is_empty() {
             let mut connections = self.connections.write().await;
-            connections.retain(|id, _| !dead.contains(id));
+            reap_closed(&mut connections, &dead);
         }
 
         Ok(())
@@ -144,18 +161,120 @@ impl WebSocketRoom {
     }
 }
 
+/// Remove the connections in `dead` from `connections`, looking each up rather
+/// than scanning the room once per dead id (which was O(room × dead) under the
+/// write lock), and only if its sender is still closed: between the read lock
+/// the failed sends were seen under and this write lock, the same id may have
+/// rejoined with a live sender, which must not be dropped.
+fn reap_closed(
+    connections: &mut HashMap<String, broadcast::Sender<WebSocketMessage>>,
+    dead: &[String],
+) {
+    for id in dead {
+        if connections
+            .get(id)
+            .is_some_and(|tx| tx.receiver_count() == 0)
+        {
+            connections.remove(id);
+        }
+    }
+}
+
 /// WebSocket manager for handling multiple rooms
+///
+/// Room names usually come from clients, so a manager that only ever adds
+/// rooms grows without bound. Prefer [`join_room`](Self::join_room) /
+/// [`leave_room`](Self::leave_room), which create a room on first join, drop
+/// it when its last connection leaves, and respect the
+/// [`with_max_rooms`](Self::with_max_rooms) cap. Joins and leaves are
+/// serialized on the manager's lock, so a room is never dropped while a
+/// concurrent join through the manager is adding to it.
 pub struct WebSocketManager {
     rooms: Arc<RwLock<HashMap<String, Arc<WebSocketRoom>>>>,
+    max_rooms: Option<usize>,
 }
 
 impl WebSocketManager {
+    /// A manager with **no cap** on the number of rooms. Room names usually
+    /// come from clients, so anything reachable by them should use
+    /// [`with_max_rooms`](Self::with_max_rooms).
     pub fn new() -> Self {
         Self {
             rooms: Arc::new(RwLock::new(HashMap::new())),
+            max_rooms: None,
         }
     }
 
+    /// Cap the number of live rooms. [`join_room`](Self::join_room) refuses to
+    /// create a room beyond it (joining an existing room is always allowed).
+    pub fn with_max_rooms(mut self, max_rooms: usize) -> Self {
+        self.max_rooms = Some(max_rooms);
+        self
+    }
+
+    /// Add a connection to `room`, creating the room if needed.
+    ///
+    /// Fails with [`Error::ServiceUnavailable`] when the room does not exist
+    /// and the [`with_max_rooms`](Self::with_max_rooms) cap is reached.
+    pub async fn join_room(
+        &self,
+        room: &str,
+        connection_id: String,
+        tx: broadcast::Sender<WebSocketMessage>,
+    ) -> Result<Arc<WebSocketRoom>, Error> {
+        let mut rooms = self.rooms.write().await;
+        let handle = match rooms.get(room) {
+            Some(existing) => existing.clone(),
+            None => {
+                if self.max_rooms.is_some_and(|max| rooms.len() >= max) {
+                    return Err(Error::ServiceUnavailable(
+                        "WebSocket room limit reached".to_string(),
+                    ));
+                }
+                let created = Arc::new(WebSocketRoom::new(room.to_string()));
+                rooms.insert(room.to_string(), created.clone());
+                created
+            }
+        };
+        handle.add_connection(connection_id, tx).await;
+        Ok(handle)
+    }
+
+    /// Remove a connection from `room`, dropping the room once it is empty.
+    pub async fn leave_room(&self, room: &str, connection_id: &str) {
+        let mut rooms = self.rooms.write().await;
+        if let Some(handle) = rooms.get(room).cloned() {
+            handle.remove_connection(connection_id).await;
+            if handle.connection_count().await == 0 {
+                rooms.remove(room);
+            }
+        }
+    }
+
+    /// Drop every room that has no connections left.
+    pub async fn prune_empty_rooms(&self) {
+        let mut rooms = self.rooms.write().await;
+        let mut empty = Vec::new();
+        for (name, room) in rooms.iter() {
+            if room.connection_count().await == 0 {
+                empty.push(name.clone());
+            }
+        }
+        for name in empty {
+            rooms.remove(&name);
+        }
+    }
+
+    /// Number of live rooms.
+    pub async fn room_count(&self) -> usize {
+        self.rooms.read().await.len()
+    }
+
+    /// Get a room, creating it if absent.
+    ///
+    /// Not subject to [`with_max_rooms`](Self::with_max_rooms) and never
+    /// removes rooms; with client-chosen names use
+    /// [`join_room`](Self::join_room) / [`leave_room`](Self::leave_room).
     pub async fn get_or_create_room(&self, name: &str) -> Arc<WebSocketRoom> {
         let mut rooms = self.rooms.write().await;
         rooms
@@ -181,11 +300,89 @@ impl Default for WebSocketManager {
     }
 }
 
+/// Recommended limits for a server-side WebSocket: 1 MiB per message and
+/// 64 KiB per frame.
+///
+/// tungstenite's defaults allow 64 MiB messages, so a peer can make the server
+/// buffer that much per connection. Pass this (or a tuned copy) when
+/// accepting, e.g. `tokio_tungstenite::accept_async_with_config(io,
+/// Some(recommended_config()))` or `WebSocketStream::from_raw_socket(io,
+/// Role::Server, Some(recommended_config()))`.
+pub fn recommended_config() -> tokio_tungstenite::tungstenite::protocol::WebSocketConfig {
+    tokio_tungstenite::tungstenite::protocol::WebSocketConfig::default()
+        .max_message_size(Some(1 << 20))
+        .max_frame_size(Some(64 << 10))
+}
+
+/// Whether the upgrade request's `Origin` header is in `allowed_origins`.
+///
+/// Browsers attach cookies to cross-site WebSocket handshakes and the same-
+/// origin policy does not apply to them, so a server relying on cookie auth
+/// must check `Origin` before upgrading (cross-site WebSocket hijacking).
+/// Origins are compared ASCII-case-insensitively as whole serialized origins
+/// (`scheme://host[:port]`, no trailing slash). A request without `Origin` is
+/// rejected: every browser sends it on a WebSocket handshake, so only
+/// non-browser clients omit it, and those should authenticate by other means.
+///
+/// ```
+/// use armature_core::HttpRequest;
+/// use armature_core::websocket::is_origin_allowed;
+///
+/// let mut req = HttpRequest::new("GET", "/ws");
+/// req.headers.insert("Origin", "https://app.example.com");
+/// assert!(is_origin_allowed(&req, &["https://app.example.com"]));
+/// assert!(!is_origin_allowed(&req, &["https://evil.example"]));
+/// ```
+pub fn is_origin_allowed(req: &crate::HttpRequest, allowed_origins: &[&str]) -> bool {
+    let Some(origin) = req.headers.get("origin").map(str::trim) else {
+        return false;
+    };
+    allowed_origins
+        .iter()
+        .any(|allowed| allowed.eq_ignore_ascii_case(origin))
+}
+
+/// Options for [`handle_websocket_with_options`].
+#[derive(Debug, Clone, Default)]
+pub struct WebSocketOptions {
+    /// Close the connection when no message (data, ping or pong) arrives from
+    /// the peer for this long. `None` (the `Default`) waits forever, which
+    /// lets idle or half-open peers hold a connection and its task
+    /// indefinitely; [`handle_websocket`] uses [`DEFAULT_WEBSOCKET_IDLE_TIMEOUT`].
+    pub idle_timeout: Option<std::time::Duration>,
+}
+
+impl WebSocketOptions {
+    /// Set the idle timeout.
+    pub fn idle_timeout(mut self, timeout: std::time::Duration) -> Self {
+        self.idle_timeout = Some(timeout);
+        self
+    }
+}
+
+/// How long [`handle_websocket`] waits for any message (data, ping or pong)
+/// before closing the connection as idle.
+///
+/// Long enough for any client that sends application- or protocol-level
+/// keep-alives (browsers' and most libraries' are well under a minute), short
+/// enough that a half-open or deliberately silent peer cannot hold a
+/// connection and its task forever.
+pub const DEFAULT_WEBSOCKET_IDLE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(300);
+
+/// How long the closing handshake may take before the connection is simply
+/// dropped. `close` flushes the Close frame and waits for the peer's reply, so
+/// a peer that stops reading would otherwise hold the task in teardown.
+const CLOSE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
 /// Handle a WebSocket connection
+///
+/// Closes the connection after [`DEFAULT_WEBSOCKET_IDLE_TIMEOUT`] without a message
+/// from the peer; see [`handle_websocket_with_options`] to choose another
+/// timeout (or none).
 ///
 /// `connection_id` is not fed into `armature_core::connection_manager` —
 /// that module tracks connections under its own internally generated
-/// [`connection_manager::ConnectionId`] (`u64`) for buffer/keep-alive
+/// [`ConnectionId`](crate::connection_manager::ConnectionId) (`u64`) for buffer/keep-alive
 /// tuning, and is itself not wired into any built-in server (see its
 /// module docs). There is no registry keyed by an externally supplied
 /// `String` id for this module to join. Instead, `connection_id` is
@@ -207,11 +404,39 @@ where
     // a guard held across an `.await` stays on the thread while this task is
     // suspended, so every other task scheduled onto that thread would be
     // logged under this connection_id.
-    handle_connection(stream, handler).instrument(span).await
+    handle_connection(
+        stream,
+        WebSocketOptions::default().idle_timeout(DEFAULT_WEBSOCKET_IDLE_TIMEOUT),
+        handler,
+    )
+    .instrument(span)
+    .await
+}
+
+/// [`handle_websocket`] with [`WebSocketOptions`] (e.g. an idle timeout).
+///
+/// On idle timeout the handler is sent [`WebSocketMessage::Close`] for
+/// teardown, the closing handshake is attempted, and `Ok(())` is returned.
+pub async fn handle_websocket_with_options<S, F, Fut>(
+    stream: WebSocketStream<S>,
+    connection_id: String,
+    options: WebSocketOptions,
+    handler: F,
+) -> Result<(), Error>
+where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+    F: FnMut(WebSocketMessage) -> Fut,
+    Fut: std::future::Future<Output = Result<(), Error>>,
+{
+    let span = tracing::info_span!("websocket_connection", connection_id = %connection_id);
+    handle_connection(stream, options, handler)
+        .instrument(span)
+        .await
 }
 
 async fn handle_connection<S, F, Fut>(
     mut stream: WebSocketStream<S>,
+    options: WebSocketOptions,
     mut handler: F,
 ) -> Result<(), Error>
 where
@@ -220,7 +445,20 @@ where
     Fut: std::future::Future<Output = Result<(), Error>>,
 {
     // Handle incoming messages
-    while let Some(msg) = stream.next().await {
+    loop {
+        let next = match options.idle_timeout {
+            Some(limit) => match tokio::time::timeout(limit, stream.next()).await {
+                Ok(next) => next,
+                Err(_) => {
+                    tracing::debug!("WebSocket idle timeout; closing");
+                    let teardown = handler(WebSocketMessage::Close).await;
+                    let _ = tokio::time::timeout(CLOSE_TIMEOUT, stream.close(None)).await;
+                    return teardown;
+                }
+            },
+            None => stream.next().await,
+        };
+        let Some(msg) = next else { break };
         match msg {
             Ok(msg) => {
                 if msg.is_close() {
@@ -232,21 +470,25 @@ where
                     // clean close. A failure means the peer is already gone,
                     // which is exactly the state we are heading for anyway.
                     let teardown = handler(WebSocketMessage::Close).await;
-                    let _ = stream.close(None).await;
+                    let _ = tokio::time::timeout(CLOSE_TIMEOUT, stream.close(None)).await;
                     if let Err(e) = teardown {
-                        tracing::error!(error = %e, "WebSocket handler error");
+                        tracing::error!(error = %e.log_display(), "WebSocket handler error");
                         return Err(e);
                     }
                     return Ok(());
                 }
                 let ws_msg: WebSocketMessage = msg.into();
                 if let Err(e) = handler(ws_msg).await {
-                    tracing::error!(error = %e, "WebSocket handler error");
+                    tracing::error!(error = %e.log_display(), "WebSocket handler error");
                     return Err(e);
                 }
             }
             Err(e) => {
-                tracing::error!(error = %e, "WebSocket error");
+                // A peer that drops without a close frame, sends a bad frame
+                // or an oversized message: the client's doing, and one any
+                // client can repeat at will, so not a server `error!` (which
+                // stays for handler failures above).
+                tracing::debug!(error = %e, "WebSocket protocol error");
                 return Err(Error::Internal(format!("WebSocket protocol error: {e}")));
             }
         }
@@ -273,6 +515,65 @@ mod tests {
         let client = WebSocketStream::from_raw_socket(client_io, Role::Client, None).await;
         let server = WebSocketStream::from_raw_socket(server_io, Role::Server, None).await;
         (client, server)
+    }
+
+    #[tokio::test]
+    async fn manager_drops_empty_rooms_and_caps_creation() {
+        let manager = WebSocketManager::new().with_max_rooms(1);
+        let (conn, _rx) = WebSocketConnection::new("c1".into());
+        manager
+            .join_room("a", "c1".into(), conn.tx.clone())
+            .await
+            .unwrap();
+        assert!(
+            manager
+                .join_room("b", "c1".into(), conn.tx.clone())
+                .await
+                .is_err(),
+            "a new room beyond the cap must be refused"
+        );
+        manager
+            .join_room("a", "c2".into(), conn.tx.clone())
+            .await
+            .unwrap();
+
+        manager.leave_room("a", "c1").await;
+        assert_eq!(manager.room_count().await, 1);
+        manager.leave_room("a", "c2").await;
+        assert_eq!(manager.room_count().await, 0, "empty room must be dropped");
+
+        manager.get_or_create_room("x").await;
+        manager.prune_empty_rooms().await;
+        assert_eq!(manager.room_count().await, 0);
+    }
+
+    #[tokio::test]
+    async fn idle_timeout_closes_connection() {
+        let (_client, server) = socket_pair().await;
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            handle_websocket_with_options(
+                server,
+                "idle".into(),
+                WebSocketOptions::default().idle_timeout(std::time::Duration::from_millis(50)),
+                |_msg| async { Ok(()) },
+            ),
+        )
+        .await
+        .expect("an idle connection must be closed by the idle timeout");
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn origin_allowlist() {
+        let mut req = crate::HttpRequest::new("GET", "/ws");
+        assert!(!is_origin_allowed(&req, &["https://a.example"]));
+        req.headers.insert("Origin", "HTTPS://A.example");
+        assert!(is_origin_allowed(&req, &["https://a.example"]));
+        assert!(!is_origin_allowed(&req, &["https://a.example.evil"]));
+        let cfg = recommended_config();
+        assert_eq!(cfg.max_message_size, Some(1 << 20));
+        assert_eq!(cfg.max_frame_size, Some(64 << 10));
     }
 
     #[test]
@@ -414,6 +715,32 @@ mod tests {
         assert!(matches!(rx1.recv().await.unwrap(), WebSocketMessage::Text(t) if t == "hi"));
     }
 
+    /// The race: an id seen dead under the read lock may have rejoined with
+    /// a live sender by the time the write lock is taken. Only a sender that
+    /// is still closed is reaped.
+    #[test]
+    fn reaping_keeps_a_connection_that_rejoined() {
+        let (gone, _) = broadcast::channel::<WebSocketMessage>(1);
+        let (rejoined, _rx) = broadcast::channel(1);
+        let mut connections =
+            HashMap::from([("c1".to_string(), gone), ("c2".to_string(), rejoined)]);
+        reap_closed(&mut connections, &["c1".to_string(), "c2".to_string()]);
+        assert!(!connections.contains_key("c1"));
+        assert!(connections.contains_key("c2"), "a live sender was dropped");
+    }
+
+    #[test]
+    fn message_debug_shows_lengths_not_payloads() {
+        let rendered = format!(
+            "{:?} {:?} {:?}",
+            WebSocketMessage::Text("secret-token".to_string()),
+            WebSocketMessage::Binary(vec![1, 2, 3]),
+            WebSocketMessage::Close
+        );
+        assert!(!rendered.contains("secret"), "{rendered}");
+        assert_eq!(rendered, "Text { len: 12 } Binary { len: 3 } Close");
+    }
+
     #[tokio::test]
     async fn handle_websocket_delivers_messages_in_order_then_closes() {
         let (mut client, server) = socket_pair().await;
@@ -475,6 +802,55 @@ mod tests {
         }
         // Consumption stops at the first failure: "two" is never handled.
         assert_eq!(seen.lock().unwrap().len(), 1);
+    }
+
+    /// Levels of the events emitted while the returned guard is held (on
+    /// this thread, which a current-thread `#[tokio::test]` stays on).
+    fn capture_levels() -> (
+        Arc<Mutex<Vec<tracing::Level>>>,
+        tracing::subscriber::DefaultGuard,
+    ) {
+        use tracing_subscriber::layer::SubscriberExt;
+
+        struct Levels(Arc<Mutex<Vec<tracing::Level>>>);
+        impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for Levels {
+            fn on_event(
+                &self,
+                event: &tracing::Event<'_>,
+                _: tracing_subscriber::layer::Context<'_, S>,
+            ) {
+                self.0.lock().unwrap().push(*event.metadata().level());
+            }
+        }
+        let levels = Arc::new(Mutex::new(Vec::new()));
+        let subscriber = tracing_subscriber::registry().with(Levels(Arc::clone(&levels)));
+        let guard = tracing::subscriber::set_default(subscriber);
+        // Callsite interest is cached process-wide; a parallel test may have
+        // cached "never" for these callsites before this subscriber existed.
+        tracing::callsite::rebuild_interest_cache();
+        (levels, guard)
+    }
+
+    /// A peer that vanishes without a closing handshake is the client's
+    /// doing, not a server fault: it is logged below `error`, so clients
+    /// cannot flood the error log (or page someone) at will.
+    ///
+    /// Only this test reaches the protocol-error callsite, so its interest
+    /// is computed with the capturing subscriber in place. (A matching test
+    /// for the handler-error `error!` would share that callsite with
+    /// `handle_websocket_stops_and_reports_handler_error` on another thread
+    /// and race tracing's global interest cache.)
+    #[tokio::test]
+    async fn peer_protocol_error_is_not_logged_as_error() {
+        let (levels, _guard) = capture_levels();
+        let (client, server) = socket_pair().await;
+        drop(client);
+
+        let result = handle_websocket(server, "gone".to_string(), |_msg| async { Ok(()) }).await;
+        assert!(result.is_err(), "{result:?}");
+        let levels = levels.lock().unwrap();
+        assert!(!levels.is_empty());
+        assert!(!levels.contains(&tracing::Level::ERROR), "{levels:?}");
     }
 
     #[tokio::test]

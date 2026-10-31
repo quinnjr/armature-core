@@ -3,10 +3,11 @@
 use crate::logging::{debug, error, info, trace};
 use crate::{Error, HttpRequest, HttpResponse};
 use async_trait::async_trait;
+use std::borrow::Cow;
 use std::collections::HashMap;
 use std::future::Future;
 use std::pin::Pin;
-use std::sync::Arc;
+use std::sync::{Arc, LazyLock};
 
 /// Type alias for the next handler in the middleware chain
 pub type Next = Box<
@@ -26,6 +27,51 @@ pub type HandlerFn = Arc<
 pub trait Middleware: Send + Sync {
     /// Process the request and optionally pass to next middleware
     async fn handle(&self, req: HttpRequest, next: Next) -> Result<HttpResponse, Error>;
+
+    /// Decorate the response the application rendered from an error.
+    ///
+    /// When the pipeline ends in an `Err`, the error propagates out of
+    /// [`handle`](Self::handle) untouched, so the application's exception
+    /// filters see it; the filters (or, without one that handles it, the
+    /// default [`Error::to_client_response`]) then render the response. That
+    /// final response is passed here, so a middleware that adds headers on
+    /// its `Ok` path (security headers, CORS) can add them to error responses
+    /// too without turning the error into an `Ok` and hiding it from the
+    /// filters.
+    ///
+    /// Called by `Application` on every **global** middleware
+    /// ([`Application::use_middleware`](crate::Application::use_middleware)),
+    /// innermost first, so an outer middleware's header wins as it does on the
+    /// `Ok` path, and whichever middleware or handler raised the error.
+    /// Route-scoped middleware is not called: an error leaving a route is
+    /// decorated by the global middleware only.
+    ///
+    /// The default does nothing, so implementing it is optional.
+    fn decorate_error_response(&self, ctx: &ErrorResponseContext<'_>, response: &mut HttpResponse) {
+        let _ = (ctx, response);
+    }
+}
+
+/// What [`Middleware::decorate_error_response`] knows about the request whose
+/// error is being rendered.
+///
+/// The request itself has been consumed by the pipeline by then; this carries
+/// what is still available without keeping a copy of every request on the
+/// success path.
+#[derive(Debug, Clone, Copy)]
+#[non_exhaustive]
+pub struct ErrorResponseContext<'a> {
+    /// The request method.
+    pub method: &'a crate::Method,
+    /// The request path, without the query string.
+    pub path: &'a str,
+}
+
+impl<'a> ErrorResponseContext<'a> {
+    /// The context for a request to `method` `path` (query string excluded).
+    pub fn new(method: &'a crate::Method, path: &'a str) -> Self {
+        Self { method, path }
+    }
 }
 
 /// Middleware chain executor
@@ -56,6 +102,18 @@ impl MiddlewareChain {
     /// Whether the chain has no middleware.
     pub fn is_empty(&self) -> bool {
         self.middlewares.is_empty()
+    }
+
+    /// Let every middleware in the chain decorate a response rendered from an
+    /// error, innermost first (see [`Middleware::decorate_error_response`]).
+    pub fn decorate_error_response(
+        &self,
+        ctx: &ErrorResponseContext<'_>,
+        response: &mut HttpResponse,
+    ) {
+        for middleware in self.middlewares.iter().rev() {
+            middleware.decorate_error_response(ctx, response);
+        }
     }
 
     /// Execute the middleware chain with a handler
@@ -120,6 +178,12 @@ impl Default for MiddlewareChain {
 /// is set, because that pair is invalid and browsers reject it. For a list of
 /// origins, reflection, or regex matching use `armature-security`'s CORS, or
 /// [`crate::micro::Cors`].
+///
+/// Error responses carry the CORS headers too, so the allowed origin can read
+/// why a request was rejected: a downstream `Err` still propagates as an
+/// `Err` (exception filters see it), and when this is global middleware the
+/// application adds the headers to the response rendered from it (see
+/// [`Middleware::decorate_error_response`]).
 pub struct CorsMiddleware {
     pub allow_origin: String,
     pub allow_methods: String,
@@ -206,21 +270,39 @@ impl Middleware for CorsMiddleware {
             return Ok(HttpResponse::with_status_and_headers(204, headers));
         }
 
-        // Process request and add CORS headers to response
+        // Process request and add CORS headers to response. An error goes on
+        // as an `Err`, for the exception filters; the response rendered from
+        // it is decorated in `decorate_error_response`.
         let mut response = next(req).await?;
+        self.apply(&mut response);
+        Ok(response)
+    }
 
+    /// Without the headers a browser hides a 4xx body (why the request was
+    /// rejected) from the allowed origin.
+    fn decorate_error_response(
+        &self,
+        _ctx: &ErrorResponseContext<'_>,
+        response: &mut HttpResponse,
+    ) {
+        self.apply(response);
+    }
+}
+
+impl CorsMiddleware {
+    /// The CORS headers of an actual (non-preflight) response.
+    fn apply(&self, response: &mut HttpResponse) {
         response.headers.insert(
             "Access-Control-Allow-Origin".to_string(),
             self.allow_origin.clone(),
         );
-        if credentials {
+        // Credentials never go out with a wildcard origin.
+        if self.allow_credentials && self.allow_origin.trim() != "*" {
             response.headers.insert(
                 "Access-Control-Allow-Credentials".to_string(),
                 "true".to_string(),
             );
         }
-
-        Ok(response)
     }
 }
 
@@ -296,13 +378,27 @@ impl Middleware for LoggerMiddleware {
                     "response sent"
                 );
             }
-            Err(e) => {
+            // A client can produce 4xx at will (no credentials, a bad
+            // parameter, an unknown path); logging those at `error` lets any
+            // peer flood the error log or page someone. Only server faults
+            // are errors.
+            Err(e) if e.status_code() >= 500 => {
                 error!(
                     method = %method,
                     path = %path,
-                    error = %e,
+                    error = %e.log_display(),
                     duration_ms = duration.as_millis(),
                     "request failed"
+                );
+            }
+            Err(e) => {
+                debug!(
+                    method = %method,
+                    path = %path,
+                    status = e.status_code(),
+                    error = %e.log_display(),
+                    duration_ms = duration.as_millis(),
+                    "request rejected"
                 );
             }
         }
@@ -318,9 +414,12 @@ pub struct RequestIdMiddleware;
 impl Middleware for RequestIdMiddleware {
     async fn handle(&self, mut req: HttpRequest, next: Next) -> Result<HttpResponse, Error> {
         // Generate or use existing request ID
+        // A client-supplied ID is reflected into the response, so it is only
+        // reused when well-formed; anything else is replaced with a fresh one.
         let request_id = req
             .headers
             .get("x-request-id")
+            .filter(|id| crate::headers::is_valid_request_id(id))
             .map(str::to_owned)
             .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
 
@@ -364,32 +463,170 @@ impl Middleware for BodySizeLimitMiddleware {
 // Re-exported from crate::timeout::{TimeoutMiddleware, ConfigurableTimeoutMiddleware, TimeoutConfig}
 
 /// Security headers middleware
+///
+/// By default sets `Strict-Transport-Security`, `X-Content-Type-Options:
+/// nosniff`, `X-Frame-Options: DENY`, `X-XSS-Protection: 0` and
+/// `Referrer-Policy: strict-origin-when-cross-origin`. Any of them can be
+/// replaced ([`with_header`](Self::with_header) and the typed helpers) or
+/// dropped ([`without`](Self::without)); a `Content-Security-Policy` or
+/// `Cross-Origin-Opener-Policy` is added only when configured, since a policy
+/// that fits one application breaks another.
+///
+/// `X-XSS-Protection` is sent as `0` (filter off), per OWASP: the legacy
+/// browser XSS auditor that `1; mode=block` switched on could itself be
+/// abused to detect or block page content cross-site (XS-leaks), and modern
+/// browsers have removed it. Use a `Content-Security-Policy` instead.
+///
+/// The headers go on error responses too, because a 401/403/404/500 page is
+/// as framable and sniffable as any other: a downstream `Err` still
+/// propagates as an `Err` (exception filters see it), and when this is global
+/// middleware the application applies the headers to the response rendered
+/// from it (see [`Middleware::decorate_error_response`]).
+#[derive(Debug, Clone)]
 pub struct SecurityHeadersMiddleware {
-    hsts_enabled: bool,
-    nosniff_enabled: bool,
-    xss_protection_enabled: bool,
-    frame_options: Option<String>,
+    /// `(name, value)` pairs in the order they are applied; names are unique
+    /// ignoring ASCII case.
+    headers: Vec<(String, String)>,
 }
+
+const HSTS_HEADER: &str = "Strict-Transport-Security";
+const HSTS_DEFAULT: &str = "max-age=31536000; includeSubDomains";
 
 impl SecurityHeadersMiddleware {
     pub fn new() -> Self {
+        let headers = [
+            (HSTS_HEADER, HSTS_DEFAULT),
+            ("X-Content-Type-Options", "nosniff"),
+            ("X-XSS-Protection", "0"),
+            ("X-Frame-Options", "DENY"),
+            // Full URLs (paths and query strings, which can carry tokens)
+            // must not leak to other origins through `Referer`.
+            ("Referrer-Policy", "strict-origin-when-cross-origin"),
+        ];
         Self {
-            hsts_enabled: true,
-            nosniff_enabled: true,
-            xss_protection_enabled: true,
-            frame_options: Some("DENY".to_string()),
+            headers: headers
+                .into_iter()
+                .map(|(name, value)| (name.to_string(), value.to_string()))
+                .collect(),
         }
     }
 
-    pub fn with_hsts(mut self, enabled: bool) -> Self {
-        self.hsts_enabled = enabled;
+    pub fn with_hsts(self, enabled: bool) -> Self {
+        if enabled {
+            self.with_header(HSTS_HEADER, HSTS_DEFAULT)
+        } else {
+            self.without(HSTS_HEADER)
+        }
+    }
+
+    /// Set `X-Frame-Options`.
+    ///
+    /// # Panics
+    ///
+    /// As [`with_header`](Self::with_header), on a value that is not a valid
+    /// header value.
+    pub fn with_frame_options(self, value: &str) -> Self {
+        self.with_header("X-Frame-Options", value)
+    }
+
+    /// Set `Referrer-Policy` (default `strict-origin-when-cross-origin`).
+    ///
+    /// # Panics
+    ///
+    /// As [`with_header`](Self::with_header).
+    pub fn with_referrer_policy(self, value: &str) -> Self {
+        self.with_header("Referrer-Policy", value)
+    }
+
+    /// Set `Content-Security-Policy` (not sent by default).
+    ///
+    /// # Panics
+    ///
+    /// As [`with_header`](Self::with_header).
+    pub fn with_content_security_policy(self, value: &str) -> Self {
+        self.with_header("Content-Security-Policy", value)
+    }
+
+    /// Set `Cross-Origin-Opener-Policy` (not sent by default).
+    ///
+    /// # Panics
+    ///
+    /// As [`with_header`](Self::with_header).
+    pub fn with_cross_origin_opener_policy(self, value: &str) -> Self {
+        self.with_header("Cross-Origin-Opener-Policy", value)
+    }
+
+    /// Set `name: value` on every response, replacing a configured header of
+    /// the same name (ignoring case).
+    ///
+    /// # Panics
+    ///
+    /// If `name` is not an HTTP token or `value` contains a control character
+    /// (CR, LF, NUL, ...). This is configuration, checked once at startup:
+    /// failing there beats emitting a split or rejected header on every
+    /// response. Use [`try_with_header`](Self::try_with_header) to handle it.
+    pub fn with_header(self, name: &str, value: &str) -> Self {
+        match self.try_with_header(name, value) {
+            Ok(this) => this,
+            Err(err) => panic!("SecurityHeadersMiddleware: {err}"),
+        }
+    }
+
+    /// [`with_header`](Self::with_header), returning an error instead of
+    /// panicking on an invalid name or value.
+    pub fn try_with_header(mut self, name: &str, value: &str) -> Result<Self, Error> {
+        validate_header(name, value)?;
+        self.headers
+            .retain(|(existing, _)| !existing.eq_ignore_ascii_case(name));
+        self.headers.push((name.to_string(), value.to_string()));
+        Ok(self)
+    }
+
+    /// Stop sending `name` (ignoring case), e.g. `X-XSS-Protection` or
+    /// `X-Content-Type-Options`.
+    pub fn without(mut self, name: &str) -> Self {
+        self.headers
+            .retain(|(existing, _)| !existing.eq_ignore_ascii_case(name));
         self
     }
 
-    pub fn with_frame_options(mut self, value: &str) -> Self {
-        self.frame_options = Some(value.to_string());
-        self
+    fn apply(&self, response: &mut HttpResponse) {
+        for (name, value) in &self.headers {
+            set_header(response, name, value);
+        }
     }
+}
+
+/// Reject a header line that would be malformed or split on the wire: the name
+/// must be an RFC 9110 token, the value free of control characters other than
+/// horizontal tab.
+fn validate_header(name: &str, value: &str) -> Result<(), Error> {
+    let token = |b: u8| b.is_ascii_alphanumeric() || b"!#$%&'*+-.^_`|~".contains(&b);
+    if name.is_empty() || !name.bytes().all(token) {
+        return Err(Error::Internal(format!("invalid header name {name:?}")));
+    }
+    if value.chars().any(|c| c.is_control() && c != '\t') {
+        return Err(Error::Internal(format!(
+            "invalid value for header {name}: contains a control character"
+        )));
+    }
+    Ok(())
+}
+
+/// Set `name` on `response`, dropping any other casing of it first: response
+/// header keys are case-sensitive here, and two casings would go out as two
+/// header lines.
+fn set_header(response: &mut HttpResponse, name: &str, value: &str) {
+    let stale: Vec<String> = response
+        .headers
+        .iter()
+        .filter(|(existing, _)| existing.as_str() != name && existing.eq_ignore_ascii_case(name))
+        .map(|(existing, _)| existing.clone())
+        .collect();
+    for existing in stale {
+        response.headers.remove(&existing);
+    }
+    response.headers.insert(name.to_string(), value.to_string());
 }
 
 impl Default for SecurityHeadersMiddleware {
@@ -401,34 +638,19 @@ impl Default for SecurityHeadersMiddleware {
 #[async_trait]
 impl Middleware for SecurityHeadersMiddleware {
     async fn handle(&self, req: HttpRequest, next: Next) -> Result<HttpResponse, Error> {
+        // An error goes on as an `Err`, for the exception filters; the
+        // response rendered from it is decorated below.
         let mut response = next(req).await?;
-
-        if self.hsts_enabled {
-            response.headers.insert(
-                "Strict-Transport-Security".to_string(),
-                "max-age=31536000; includeSubDomains".to_string(),
-            );
-        }
-
-        if self.nosniff_enabled {
-            response
-                .headers
-                .insert("X-Content-Type-Options".to_string(), "nosniff".to_string());
-        }
-
-        if self.xss_protection_enabled {
-            response
-                .headers
-                .insert("X-XSS-Protection".to_string(), "1; mode=block".to_string());
-        }
-
-        if let Some(frame_opts) = &self.frame_options {
-            response
-                .headers
-                .insert("X-Frame-Options".to_string(), frame_opts.clone());
-        }
-
+        self.apply(&mut response);
         Ok(response)
+    }
+
+    fn decorate_error_response(
+        &self,
+        _ctx: &ErrorResponseContext<'_>,
+        response: &mut HttpResponse,
+    ) {
+        self.apply(response);
     }
 }
 
@@ -441,9 +663,48 @@ impl Middleware for SecurityHeadersMiddleware {
 /// survives. Small bodies, bodies that are already content-encoded, and
 /// clients that do not accept gzip are passed through unchanged (but still
 /// gain `Vary`).
+///
+/// # BREACH
+///
+/// Compressing a response that reflects attacker-influenced input next to a
+/// secret (a CSRF token, a session ID) lets an attacker who can observe
+/// ciphertext lengths recover the secret byte by byte (BREACH). By default
+/// this middleware therefore leaves uncompressed any response that looks
+/// secret-bearing: one that sets a cookie (`Set-Cookie`) or is marked
+/// `Cache-Control: no-store` or `private`. Override the decision with
+/// [`skip_when`](Self::skip_when); routes that echo user input alongside
+/// secrets in an ordinary cacheable response still need application-level
+/// mitigation (e.g. per-response masking of CSRF tokens).
 pub struct CompressionMiddleware {
     min_size: usize,
     level: crate::micro::CompressionLevel,
+    skip: CompressionSkip,
+}
+
+type CompressionSkip = Arc<dyn Fn(&HttpResponse) -> bool + Send + Sync>;
+
+/// The default BREACH heuristic: skip responses that carry a cookie or are
+/// marked non-shareable, which is where per-user secrets live.
+///
+/// Cookies count wherever they are: `HttpResponse::cookie`/`set_cookie`/
+/// `cookie_raw` put them in `response.cookies`, not in `headers`, and that is
+/// the usual way a session cookie gets set. A directive is matched on its
+/// name alone, so `private="Set-Cookie"` and `no-store=...` count too. Same
+/// rule as the micro server's compression path.
+pub fn is_likely_secret_bearing(response: &HttpResponse) -> bool {
+    if !response.cookies.is_empty() {
+        return true;
+    }
+    response.headers.iter().any(|(name, value)| {
+        if name.eq_ignore_ascii_case("set-cookie") {
+            return true;
+        }
+        name.eq_ignore_ascii_case("cache-control")
+            && value.split(',').any(|directive| {
+                let d = directive.split('=').next().unwrap_or("").trim();
+                d.eq_ignore_ascii_case("no-store") || d.eq_ignore_ascii_case("private")
+            })
+    })
 }
 
 impl CompressionMiddleware {
@@ -451,7 +712,19 @@ impl CompressionMiddleware {
         Self {
             min_size: 1024, // Only compress responses > 1KB
             level: crate::micro::CompressionLevel::Default,
+            skip: Arc::new(is_likely_secret_bearing),
         }
+    }
+
+    /// Replace the predicate that decides which responses are left
+    /// uncompressed (default: [`is_likely_secret_bearing`]). Return `true`
+    /// to skip compression for that response.
+    pub fn skip_when<F>(mut self, predicate: F) -> Self
+    where
+        F: Fn(&HttpResponse) -> bool + Send + Sync + 'static,
+    {
+        self.skip = Arc::new(predicate);
+        self
     }
 
     pub fn with_min_size(mut self, size: usize) -> Self {
@@ -486,7 +759,11 @@ impl Middleware for CompressionMiddleware {
         crate::micro::add_vary_accept_encoding(&mut response);
 
         let already_encoded = response.headers.contains_key("Content-Encoding");
-        if client_accepts_gzip && !already_encoded && response.body_ref().len() > self.min_size {
+        if client_accepts_gzip
+            && !already_encoded
+            && response.body_ref().len() > self.min_size
+            && !(self.skip)(&response)
+        {
             response = crate::micro::apply_gzip_offload(response, self.level).await;
         }
 
@@ -500,6 +777,24 @@ impl Middleware for CompressionMiddleware {
 /// Logs include method, path, status code, duration, and optional request/response bodies.
 /// The path is logged without its query string, which routinely carries secrets
 /// (reset codes, OAuth `code`, API keys).
+///
+/// Body logging is off by default. When enabled, a body is redacted
+/// *structurally*, chosen by its `Content-Type`:
+///
+/// - JSON (`application/json`, `*+json`): parsed, and the whole value of any
+///   member whose key names a credential (`password`, `user.password`,
+///   `authToken`, `pin_code`, ... — object and array values included) is
+///   replaced with `"[FILTERED]"`, recursively, including JSON embedded in
+///   string values.
+/// - `application/x-www-form-urlencoded`: decoded pair by pair; a sensitive
+///   field name (`password`, `user[password]`, `user%5Bpassword%5D`, a bare
+///   OAuth `code`) has its value replaced.
+/// - `multipart/form-data`: only part names and sizes are logged.
+/// - Anything else, or a body that does not parse as its declared type, or
+///   one too large to parse: only `<N bytes>` is logged (fail closed).
+///
+/// Redaction is by field name and cannot recognize a secret in a field it
+/// has no reason to suspect, so leave body logging off in production.
 ///
 /// # Examples
 ///
@@ -547,6 +842,266 @@ impl LoggingMiddleware {
     }
 }
 
+/// How far past the preview limit a body may run and still be parsed for
+/// redaction. Structural redaction needs the whole body (a truncated JSON
+/// document does not parse), so this bounds the work logging one request
+/// can cost; a larger body logs as `<N bytes>`.
+const BODY_REDACTION_SLACK: usize = 64 * 1024;
+
+/// How many levels of JSON-inside-a-JSON-string are unpacked and redacted.
+/// Deeper nesting is logged as `<N bytes>` rather than trusted.
+const EMBEDDED_JSON_DEPTH: usize = 4;
+
+/// How many strings, numbers and form values one body may run through the
+/// value redactor. Each is a regex scan on the async worker, and a body of
+/// thousands of tiny values would otherwise cost thousands of them; past the
+/// budget the body is withheld instead.
+const REDACTION_LEAF_BUDGET: usize = 4096;
+
+/// Shorter text cannot hold anything the value redactor matches (the
+/// shortest, `pw=x`, is four bytes), so it skips the redactor and the budget.
+const MIN_REDACTABLE_LEN: usize = 4;
+
+/// The body shapes [`body_log_preview`] knows how to redact structurally.
+enum BodyKind<'a> {
+    Json,
+    Form,
+    /// Carries the full `Content-Type`, which holds the boundary.
+    Multipart(&'a str),
+}
+
+impl<'a> BodyKind<'a> {
+    fn of(content_type: Option<&'a str>) -> Option<Self> {
+        let content_type = content_type?;
+        let essence = content_type.split(';').next().unwrap_or("").trim();
+        let essence = essence.to_ascii_lowercase();
+        if essence == "application/json"
+            || (essence.starts_with("application/") && essence.ends_with("+json"))
+        {
+            Some(Self::Json)
+        } else if essence == "application/x-www-form-urlencoded" {
+            Some(Self::Form)
+        } else if essence == "multipart/form-data" {
+            Some(Self::Multipart(content_type))
+        } else {
+            None
+        }
+    }
+}
+
+/// Replace the value of every credential-named member of `value`, whatever
+/// its type, with `"[FILTERED]"`; recurse into everything else. `None` once
+/// `budget` (see [`REDACTION_LEAF_BUDGET`]) runs out.
+fn redact_json_value(
+    value: &mut serde_json::Value,
+    depth: usize,
+    budget: &mut usize,
+) -> Option<()> {
+    use serde_json::Value;
+    match value {
+        Value::Object(map) => {
+            for (key, member) in map.iter_mut() {
+                if crate::error_transform::is_sensitive_key(key) {
+                    *member = Value::String("[FILTERED]".to_owned());
+                } else {
+                    redact_json_value(member, depth, budget)?;
+                }
+            }
+        }
+        Value::Array(items) => {
+            for item in items {
+                redact_json_value(item, depth, budget)?;
+            }
+        }
+        Value::String(text) => {
+            if let Cow::Owned(redacted) = redact_json_string(text, depth, budget)? {
+                *text = redacted;
+            }
+        }
+        // Numbers get the same value patterns as strings: a card number or
+        // SSN sent bare (`"card":4111111111111111`) is as sensitive as one
+        // sent quoted, and a key-name list cannot anticipate every field.
+        Value::Number(number) => {
+            let text = number.to_string();
+            if text.len() >= MIN_REDACTABLE_LEN {
+                *budget = budget.checked_sub(1)?;
+                if let Cow::Owned(filtered) = crate::error_transform::redact_sensitive(&text) {
+                    *value = Value::String(filtered);
+                }
+            }
+        }
+        _ => {}
+    }
+    Some(())
+}
+
+/// A JSON string value as it may be logged. One that itself holds JSON —
+/// an object or array (`"{\"password\":\"x\"}"`), or a JSON-encoded string
+/// of one (double-stringified) — is parsed and redacted structurally, up to
+/// [`EMBEDDED_JSON_DEPTH`] levels; past that it is replaced by its size.
+/// Anything else goes through [`redact_text`].
+fn redact_json_string<'a>(text: &'a str, depth: usize, budget: &mut usize) -> Option<Cow<'a, str>> {
+    if text.len() < MIN_REDACTABLE_LEN {
+        return Some(Cow::Borrowed(text));
+    }
+    *budget = budget.checked_sub(1)?;
+    if text.trim_start().starts_with(['{', '[', '"']) {
+        let Some(depth) = depth.checked_sub(1) else {
+            return Some(Cow::Owned(format!("<{} bytes>", text.len())));
+        };
+        if let Ok(mut inner) = serde_json::from_str::<serde_json::Value>(text) {
+            redact_json_value(&mut inner, depth, budget)?;
+            return Some(Cow::Owned(inner.to_string()));
+        }
+    }
+    Some(redact_text(text))
+}
+
+/// Free text (a non-JSON string value or a form value) as it may be logged:
+/// the shared value patterns, then a fail-closed check. If a credential key
+/// still sits in quotes without a `[FILTERED]` value after it — Python repr
+/// (`{'password': 'x'}`), stray escapes (`\"token\": \"x\"`), or any shape
+/// the patterns do not know — the whole text is withheld rather than trusted.
+///
+/// `Cow::Borrowed` means "unchanged": callers keep the original text then.
+fn redact_text(text: &str) -> Cow<'_, str> {
+    // A quoted key needs a quote: most text skips the second scan.
+    let filtered = crate::error_transform::redact_sensitive(text);
+    if filtered.contains(['"', '\'']) && has_unredacted_quoted_key(&filtered) {
+        return Cow::Owned("[WITHHELD]".to_owned());
+    }
+    filtered
+}
+
+/// Whether `text` holds a quoted, credential-named key (see
+/// [`crate::error_transform::is_sensitive_key`]) not followed by the
+/// `[FILTERED]` marker the value patterns leave behind.
+fn has_unredacted_quoted_key(text: &str) -> bool {
+    static QUOTED_KEY: LazyLock<Option<regex::Regex>> = LazyLock::new(|| {
+        let re = regex::Regex::new(r#"[\\'"]([A-Za-z0-9_.\[\]-]{1,128})\\?['"]"#);
+        debug_assert!(re.is_ok(), "bad quoted-key pattern: {re:?}");
+        re.ok()
+    });
+    // Unable to look: assume the worst.
+    let Some(re) = QUOTED_KEY.as_ref() else {
+        return true;
+    };
+    re.captures_iter(text).any(|caps| {
+        let (Some(whole), Some(key)) = (caps.get(0), caps.get(1)) else {
+            return false;
+        };
+        crate::error_transform::is_sensitive_key(key.as_str())
+            && !text[whole.end()..]
+                .trim_start_matches(['\\', '\'', '"', ':', '=', ' ', '\t'])
+                .starts_with("[FILTERED]")
+    })
+}
+
+/// Whether a urlencoded field name names a credential. Besides the shared
+/// key test, a bare `code` (as the whole name or its last bracket segment) is
+/// the OAuth authorization code here, not an error code as it is in JSON.
+fn is_sensitive_form_key(key: &str) -> bool {
+    let last = key.rsplit('[').next().unwrap_or(key).trim_end_matches(']');
+    crate::error_transform::is_sensitive_key(key) || last.eq_ignore_ascii_case("code")
+}
+
+/// Whether a decoded form or multipart field name looks like one. Names are
+/// logged verbatim, so one that does not is likely the real content of a
+/// mislabeled body — JSON sent as a form (`{"password":"x"}` parses as one
+/// pair whose *name* is the whole document), or multipart text — and the
+/// body is withheld rather than logged through a name nobody redacts.
+fn is_plausible_field_name(name: &str) -> bool {
+    (1..=128).contains(&name.len())
+        && name
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'.' | b'[' | b']' | b'-'))
+}
+
+/// The full redacted rendering of `body`, or `None` if it cannot be shown
+/// safely (unknown type, or it does not parse as the declared one).
+fn redact_body(kind: BodyKind<'_>, body: &[u8]) -> Option<String> {
+    match kind {
+        BodyKind::Json => {
+            let mut value: serde_json::Value = serde_json::from_slice(body).ok()?;
+            redact_json_value(&mut value, EMBEDDED_JSON_DEPTH, &mut {
+                REDACTION_LEAF_BUDGET
+            })?;
+            Some(value.to_string())
+        }
+        BodyKind::Form => {
+            // Same decoding the handler's `Form`/`Query` readers use, so the
+            // name tested is the name the application sees: `user%5Bpassword%5D`
+            // is `user[password]` here.
+            let text = std::str::from_utf8(body).ok()?;
+            let pairs = crate::query::parse(text);
+            if !pairs.iter().all(|(key, _)| is_plausible_field_name(key)) {
+                return None;
+            }
+            let mut budget = REDACTION_LEAF_BUDGET;
+            let mut rendered = Vec::with_capacity(pairs.len());
+            for (key, value) in pairs.iter() {
+                let value = if is_sensitive_form_key(key) {
+                    "[FILTERED]".to_owned()
+                } else {
+                    if value.len() >= MIN_REDACTABLE_LEN {
+                        budget = budget.checked_sub(1)?;
+                    }
+                    urlencoding::encode(&redact_text(value)).into_owned()
+                };
+                rendered.push(format!("{}={value}", urlencoding::encode(key)));
+            }
+            Some(rendered.join("&"))
+        }
+        BodyKind::Multipart(content_type) => {
+            let parser = crate::form::MultipartParser::from_content_type(content_type).ok()?;
+            let mut parts = Vec::new();
+            for field in parser.parts(body) {
+                let field = field.ok()?;
+                if !is_plausible_field_name(&field.name) {
+                    return None;
+                }
+                let size = match (&field.file, &field.value) {
+                    (Some(file), _) => file.data.len(),
+                    (None, Some(value)) => value.len(),
+                    (None, None) => 0,
+                };
+                parts.push(format!(
+                    "{}=<{size} bytes>",
+                    urlencoding::encode(&field.name)
+                ));
+            }
+            Some(format!("multipart[{}]", parts.join(", ")))
+        }
+    }
+}
+
+/// A truncated, structurally redacted view of `body` for logging, chosen by
+/// its `Content-Type` (see [`LoggingMiddleware`]).
+///
+/// Redacts first, then truncates: truncating first would leave a JSON body
+/// unparseable and cut a secret in half at the limit. A body too large to
+/// parse within the redaction budget, of an unrecognized type, or that fails
+/// to parse logs as `<N bytes>` only.
+fn body_log_preview(content_type: Option<&str>, body: &[u8], max: usize) -> String {
+    let withheld = || format!("<{} bytes>", body.len());
+    if body.len() > max.saturating_add(BODY_REDACTION_SLACK) {
+        return withheld();
+    }
+    let Some(redacted) = BodyKind::of(content_type).and_then(|kind| redact_body(kind, body)) else {
+        return withheld();
+    };
+    if redacted.len() > max {
+        // Cut on a char boundary at or below `max`.
+        let mut end = max.min(redacted.len());
+        while !redacted.is_char_boundary(end) {
+            end -= 1;
+        }
+        format!("{}... ({} bytes)", &redacted[..end], body.len())
+    } else {
+        redacted
+    }
+}
+
 impl Default for LoggingMiddleware {
     fn default() -> Self {
         Self::new()
@@ -565,15 +1120,13 @@ impl Middleware for LoggingMiddleware {
 
         // Log request
         if self.log_request_body && !req.body.is_empty() {
-            let body_preview = if req.body.len() > self.max_body_size {
-                format!(
-                    "{}... ({} bytes)",
-                    String::from_utf8_lossy(&req.body[..self.max_body_size]),
-                    req.body.len()
-                )
-            } else {
-                String::from_utf8_lossy(&req.body).to_string()
+            // One unambiguous Content-Type, or the body is withheld: two
+            // lines leave which parser the application used a guess.
+            let content_type = match req.headers.get_all("content-type").as_slice() {
+                [one] => Some(*one),
+                _ => None,
             };
+            let body_preview = body_log_preview(content_type, &req.body, self.max_body_size);
 
             crate::logging::info!(
                 method = %method,
@@ -597,15 +1150,20 @@ impl Middleware for LoggingMiddleware {
         match &result {
             Ok(response) => {
                 if self.log_response_body && !response.body.is_empty() {
-                    let body_preview = if response.body.len() > self.max_body_size {
-                        format!(
-                            "{}... ({} bytes)",
-                            String::from_utf8_lossy(&response.body[..self.max_body_size]),
-                            response.body.len()
-                        )
-                    } else {
-                        String::from_utf8_lossy(&response.body).to_string()
+                    // Response header names are case-sensitive map keys
+                    // here, so look across every casing; more than one line
+                    // withholds the body.
+                    let mut types = response
+                        .headers
+                        .iter()
+                        .filter(|(name, _)| name.eq_ignore_ascii_case("content-type"))
+                        .map(|(_, value)| value.as_str());
+                    let content_type = match (types.next(), types.next()) {
+                        (Some(one), None) => Some(one),
+                        _ => None,
                     };
+                    let body_preview =
+                        body_log_preview(content_type, &response.body, self.max_body_size);
 
                     crate::logging::info!(
                         method = %method,
@@ -625,13 +1183,26 @@ impl Middleware for LoggingMiddleware {
                     );
                 }
             }
-            Err(err) => {
+            // Client-caused failures stay below `error` (see
+            // `LoggerMiddleware`): a peer must not be able to flood the
+            // error log at will.
+            Err(err) if err.status_code() >= 500 => {
                 crate::logging::error!(
                     method = %method,
                     path = %path,
                     duration_ms = duration.as_millis(),
-                    error = %err,
+                    error = %err.log_display(),
                     "HTTP request failed"
+                );
+            }
+            Err(err) => {
+                crate::logging::debug!(
+                    method = %method,
+                    path = %path,
+                    status = err.status_code(),
+                    duration_ms = duration.as_millis(),
+                    error = %err.log_display(),
+                    "HTTP request rejected"
                 );
             }
         }
@@ -644,6 +1215,332 @@ impl Middleware for LoggingMiddleware {
 mod tests {
     use super::*;
     use bytes::Bytes;
+
+    #[tokio::test]
+    async fn compression_skips_secret_bearing_responses_by_default() {
+        fn gzip_req() -> HttpRequest {
+            let mut req = HttpRequest::new("GET", "/".to_string());
+            req.headers.insert("accept-encoding", "gzip");
+            req
+        }
+        let big = vec![b'a'; 4096];
+
+        let body = big.clone();
+        let next: Next = Box::new(move |_req| {
+            Box::pin(async move {
+                let mut r = HttpResponse::ok().with_body(body);
+                r.headers
+                    .insert("Set-Cookie".to_string(), "sid=1".to_string());
+                Ok(r)
+            })
+        });
+        let resp = CompressionMiddleware::new()
+            .handle(gzip_req(), next)
+            .await
+            .unwrap();
+        assert!(!resp.headers.contains_key("Content-Encoding"));
+
+        let body = big.clone();
+        let next: Next = Box::new(move |_req| {
+            Box::pin(async move {
+                let mut r = HttpResponse::ok().with_body(body);
+                r.headers.insert(
+                    "cache-control".to_string(),
+                    "max-age=0, Private".to_string(),
+                );
+                Ok(r)
+            })
+        });
+        let resp = CompressionMiddleware::new()
+            .handle(gzip_req(), next)
+            .await
+            .unwrap();
+        assert!(!resp.headers.contains_key("Content-Encoding"));
+
+        let body = big.clone();
+        let next: Next =
+            Box::new(move |_req| Box::pin(async move { Ok(HttpResponse::ok().with_body(body)) }));
+        let resp = CompressionMiddleware::new()
+            .handle(gzip_req(), next)
+            .await
+            .unwrap();
+        assert!(resp.headers.contains_key("Content-Encoding"));
+
+        let body = big.clone();
+        let next: Next =
+            Box::new(move |_req| Box::pin(async move { Ok(HttpResponse::ok().with_body(body)) }));
+        let resp = CompressionMiddleware::new()
+            .skip_when(|_| true)
+            .handle(gzip_req(), next)
+            .await
+            .unwrap();
+        assert!(!resp.headers.contains_key("Content-Encoding"));
+    }
+
+    #[tokio::test]
+    async fn request_id_middleware_replaces_malformed_inbound_id() {
+        let mut req = HttpRequest::new("GET", "/".to_string());
+        req.headers.insert("x-request-id", "bad id<script>");
+        let next: Next = Box::new(|_req| Box::pin(async { Ok(HttpResponse::ok()) }));
+        let response = RequestIdMiddleware.handle(req, next).await.unwrap();
+        let echoed = response.headers.get("x-request-id").unwrap();
+        assert_ne!(echoed, "bad id<script>");
+        assert!(crate::headers::is_valid_request_id(echoed));
+
+        let mut req = HttpRequest::new("GET", "/".to_string());
+        req.headers.insert("x-request-id", "req-42");
+        let next: Next = Box::new(|_req| Box::pin(async { Ok(HttpResponse::ok()) }));
+        let response = RequestIdMiddleware.handle(req, next).await.unwrap();
+        assert_eq!(
+            response.headers.get("x-request-id").map(String::as_str),
+            Some("req-42")
+        );
+    }
+
+    const JSON: Option<&str> = Some("application/json");
+    const FORM: Option<&str> = Some("application/x-www-form-urlencoded");
+
+    #[test]
+    fn logged_bodies_are_redacted() {
+        let body = br#"{"user":"a","password":"hunter2","api_key":"k-1"}"#;
+        let out = body_log_preview(JSON, body, 1024);
+        assert!(!out.contains("hunter2"), "{out}");
+        assert!(!out.contains("k-1"), "{out}");
+        assert!(out.contains(r#""user":"a""#), "{out}");
+
+        let out = body_log_preview(FORM, b"token=abc&x=1", 1024);
+        assert!(!out.contains("abc"), "{out}");
+        assert!(out.contains("x=1"), "{out}");
+
+        // A secret cut by the preview limit is still redacted: the whole
+        // body is parsed (and filtered) before the cut.
+        let body = br#"{"password":"hunter2-is-long"}"#;
+        let out = body_log_preview(JSON, body, 18);
+        assert!(!out.contains("hun"), "{out}");
+        assert!(
+            out.ends_with(&format!("... ({} bytes)", body.len())),
+            "{out}"
+        );
+
+        // Multi-byte text is cut on a char boundary, not mid-codepoint.
+        let out = body_log_preview(JSON, r#""ééé""#.as_bytes(), 3);
+        assert_eq!(out, "\"é... (8 bytes)");
+    }
+
+    #[test]
+    fn json_numbers_that_are_not_secrets_stay_numbers() {
+        let logged = body_log_preview(
+            Some("application/json"),
+            br#"{"amount":1500,"year":2026}"#,
+            1024,
+        );
+        assert_eq!(logged, r#"{"amount":1500,"year":2026}"#);
+    }
+
+    #[test]
+    fn json_numbers_get_the_value_patterns_too() {
+        let logged = body_log_preview(
+            Some("application/json"),
+            br#"{"card":4111111111111111,"tax_id":123456789,"qty":3}"#,
+            1024,
+        );
+        assert!(!logged.contains("4111111111111111"), "{logged}");
+        assert!(!logged.contains("123456789"), "{logged}");
+        assert!(logged.contains("\"qty\":3"), "{logged}");
+    }
+
+    /// Every round-4 bypass of the old regex-only redaction.
+    #[test]
+    fn json_bodies_are_redacted_structurally() {
+        for body in [
+            // Dotted / bracketed / camelCase keys.
+            r#"{"user.password":"s3cr3t"}"#,
+            r#"{"user[password]":"s3cr3t"}"#,
+            r#"{"authToken":"s3cr3t"}"#,
+            // Non-scalar values: the whole value goes.
+            r#"{"password":["s3cr3t"]}"#,
+            r#"{"token":{"value":"s3cr3t","kind":"bearer"}}"#,
+            r#"{"password":{"nested":["s3cr3t"]}}"#,
+            // Nested under an innocent key, and inside arrays.
+            r#"{"user":{"credentials":{"pw":"s3cr3t"}}}"#,
+            r#"[{"name":"a","secret":"s3cr3t"}]"#,
+            // Escaped JSON inside a string, and form text inside a string.
+            r#"{"payload":"{\"password\":\"s3cr3t\"}"}"#,
+            r#"{"payload":"{\"inner\":\"{\\\"token\\\":[\\\"s3cr3t\\\"]}\"}"}"#,
+            r#"{"note":"password = s3cr3t"}"#,
+            // The added key names.
+            r#"{"pass":"s3cr3t","passphrase":"s3cr3t","pw":"s3cr3t","auth":"s3cr3t"}"#,
+            r#"{"jwt":"s3cr3t","signature":"s3cr3t","cookie":"s3cr3t","pin_code":"s3cr3t"}"#,
+        ] {
+            let out = body_log_preview(JSON, body.as_bytes(), 4096);
+            assert!(!out.contains("s3cr3t"), "{body} -> {out}");
+            assert!(out.contains("[FILTERED]"), "{body} -> {out}");
+        }
+        // `+json` media types are JSON too.
+        let out = body_log_preview(
+            Some("application/vnd.api+json; charset=utf-8"),
+            br#"{"password":"s3cr3t"}"#,
+            4096,
+        );
+        assert!(!out.contains("s3cr3t"), "{out}");
+    }
+
+    #[test]
+    fn form_bodies_are_redacted_by_decoded_key() {
+        for body in [
+            "password=s3cr3t",
+            "user[password]=s3cr3t",
+            "user%5Bpassword%5D=s3cr3t",
+            "user[0][pin]=s3cr3t",
+            "code=s3cr3t&state=xyz",
+            "x[code]=s3cr3t",
+            "passphrase=s3cr3t&pw=s3cr3t&auth=s3cr3t&jwt=s3cr3t",
+            "signature=s3cr3t&cookie=s3cr3t&pin_code=s3cr3t&pass=s3cr3t",
+            "note=password+%3D+s3cr3t",
+        ] {
+            let out = body_log_preview(FORM, body.as_bytes(), 4096);
+            assert!(!out.contains("s3cr3t"), "{body} -> {out}");
+        }
+        let out = body_log_preview(FORM, b"name=alice&state=xyz", 4096);
+        assert_eq!(out, "name=alice&state=xyz");
+    }
+
+    #[test]
+    fn multipart_bodies_log_part_names_and_sizes_only() {
+        let ct = "multipart/form-data; boundary=XyZ";
+        let body = b"--XyZ\r\nContent-Disposition: form-data; name=\"username\"\r\n\r\nalice\r\n--XyZ\r\nContent-Disposition: form-data; name=\"password\"\r\n\r\ns3cr3t\r\n--XyZ--\r\n";
+        let out = body_log_preview(Some(ct), body, 4096);
+        assert!(!out.contains("s3cr3t") && !out.contains("alice"), "{out}");
+        assert!(out.contains("username=<5 bytes>"), "{out}");
+        assert!(out.contains("password=<6 bytes>"), "{out}");
+    }
+
+    /// Unknown or missing types, bodies that don't parse as their declared
+    /// type, and bodies too large to parse are withheld entirely.
+    #[test]
+    fn unparseable_or_unknown_bodies_fail_closed() {
+        let secret = b"password = s3cr3t";
+        for ct in [
+            None,
+            Some("text/plain"),
+            Some("application/octet-stream"),
+            JSON,
+        ] {
+            assert_eq!(body_log_preview(ct, secret, 4096), "<17 bytes>", "{ct:?}");
+        }
+        // Truncated JSON does not parse.
+        assert_eq!(
+            body_log_preview(JSON, br#"{"password":"s3cr"#, 4096),
+            "<17 bytes>"
+        );
+        // Malformed multipart.
+        assert_eq!(
+            body_log_preview(Some("multipart/form-data; boundary=XyZ"), secret, 4096),
+            "<17 bytes>"
+        );
+        // Over the parse budget.
+        let big = vec![b' '; BODY_REDACTION_SLACK + 11];
+        assert_eq!(
+            body_log_preview(JSON, &big, 10),
+            format!("<{} bytes>", big.len())
+        );
+    }
+
+    /// A body mislabeled as a form parses as pairs whose *names* are the
+    /// real content; names are logged verbatim, so any implausible name
+    /// withholds the whole body.
+    #[test]
+    fn mislabeled_form_bodies_fail_closed() {
+        for body in [
+            &br#"{"password":"s3cr3t","user":"a"}"#[..],
+            b"--XyZ\r\nContent-Disposition: form-data; name=\"password\"\r\n\r\ns3cr3t\r\n--XyZ--\r\n",
+            b"=s3cr3t",
+        ] {
+            let out = body_log_preview(FORM, body, 4096);
+            assert_eq!(out, format!("<{} bytes>", body.len()), "{out}");
+        }
+        // Bracketed, dotted and dashed names are still fine.
+        let out = body_log_preview(FORM, b"user[0][name]=a&x.y-z_1=b", 4096);
+        assert_eq!(out, "user%5B0%5D%5Bname%5D=a&x.y-z_1=b");
+
+        // Multipart part names get the same test.
+        let ct = "multipart/form-data; boundary=XyZ";
+        let body =
+            b"--XyZ\r\nContent-Disposition: form-data; name=\"pw: s3cr3t\"\r\n\r\nx\r\n--XyZ--\r\n";
+        let out = body_log_preview(Some(ct), body, 4096);
+        assert_eq!(out, format!("<{} bytes>", body.len()), "{out}");
+    }
+
+    /// A JSON string holding a JSON-encoded string (double-stringified) is
+    /// decoded and redacted; a quoted credential key the redactor still
+    /// cannot see past (Python repr, stray escapes) withholds the string.
+    #[test]
+    fn stringified_and_repr_credentials_fail_closed() {
+        let inner = r#"{"password":"s3cr3t"}"#;
+        let once = serde_json::to_string(inner).unwrap();
+        let twice = serde_json::to_string(&once).unwrap();
+        for payload in [
+            once.clone(),
+            twice,
+            "{'password': 's3cr3t'}".to_owned(),
+            r#"x \"token\": \"s3cr3t\""#.to_owned(),
+        ] {
+            let body = serde_json::json!({ "payload": payload }).to_string();
+            let out = body_log_preview(JSON, body.as_bytes(), 4096);
+            assert!(!out.contains("s3cr3t"), "{body} -> {out}");
+        }
+        // Ordinary values that merely *are* a credential word survive.
+        let out = body_log_preview(JSON, br#"{"grant_type":"password","u":"a"}"#, 4096);
+        assert_eq!(out, r#"{"grant_type":"password","u":"a"}"#);
+    }
+
+    /// Redaction work per body is bounded: past the leaf budget the body is
+    /// withheld instead of running the redactor on every node.
+    #[test]
+    fn redaction_work_is_bounded() {
+        let items: Vec<String> = (0..REDACTION_LEAF_BUDGET + 1)
+            .map(|i| format!("v{i:04}"))
+            .collect();
+        let body = serde_json::to_vec(&items).unwrap();
+        assert_eq!(
+            body_log_preview(JSON, &body, 1024),
+            format!("<{} bytes>", body.len())
+        );
+        // Tiny strings and small numbers are not counted against it.
+        let body = serde_json::to_vec(&vec!["ab"; REDACTION_LEAF_BUDGET * 2]).unwrap();
+        assert!(body_log_preview(JSON, &body, 64).starts_with("[\"ab\""));
+    }
+
+    /// The BREACH heuristic sees cookies set through the cookie API (which
+    /// live in `response.cookies`, not `headers`) and directives that carry
+    /// an argument.
+    #[test]
+    fn breach_heuristic_sees_cookie_api_and_directive_arguments() {
+        let r = HttpResponse::ok().cookie("sid", "abc");
+        assert!(
+            r.headers
+                .iter()
+                .all(|(n, _)| !n.eq_ignore_ascii_case("set-cookie"))
+        );
+        assert!(is_likely_secret_bearing(&r));
+
+        for cc in [
+            r#"private="Set-Cookie""#,
+            "no-store=1",
+            "max-age=0, PRIVATE",
+        ] {
+            let mut r = HttpResponse::ok();
+            r.headers
+                .insert("Cache-Control".to_string(), cc.to_string());
+            assert!(is_likely_secret_bearing(&r), "{cc}");
+        }
+        let mut r = HttpResponse::ok();
+        r.headers.insert(
+            "Cache-Control".to_string(),
+            "public, max-age=60".to_string(),
+        );
+        assert!(!is_likely_secret_bearing(&r));
+    }
 
     /// H7: the legacy CORS middleware never pairs `*` with credentials.
     #[tokio::test]
@@ -732,6 +1629,233 @@ mod tests {
             !logged.contains("SECRET"),
             "a query secret was logged: {logged}"
         );
+    }
+
+    /// Levels of the events emitted while the returned guard is held (on
+    /// this thread, which a current-thread `#[tokio::test]` stays on).
+    fn capture_levels() -> (
+        Arc<std::sync::Mutex<Vec<tracing::Level>>>,
+        tracing::subscriber::DefaultGuard,
+    ) {
+        use tracing_subscriber::layer::SubscriberExt;
+
+        struct Levels(Arc<std::sync::Mutex<Vec<tracing::Level>>>);
+        impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for Levels {
+            fn on_event(
+                &self,
+                event: &tracing::Event<'_>,
+                _: tracing_subscriber::layer::Context<'_, S>,
+            ) {
+                self.0.lock().unwrap().push(*event.metadata().level());
+            }
+        }
+        let levels = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let subscriber = tracing_subscriber::registry().with(Levels(Arc::clone(&levels)));
+        let guard = tracing::subscriber::set_default(subscriber);
+        // Callsite interest is cached process-wide; a parallel test may have
+        // cached "never" for these callsites before this subscriber existed.
+        tracing::callsite::rebuild_interest_cache();
+        (levels, guard)
+    }
+
+    fn failing(err: fn() -> Error) -> Next {
+        Box::new(move |_req| Box::pin(async move { Err(err()) }))
+    }
+
+    /// A client-caused failure is not an `error` (a peer could flood the
+    /// error log at will); a server fault still is.
+    #[tokio::test]
+    async fn logging_middlewares_log_client_errors_below_error() {
+        let (levels, _guard) = capture_levels();
+        let req = || HttpRequest::new("GET", "/x".to_string());
+        let not_found = || Error::NotFound("nope".into());
+        let internal = || Error::Internal("boom".into());
+
+        let _ = LoggerMiddleware::new()
+            .handle(req(), failing(not_found))
+            .await;
+        let _ = LoggingMiddleware::new()
+            .handle(req(), failing(not_found))
+            .await;
+        assert!(
+            !levels.lock().unwrap().contains(&tracing::Level::ERROR),
+            "{:?}",
+            levels.lock().unwrap()
+        );
+
+        let _ = LoggerMiddleware::new()
+            .handle(req(), failing(internal))
+            .await;
+        let _ = LoggingMiddleware::new()
+            .handle(req(), failing(internal))
+            .await;
+        let errors = levels
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|l| **l == tracing::Level::ERROR)
+            .count();
+        assert_eq!(errors, 2);
+    }
+
+    fn error_ctx() -> (crate::Method, &'static str) {
+        (HttpRequest::new("GET", "/".to_string()).method, "/")
+    }
+
+    /// Error responses are as framable and sniffable as any other: the
+    /// error itself still propagates (for the exception filters), and the
+    /// response rendered from it gets the security headers.
+    #[tokio::test]
+    async fn security_headers_apply_to_error_responses() {
+        let middleware = SecurityHeadersMiddleware::new();
+        let (method, path) = error_ctx();
+        for (err, status) in [
+            (Error::Unauthorized("who".into()), 401),
+            (Error::NotFound("nope".into()), 404),
+            (Error::Internal("db password=hunter2".into()), 500),
+        ] {
+            let next: Next = Box::new(move |_req| Box::pin(async move { Err(err) }));
+            let err = middleware
+                .handle(HttpRequest::new("GET", "/".to_string()), next)
+                .await
+                .expect_err("an error propagates, so exception filters see it");
+            assert_eq!(err.status_code(), status);
+
+            let mut response = err.to_client_response();
+            middleware
+                .decorate_error_response(&ErrorResponseContext::new(&method, path), &mut response);
+            for name in [
+                "Strict-Transport-Security",
+                "X-Content-Type-Options",
+                "X-Frame-Options",
+                "Referrer-Policy",
+            ] {
+                assert!(response.headers.contains_key(name), "{status}: {name}");
+            }
+            assert!(!String::from_utf8_lossy(&response.body).contains("hunter2"));
+        }
+    }
+
+    /// The allowed origin can read why its request was rejected; credentials
+    /// still go out only with a specific origin.
+    #[tokio::test]
+    async fn cors_headers_apply_to_error_responses() {
+        let (method, path) = error_ctx();
+        let ctx = ErrorResponseContext::new(&method, path);
+        let cors = CorsMiddleware::new()
+            .allow_origin("https://app.example")
+            .allow_credentials(true);
+        let mut req = HttpRequest::new("GET", "/api".to_string());
+        req.headers.insert("origin", "https://app.example");
+        let err = cors
+            .handle(req, failing(|| Error::Forbidden("no".into())))
+            .await
+            .expect_err("an error propagates, so exception filters see it");
+        assert_eq!(err.status_code(), 403);
+
+        let mut response = err.to_client_response();
+        cors.decorate_error_response(&ctx, &mut response);
+        let get = |r: &HttpResponse, name: &str| r.headers.get(name).cloned();
+        assert_eq!(
+            get(&response, "Access-Control-Allow-Origin").as_deref(),
+            Some("https://app.example")
+        );
+        assert_eq!(
+            get(&response, "Access-Control-Allow-Credentials").as_deref(),
+            Some("true")
+        );
+
+        let wildcard = CorsMiddleware::new().allow_credentials(true);
+        let mut response = Error::Forbidden("no".into()).to_client_response();
+        wildcard.decorate_error_response(&ctx, &mut response);
+        assert_eq!(
+            get(&response, "Access-Control-Allow-Origin").as_deref(),
+            Some("*")
+        );
+        assert!(
+            !response
+                .headers
+                .contains_key("Access-Control-Allow-Credentials")
+        );
+    }
+
+    async fn secured(
+        middleware: &SecurityHeadersMiddleware,
+        response: HttpResponse,
+    ) -> HttpResponse {
+        let next: Next = Box::new(move |_req| Box::pin(async move { Ok(response) }));
+        middleware
+            .handle(HttpRequest::new("GET", "/".to_string()), next)
+            .await
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn security_headers_are_configurable() {
+        let middleware = SecurityHeadersMiddleware::new()
+            .with_content_security_policy("default-src 'self'")
+            .with_cross_origin_opener_policy("same-origin")
+            .with_referrer_policy("no-referrer")
+            .with_header("Permissions-Policy", "camera=()")
+            .without("x-xss-protection")
+            .without("X-Content-Type-Options")
+            .with_hsts(false);
+        let response = secured(&middleware, HttpResponse::ok()).await;
+        let get = |name: &str| response.headers.get(name).map(String::as_str);
+        assert_eq!(get("Content-Security-Policy"), Some("default-src 'self'"));
+        assert_eq!(get("Cross-Origin-Opener-Policy"), Some("same-origin"));
+        assert_eq!(get("Referrer-Policy"), Some("no-referrer"));
+        assert_eq!(get("Permissions-Policy"), Some("camera=()"));
+        assert_eq!(get("X-Frame-Options"), Some("DENY"));
+        assert!(!response.headers.contains_key("X-XSS-Protection"));
+        assert!(!response.headers.contains_key("X-Content-Type-Options"));
+        assert!(!response.headers.contains_key("Strict-Transport-Security"));
+    }
+
+    #[tokio::test]
+    async fn security_headers_default_referrer_policy_and_replace_other_casings() {
+        let mut handler_response = HttpResponse::ok();
+        handler_response
+            .headers
+            .insert("x-frame-options".to_string(), "ALLOWALL".to_string());
+        let response = secured(&SecurityHeadersMiddleware::new(), handler_response).await;
+        assert_eq!(
+            response.headers.get("Referrer-Policy").map(String::as_str),
+            Some("strict-origin-when-cross-origin")
+        );
+        // One `X-Frame-Options` line goes out, not two.
+        let frame: Vec<_> = response
+            .headers
+            .iter()
+            .filter(|(name, _)| name.eq_ignore_ascii_case("x-frame-options"))
+            .collect();
+        assert_eq!(frame.len(), 1, "{frame:?}");
+        assert_eq!(frame[0].1, "DENY");
+    }
+
+    /// Header injection is caught when the middleware is configured, not on
+    /// the wire.
+    #[test]
+    fn security_headers_reject_invalid_names_and_values() {
+        let base = SecurityHeadersMiddleware::new;
+        assert!(
+            base()
+                .try_with_header(
+                    "Content-Security-Policy",
+                    "default-src 'self'\r\nSet-Cookie: a=b"
+                )
+                .is_err()
+        );
+        assert!(base().try_with_header("X-Frame-Options", "DENY\n").is_err());
+        assert!(base().try_with_header("X-Frame-Options", "DE\0NY").is_err());
+        assert!(base().try_with_header("Bad Name", "x").is_err());
+        assert!(base().try_with_header("Bad:Name", "x").is_err());
+        assert!(base().try_with_header("", "x").is_err());
+        assert!(base().try_with_header("X-Ok", "a\tb").is_ok());
+        let panicked = std::panic::catch_unwind(|| {
+            SecurityHeadersMiddleware::new().with_referrer_policy("no-referrer\r\nX-Evil: 1")
+        });
+        assert!(panicked.is_err());
     }
 
     #[tokio::test]
@@ -837,6 +1961,11 @@ mod tests {
         let response = result.unwrap();
         assert!(response.headers.contains_key("X-Content-Type-Options"));
         assert!(response.headers.contains_key("X-Frame-Options"));
+        // The auditor is switched off, not into `mode=block` (XS-leaks).
+        assert_eq!(
+            response.headers.get("X-XSS-Protection").map(String::as_str),
+            Some("0")
+        );
     }
 
     #[tokio::test]

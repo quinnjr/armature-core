@@ -167,7 +167,9 @@ impl BatchConfigBuilder {
 // ============================================================================
 
 /// A parsed HTTP request from a batch (borrowed version)
-#[derive(Debug)]
+///
+/// `Debug` follows `HttpRequest`'s rules: path without query, sensitive
+/// header values redacted, body length only.
 pub struct ParsedRequest<'a> {
     /// HTTP method (GET, POST, etc.)
     pub method: &'a str,
@@ -184,7 +186,10 @@ pub struct ParsedRequest<'a> {
 }
 
 /// An owned parsed HTTP request (no lifetime dependencies)
-#[derive(Debug, Clone)]
+///
+/// `Debug` follows `HttpRequest`'s rules: path without query, sensitive
+/// header values redacted, body length only.
+#[derive(Clone)]
 pub struct OwnedParsedRequest {
     /// HTTP method (GET, POST, etc.)
     pub method: String,
@@ -200,6 +205,49 @@ pub struct OwnedParsedRequest {
     pub bytes_consumed: usize,
 }
 
+impl ParsedRequest<'_> {
+    /// `Debug` body shared with [`OwnedParsedRequest`], which borrows itself
+    /// into a `ParsedRequest` and renders under its own name.
+    fn fmt_as(&self, f: &mut std::fmt::Formatter<'_>, name: &str) -> std::fmt::Result {
+        f.debug_struct(name)
+            .field("method", &self.method)
+            .field("path", &crate::headers::path_without_query(self.path))
+            .field("has_query", &self.path.contains('?'))
+            .field("version", &self.version)
+            .field(
+                "headers",
+                &crate::headers::RedactedHeaders(self.headers.clone()),
+            )
+            .field("body_len", &self.body.len())
+            .field("bytes_consumed", &self.bytes_consumed)
+            .finish()
+    }
+}
+
+impl std::fmt::Debug for ParsedRequest<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.fmt_as(f, "ParsedRequest")
+    }
+}
+
+impl std::fmt::Debug for OwnedParsedRequest {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        ParsedRequest {
+            method: &self.method,
+            path: &self.path,
+            version: &self.version,
+            headers: self
+                .headers
+                .iter()
+                .map(|(n, v)| (n.as_str(), v.as_slice()))
+                .collect(),
+            body: &self.body,
+            bytes_consumed: self.bytes_consumed,
+        }
+        .fmt_as(f, "OwnedParsedRequest")
+    }
+}
+
 impl OwnedParsedRequest {
     /// Get a header value by name (case-insensitive)
     #[inline]
@@ -210,12 +258,13 @@ impl OwnedParsedRequest {
             .map(|(_, v)| v.as_slice())
     }
 
-    /// Get Content-Length header value
+    /// The `Content-Length` this request was framed with (see
+    /// [`ParsedRequest::content_length`]).
     #[inline]
     pub fn content_length(&self) -> Option<usize> {
-        self.header("content-length")
-            .and_then(|v| std::str::from_utf8(v).ok())
-            .and_then(|s| s.trim().parse().ok())
+        declared_content_length(self.headers.iter().map(|(n, v)| (n.as_str(), v.as_slice())))
+            .ok()
+            .flatten()
     }
 
     /// Check if this is a keep-alive connection
@@ -234,20 +283,21 @@ impl OwnedParsedRequest {
     }
 
     /// Convert to HttpRequest
-    pub fn to_http_request(&self) -> crate::HttpRequest {
-        let mut req = crate::HttpRequest::new(self.method.clone(), self.path.clone());
-
-        for (name, value) in &self.headers {
-            if let Ok(v) = std::str::from_utf8(value) {
-                req.headers.insert(name.clone(), v.to_string());
-            }
-        }
-
-        if !self.body.is_empty() {
-            req.set_body_bytes(self.body.clone());
-        }
-
-        req
+    ///
+    /// # Errors
+    ///
+    /// [`Error::BadRequest`](crate::Error::BadRequest) when `Host` and the
+    /// request target break the rules every serve path enforces (see
+    /// [`ParsedRequest::to_http_request`], which also covers path
+    /// canonicalization and the peer address the caller must set).
+    pub fn to_http_request(&self) -> Result<crate::HttpRequest, crate::Error> {
+        build_http_request(
+            &self.method,
+            &self.path,
+            &self.version,
+            self.headers.iter().map(|(n, v)| (n.as_str(), v.as_slice())),
+            self.body.clone(),
+        )
     }
 }
 
@@ -274,12 +324,16 @@ impl<'a> ParsedRequest<'a> {
             .map(|(_, v)| *v)
     }
 
-    /// Get Content-Length header value
+    /// The `Content-Length` this request was framed with: every
+    /// `Content-Length` line and list element, read by the same strict rules
+    /// as framing. `None` when the request has none (framing then used 0) or
+    /// when they are malformed or disagree (which framing refuses); taking the
+    /// first value loosely would report a length the body was not cut by.
     #[inline]
     pub fn content_length(&self) -> Option<usize> {
-        self.header("content-length")
-            .and_then(|v| std::str::from_utf8(v).ok())
-            .and_then(|s| s.trim().parse().ok())
+        declared_content_length(self.headers.iter().copied())
+            .ok()
+            .flatten()
     }
 
     /// Check if this is a keep-alive connection
@@ -300,21 +354,113 @@ impl<'a> ParsedRequest<'a> {
     }
 
     /// Convert to owned HttpRequest
-    pub fn to_http_request(&self) -> crate::HttpRequest {
-        let mut req = crate::HttpRequest::new(self.method.to_string(), self.path.to_string());
-
-        for (name, value) in &self.headers {
-            if let Ok(v) = std::str::from_utf8(value) {
-                req.headers.insert(name, v);
-            }
-        }
-
-        if !self.body.is_empty() {
-            req.set_body_bytes(Bytes::copy_from_slice(self.body));
-        }
-
-        req
+    ///
+    /// Held to the same `Host` rules as every serve path (see
+    /// `application::reconcile_authority`): exactly one syntactically valid
+    /// `Host` on HTTP/1.1, none that is malformed or repeated, and no
+    /// absolute-form target. A request built here would otherwise reach a
+    /// virtual-host router or a redirect builder carrying a `Host` that no
+    /// listener would have let through. The path is canonicalized by
+    /// [`canonicalize_path`](crate::routing::canonicalize_path), as every serve
+    /// path does before routing, and every field line is kept byte for byte.
+    ///
+    /// The request carries no peer address: this parser never saw the socket.
+    /// Set it with [`HttpRequest::with_peer`](crate::HttpRequest::with_peer)
+    /// before anything reads [`client_address`](crate::HttpRequest::client_address)
+    /// — without one, a direct-connection policy (`trusted_proxy_depth == 0`)
+    /// names no client, and a proxy-trust one can only fall back to
+    /// `X-Forwarded-For`, which the client writes.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::BadRequest`](crate::Error::BadRequest) naming the rule broken,
+    /// or the path's [`PathRejection`](crate::routing::PathRejection).
+    pub fn to_http_request(&self) -> Result<crate::HttpRequest, crate::Error> {
+        build_http_request(
+            self.method,
+            self.path,
+            self.version,
+            self.headers.iter().copied(),
+            Bytes::copy_from_slice(self.body),
+        )
     }
+}
+
+/// The conversion behind both `to_http_request`s.
+fn build_http_request<'h>(
+    method: &str,
+    path: &str,
+    version: &str,
+    headers: impl Iterator<Item = (&'h str, &'h [u8])> + Clone,
+    body: Bytes,
+) -> Result<crate::HttpRequest, crate::Error> {
+    let http_version = match version {
+        "1.0" => http::Version::HTTP_10,
+        "0.9" => http::Version::HTTP_09,
+        _ => http::Version::HTTP_11,
+    };
+    // An origin-form target ("/path") has no authority; absolute-form and
+    // CONNECT's authority-form do, and `reconcile_authority` decides them.
+    let target = (!path.starts_with('/'))
+        .then(|| path.parse::<http::Uri>().ok())
+        .flatten();
+    let host_from_authority = crate::application::reconcile_authority(
+        http_version,
+        method.eq_ignore_ascii_case("CONNECT"),
+        target
+            .as_ref()
+            .and_then(|uri| uri.authority())
+            .map(|a| a.as_str()),
+        headers
+            .clone()
+            .filter(|(name, _)| name.eq_ignore_ascii_case("host"))
+            .map(|(_, value)| value),
+    )
+    .map_err(|reason| crate::Error::BadRequest(reason.to_string()))?;
+
+    // The one spelling of the path every serve path rewrites the target to
+    // before middleware, guards and routing see it (`admit`), so a request
+    // built here cannot reach them as `//%61dmin` or `/a/../admin`.
+    let (raw_path, query) = match path.split_once('?') {
+        Some((p, q)) => (p, Some(q)),
+        None => (path, None),
+    };
+    // Asterisk-form only for OPTIONS, as `admit` enforces (RFC 9112 §3.2.4).
+    if raw_path == "*" && !method.eq_ignore_ascii_case("OPTIONS") {
+        return Err(crate::Error::BadRequest(
+            "asterisk-form request target is only valid for OPTIONS".to_string(),
+        ));
+    }
+    let target = match crate::routing::canonicalize_path(raw_path)
+        .map_err(|rejection| crate::Error::BadRequest(rejection.to_string()))?
+    {
+        std::borrow::Cow::Borrowed(_) => path.to_string(),
+        std::borrow::Cow::Owned(mut canonical) => {
+            if let Some(query) = query {
+                canonical.push('?');
+                canonical.push_str(query);
+            }
+            canonical
+        }
+    };
+
+    let mut req = crate::HttpRequest::new(method.to_string(), target);
+    // `append`, not `insert`: a repeated field (`X-Forwarded-For`) must keep
+    // every occurrence, as it does on the serve paths, or a proxy-trust policy
+    // reads only whichever copy happened to come last. Raw bytes, not only the
+    // lines that are UTF-8: dropping a non-UTF-8 `X-Forwarded-For` line would
+    // let the next one be read as the whole chain, where the serve paths keep
+    // it and `client_address` then names no client at all.
+    for (name, value) in headers {
+        req.headers.append(name, value);
+    }
+    if let Some(host) = host_from_authority {
+        req.headers.append("host", host);
+    }
+    if !body.is_empty() {
+        req.set_body_bytes(body);
+    }
+    Ok(req)
 }
 
 // ============================================================================
@@ -477,16 +623,18 @@ impl BatchParser {
                     ));
                 }
 
-                // Determine body length
-                let content_length = parsed_headers
-                    .iter()
-                    .find(|(n, _)| n.eq_ignore_ascii_case("content-length"))
-                    .and_then(|(_, v)| std::str::from_utf8(v).ok())
-                    .and_then(|s| s.trim().parse::<usize>().ok())
-                    .unwrap_or(0);
+                // Determine body length. Every Content-Length line counts,
+                // and a value this parser can't read exactly is refused
+                // rather than read as "no body": a proxy that framed the
+                // request by the value it understood would otherwise forward
+                // body bytes this parser treats as the next request.
+                let content_length = framing_content_length(&parsed_headers)?;
 
-                // Check if we have complete body
-                let total_len = header_len + content_length;
+                // Check if we have complete body. Checked: a length near
+                // `usize::MAX` would otherwise wrap and slice backwards.
+                let total_len = header_len
+                    .checked_add(content_length)
+                    .ok_or(BatchParseError::BufferOverflow)?;
                 if buffer.len() < total_len {
                     // A request larger than the read buffer can never
                     // complete: returning Ok(None) would stall the
@@ -520,6 +668,48 @@ impl BatchParser {
     pub fn config(&self) -> &BatchConfig {
         &self.config
     }
+}
+
+/// The body length declared by a request's `Content-Length` field lines.
+///
+/// RFC 9110 §8.6 allows a list of identical values (`40, 40`, or the same
+/// value on two lines) and nothing else: every element must be plain decimal
+/// digits — no sign, no whitespace inside, no junk — and all must agree. Any
+/// other shape is malformed, as it is on the HTTP/3 path
+/// (`http3::reject_malformed_fields`), since two parsers that resolve it
+/// differently disagree about where the request ends.
+fn framing_content_length(headers: &[(&str, &[u8])]) -> Result<usize, BatchParseError> {
+    Ok(declared_content_length(headers.iter().copied())?.unwrap_or(0))
+}
+
+/// [`framing_content_length`] before defaulting: `None` when there is no
+/// `Content-Length` line at all. Shared with the `content_length` helpers so
+/// they cannot disagree with framing.
+fn declared_content_length<'h>(
+    headers: impl IntoIterator<Item = (&'h str, &'h [u8])>,
+) -> Result<Option<usize>, BatchParseError> {
+    let malformed = || BatchParseError::InvalidSyntax("Malformed Content-Length".to_string());
+    let mut declared: Option<usize> = None;
+    for (_, value) in headers
+        .into_iter()
+        .filter(|(name, _)| name.eq_ignore_ascii_case("content-length"))
+    {
+        for element in value.split(|&b| b == b',') {
+            let element = element.trim_ascii();
+            if element.is_empty() || !element.iter().all(u8::is_ascii_digit) {
+                return Err(malformed());
+            }
+            let length: usize = std::str::from_utf8(element)
+                .ok()
+                .and_then(|digits| digits.parse().ok())
+                .ok_or_else(malformed)?;
+            match declared {
+                Some(previous) if previous != length => return Err(malformed()),
+                _ => declared = Some(length),
+            }
+        }
+    }
+    Ok(declared)
 }
 
 // ============================================================================
@@ -616,7 +806,9 @@ impl BatchStats {
 // ============================================================================
 
 /// A reusable buffer for batch reading from sockets
-#[derive(Debug)]
+///
+/// `Debug` shows positions and sizes, not the buffered bytes: those are raw
+/// requests, credentials and bodies included.
 pub struct BatchBuffer {
     /// The underlying buffer
     buffer: BytesMut,
@@ -626,6 +818,18 @@ pub struct BatchBuffer {
     read_pos: usize,
     /// Write position (end of valid data)
     write_pos: usize,
+}
+
+impl std::fmt::Debug for BatchBuffer {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("BatchBuffer")
+            .field("buffered", &(self.write_pos - self.read_pos))
+            .field("capacity", &self.buffer.capacity())
+            .field("config", &self.config)
+            .field("read_pos", &self.read_pos)
+            .field("write_pos", &self.write_pos)
+            .finish()
+    }
 }
 
 impl BatchBuffer {
@@ -824,6 +1028,51 @@ impl BatchReader {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn asterisk_form_converts_only_for_options() {
+        let parser = BatchParser::new(BatchConfig::default());
+        for (input, ok) in [
+            ("OPTIONS * HTTP/1.1\r\nHost: a\r\n\r\n", true),
+            ("GET * HTTP/1.1\r\nHost: a\r\n\r\n", false),
+        ] {
+            let (parsed, _) = parser.parse_single(input.as_bytes()).unwrap().unwrap();
+            assert_eq!(parsed.to_http_request().is_ok(), ok, "{input}");
+        }
+    }
+
+    #[test]
+    fn content_length_framing_is_strict() {
+        let parser = BatchParser::new(BatchConfig::default());
+        let req = |cl: &str| format!("POST /x HTTP/1.1\r\nHost: a\r\n{cl}\r\n\r\nhello");
+        // A list of identical values, or the same value twice, is one length.
+        for ok in [
+            "Content-Length: 5",
+            "Content-Length: 5, 5",
+            "Content-Length: 5\r\nContent-Length: 5",
+        ] {
+            let input = req(ok);
+            let (parsed, used) = parser.parse_single(input.as_bytes()).unwrap().unwrap();
+            assert_eq!(parsed.body, b"hello", "{ok}");
+            assert_eq!(used, input.len(), "{ok}");
+        }
+        // Anything a second parser could read differently is refused.
+        for bad in [
+            "Content-Length: +5",
+            "Content-Length: 5, 6",
+            "Content-Length: 5\r\nContent-Length: 6",
+            "Content-Length: 5x",
+            "Content-Length: ,5",
+            "Content-Length: 99999999999999999999999",
+        ] {
+            assert!(parser.parse_single(req(bad).as_bytes()).is_err(), "{bad}");
+        }
+        // A length that would wrap `header_len + length` is an error, not a
+        // backwards slice.
+        let huge = req(&format!("Content-Length: {}", usize::MAX));
+        assert!(parser.parse_single(huge.as_bytes()).is_err());
+    }
+
     use super::*;
 
     #[test]
@@ -892,6 +1141,49 @@ mod tests {
         assert_eq!(req.content_length(), Some(5));
         assert!(req.is_keep_alive());
         assert_eq!(req.header("host"), Some(b"example.com".as_slice()));
+    }
+
+    /// `content_length()` reports what framing used: the list form a parser
+    /// accepted is that length, and a conflict (which framing refuses) is
+    /// not quietly resolved to the first value.
+    #[test]
+    fn content_length_helper_agrees_with_framing() {
+        let parser = BatchParser::new(BatchConfig::default());
+        let input = b"POST /x HTTP/1.1\r\nHost: a\r\nContent-Length: 5, 5\r\n\r\nhello";
+        let (parsed, _) = parser.parse_single(input).unwrap().unwrap();
+        assert_eq!(parsed.body, b"hello");
+        assert_eq!(parsed.content_length(), Some(5));
+
+        let with_headers = |headers: Vec<(&'static str, &'static [u8])>| ParsedRequest {
+            method: "POST",
+            path: "/x",
+            version: "1.1",
+            headers,
+            body: b"hello",
+            bytes_consumed: 0,
+        };
+        let conflicting = with_headers(vec![("Content-Length", b"5"), ("content-length", b"6")]);
+        assert_eq!(conflicting.content_length(), None);
+        let lenient = with_headers(vec![("Content-Length", b" +5")]);
+        assert_eq!(lenient.content_length(), None);
+        let absent = with_headers(vec![("Host", b"a")]);
+        assert_eq!(absent.content_length(), None);
+
+        let owned = |r: &ParsedRequest<'_>| OwnedParsedRequest {
+            method: r.method.to_string(),
+            path: r.path.to_string(),
+            version: r.version.to_string(),
+            headers: r
+                .headers
+                .iter()
+                .map(|(n, v)| (n.to_string(), v.to_vec()))
+                .collect(),
+            body: Bytes::copy_from_slice(r.body),
+            bytes_consumed: r.bytes_consumed,
+        };
+        assert_eq!(owned(&parsed).content_length(), Some(5));
+        assert_eq!(owned(&conflicting).content_length(), None);
+        assert_eq!(owned(&absent).content_length(), None);
     }
 
     #[test]
@@ -998,7 +1290,7 @@ mod tests {
         let result = parser.parse_batch(request);
         assert_eq!(result.requests.len(), 1);
 
-        let http_req = result.requests[0].to_http_request();
+        let http_req = result.requests[0].to_http_request().unwrap();
         assert_eq!(http_req.method, "POST");
         assert_eq!(http_req.path, "/api/data");
         assert_eq!(
@@ -1006,5 +1298,125 @@ mod tests {
             Some("application/json")
         );
         assert_eq!(http_req.body_ref(), b"{\"key\":\"val\"}");
+    }
+
+    /// Repeated fields keep every occurrence, and `Host` is held to the
+    /// serve paths' rules rather than collapsed or passed through unchecked.
+    #[test]
+    fn to_http_request_keeps_repeated_headers_and_checks_host() {
+        let parser = BatchParser::new(BatchConfig::default());
+        let ok = b"GET / HTTP/1.1\r\nHost: a.example\r\nX-Forwarded-For: 1.1.1.1\r\nX-Forwarded-For: 2.2.2.2\r\n\r\n";
+        let result = parser.parse_batch(ok);
+        let req = result.requests[0].to_http_request().unwrap();
+        assert_eq!(
+            req.headers.get_all("x-forwarded-for"),
+            vec!["1.1.1.1", "2.2.2.2"]
+        );
+        let owned = |r: &ParsedRequest<'_>| OwnedParsedRequest {
+            method: r.method.to_string(),
+            path: r.path.to_string(),
+            version: r.version.to_string(),
+            headers: r
+                .headers
+                .iter()
+                .map(|(k, v)| (k.to_string(), v.to_vec()))
+                .collect(),
+            body: Bytes::copy_from_slice(r.body),
+            bytes_consumed: r.bytes_consumed,
+        };
+        let req = owned(&result.requests[0]).to_http_request().unwrap();
+        assert_eq!(req.headers.get_all("x-forwarded-for").len(), 2);
+
+        for bad in [
+            &b"GET / HTTP/1.1\r\nHost: a.example\r\nHost: b.example\r\n\r\n"[..],
+            b"GET / HTTP/1.1\r\nHost: victim.example@evil.example\r\n\r\n",
+            b"GET / HTTP/1.1\r\n\r\n",
+            b"GET http://a.example/ HTTP/1.1\r\nHost: a.example\r\n\r\n",
+        ] {
+            let result = parser.parse_batch(bad);
+            assert!(
+                matches!(
+                    result.requests[0].to_http_request(),
+                    Err(crate::Error::BadRequest(_))
+                ),
+                "{}",
+                String::from_utf8_lossy(bad)
+            );
+            assert!(owned(&result.requests[0]).to_http_request().is_err());
+        }
+    }
+
+    /// A field line that is not UTF-8 reaches the request as-is, so the
+    /// `X-Forwarded-For` rule that such a chain names no client applies here
+    /// as on the serve paths, instead of the bad line silently vanishing and
+    /// the next one being trusted in its place.
+    #[test]
+    fn to_http_request_keeps_non_utf8_field_lines() {
+        let parser = BatchParser::new(BatchConfig::default());
+        let raw = b"GET / HTTP/1.1\r\nHost: a.example\r\nX-Forwarded-For: 1.1.1.1\r\nX-Forwarded-For: \xff2.2.2.2\r\n\r\n";
+        let result = parser.parse_batch(raw);
+        let peer = "10.0.0.1:443".parse().ok();
+        let req = result.requests[0]
+            .to_http_request()
+            .unwrap()
+            .with_peer(peer);
+        assert_eq!(req.headers.get_all_bytes("x-forwarded-for").len(), 2);
+        assert_eq!(req.client_address(1), None);
+    }
+
+    /// The target is canonicalized by the same rule `admit` applies, so a
+    /// batch-built request cannot carry a spelling no serve path would let
+    /// through.
+    #[test]
+    fn to_http_request_canonicalizes_the_target() {
+        let parser = BatchParser::new(BatchConfig::default());
+        let result = parser.parse_batch(b"GET //%61dmin//x?q=%2F HTTP/1.1\r\nHost: a\r\n\r\n");
+        let req = result.requests[0].to_http_request().unwrap();
+        assert_eq!(req.path, "/admin/x?q=%2F");
+
+        for bad in [
+            &b"GET /a/../admin HTTP/1.1\r\nHost: a\r\n\r\n"[..],
+            b"GET /%2Fadmin HTTP/1.1\r\nHost: a\r\n\r\n",
+        ] {
+            let result = parser.parse_batch(bad);
+            assert!(matches!(
+                result.requests[0].to_http_request(),
+                Err(crate::Error::BadRequest(_))
+            ));
+        }
+    }
+
+    #[test]
+    fn parsed_request_debug_follows_http_request_rules() {
+        let borrowed = ParsedRequest {
+            method: "POST",
+            path: "/login?code=q-secret",
+            version: "1.1",
+            headers: vec![("Cookie", b"sid=h-secret"), ("Accept", b"*/*")],
+            body: b"password=b-secret",
+            bytes_consumed: 0,
+        };
+        let owned = OwnedParsedRequest {
+            method: "POST".into(),
+            path: "/login?code=q-secret".into(),
+            version: "1.1".into(),
+            headers: vec![("Cookie".into(), b"sid=h-secret".to_vec())],
+            body: Bytes::from_static(b"password=b-secret"),
+            bytes_consumed: 0,
+        };
+        let mut buffer = BatchBuffer::new(BatchConfig::default());
+        let raw = b"GET /?k=raw-secret HTTP/1.1\r\n\r\n";
+        buffer.write_slice()[..raw.len()].copy_from_slice(raw);
+        buffer.advance_write(raw.len());
+        for out in [
+            format!("{borrowed:?}"),
+            format!("{owned:?}"),
+            format!("{buffer:?}"),
+        ] {
+            for secret in ["q-secret", "h-secret", "b-secret", "raw-secret"] {
+                assert!(!out.contains(secret), "{secret} leaked: {out}");
+            }
+        }
+        assert!(format!("{borrowed:?}").contains("*/*"));
     }
 }

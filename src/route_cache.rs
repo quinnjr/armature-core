@@ -28,7 +28,7 @@
 
 use crate::handler::BoxedHandler;
 use crate::route_constraint::RouteConstraints;
-use crate::routing::Router;
+use crate::routing::{PatternSegment, Router};
 use crate::{Error, HttpMethod, HttpRequest, HttpResponse};
 use bytes::Bytes;
 use lru::LruCache;
@@ -150,9 +150,13 @@ impl CachedRoute {
             route_index,
             param_indices: compiled.param_indices.clone(),
             is_static: compiled.is_static,
+            // The catch-all's own position, not the last segment's: the two
+            // only coincide because `compile` ends a pattern at its catch-all,
+            // and the cached extraction must not depend on that staying true.
             catch_all_index: compiled
-                .has_catch_all
-                .then(|| compiled.segments.len().saturating_sub(1)),
+                .segments
+                .iter()
+                .position(|segment| matches!(segment, RouteSegment::CatchAll(_))),
         }
     }
 
@@ -331,9 +335,12 @@ impl StaticRoutes {
         result
     }
 
-    /// Check if path is static (no parameter segments).
+    /// Check if path is static (no parameter segments, in either the
+    /// `:name` / `*name` or the `{name}` / `{*name}` spelling).
     pub fn is_static_path(path: &str) -> bool {
-        !path.contains(':') && !path.contains('*')
+        path.split('/')
+            .filter(|s| !s.is_empty())
+            .all(|s| matches!(PatternSegment::parse(s), PatternSegment::Static(_)))
     }
 
     /// Get statistics.
@@ -392,8 +399,40 @@ pub enum RouteSegment {
     CatchAll(String),
 }
 
+/// A pattern segment with parameter names erased, for duplicate detection.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+enum SegmentShape<'a> {
+    Static(&'a str),
+    Param,
+    CatchAll,
+}
+
 impl CompiledRoute {
+    /// The pattern with parameter names erased.
+    fn shape(&self) -> Vec<SegmentShape<'_>> {
+        self.segments
+            .iter()
+            .map(|segment| match segment {
+                RouteSegment::Static(s) => SegmentShape::Static(s),
+                RouteSegment::Param(_) => SegmentShape::Param,
+                RouteSegment::CatchAll(_) => SegmentShape::CatchAll,
+            })
+            .collect()
+    }
+
+    /// Whether two patterns match exactly the same paths: equal segment by
+    /// segment, with parameter names ignored.
+    fn same_pattern(&self, other: &CompiledRoute) -> bool {
+        self.segments.len() == other.segments.len() && self.shape().into_iter().eq(other.shape())
+    }
+
     /// Compile a route pattern.
+    ///
+    /// Pattern syntax is read by the same parser the linear
+    /// [`Router`] uses, so `{name}` / `{*name}` mean
+    /// exactly what `:name` / `*name` do. A catch-all ends the pattern: any
+    /// segments written after it are unreachable in the linear router, so they
+    /// are dropped here rather than half-honored.
     pub fn compile(pattern: &str) -> Self {
         let mut segments = Vec::new();
         let mut param_indices = Vec::new();
@@ -401,18 +440,22 @@ impl CompiledRoute {
         let mut has_catch_all = false;
 
         for (idx, part) in pattern.split('/').filter(|s| !s.is_empty()).enumerate() {
-            if let Some(name) = part.strip_prefix(':') {
-                segments.push(RouteSegment::Param(name.to_string()));
-                param_indices.push((crate::param_intern::intern(name), idx));
-                is_static = false;
-            } else if let Some(name) = part.strip_prefix('*') {
-                let name = if name.is_empty() { "*" } else { name };
-                segments.push(RouteSegment::CatchAll(name.to_string()));
-                param_indices.push((crate::param_intern::intern(name), idx));
-                is_static = false;
-                has_catch_all = true;
-            } else {
-                segments.push(RouteSegment::Static(part.to_string()));
+            match PatternSegment::parse(part) {
+                PatternSegment::Param(name) => {
+                    segments.push(RouteSegment::Param(name.to_string()));
+                    param_indices.push((crate::param_intern::intern(name), idx));
+                    is_static = false;
+                }
+                PatternSegment::CatchAll(name) => {
+                    segments.push(RouteSegment::CatchAll(name.to_string()));
+                    param_indices.push((crate::param_intern::intern(name), idx));
+                    is_static = false;
+                    has_catch_all = true;
+                    break;
+                }
+                PatternSegment::Static(text) => {
+                    segments.push(RouteSegment::Static(text.to_string()));
+                }
             }
         }
 
@@ -509,7 +552,7 @@ pub struct OptimizedRoute {
     ///
     /// Carried alongside the compiled pattern so the optimized dispatch can
     /// validate a matched route's parameters exactly as the linear
-    /// [`Router`](crate::routing::Router) does, returning the same
+    /// [`Router`] does, returning the same
     /// `Error::BadRequest` on failure.
     pub constraints: Option<RouteConstraints>,
 }
@@ -558,27 +601,96 @@ impl OptimizedRouter {
     }
 
     /// Add a route.
+    ///
+    /// First-registered-wins, exactly as [`from_router`](Self::from_router)
+    /// and the linear [`Router`]: a later registration for a method and path
+    /// an earlier route already answers is unreachable there. A duplicate
+    /// method+pattern registration is logged at `warn` (see
+    /// [`duplicate_routes`](Self::duplicate_routes)).
     pub fn add_route(
         &mut self,
         method: HttpMethod,
         path: impl Into<String>,
         handler: BoxedHandler,
     ) {
-        let path = path.into();
-        let compiled = CompiledRoute::compile(&path);
+        self.push_route(method, &path.into(), handler, None);
+    }
+
+    /// Append one route, keeping the static fast path first-registered-wins.
+    fn push_route(
+        &mut self,
+        method: HttpMethod,
+        path: &str,
+        handler: BoxedHandler,
+        constraints: Option<RouteConstraints>,
+    ) {
+        let compiled = CompiledRoute::compile(path);
         let route_index = self.routes.len();
 
-        // Add to static routes if applicable
+        if let Some(earlier) = self
+            .routes
+            .iter()
+            .position(|r| r.method == method && r.compiled.same_pattern(&compiled))
+        {
+            // Not silently: when two modules register the same method+path,
+            // whichever registered first answers it, guards and all — so an
+            // unguarded controller imported ahead of a guarded one exposes the
+            // guarded route. `Router` registration can't fail, so this is
+            // surfaced here and through `duplicate_routes` for bootstrap.
+            tracing::warn!(
+                method = method.as_str(),
+                path,
+                earlier = %self.routes[earlier].compiled.pattern,
+                "duplicate route registration: the earlier route answers this \
+                 method and path, the later one is unreachable"
+            );
+        }
+
+        // Only take the O(1) static fast path when no earlier route shadows
+        // this concrete path. `matches` handles static, `:param`, and
+        // `*catch_all` earlier routes, so precedence is identical to the
+        // linear first-match scan. (Inserting unconditionally used to let a
+        // later exact duplicate overwrite the earlier one's slot.)
         if compiled.is_static {
-            self.static_routes.add(method.clone(), &path, route_index);
+            let shadowed_by_earlier = self
+                .routes
+                .iter()
+                .any(|earlier| earlier.method == method && earlier.compiled.matches(path));
+            if !shadowed_by_earlier {
+                self.static_routes.add(method.clone(), path, route_index);
+            }
         }
 
         self.routes.push(OptimizedRoute {
             method,
             compiled,
             handler,
-            constraints: None,
+            constraints,
         });
+    }
+
+    /// Every registration that repeats an earlier route's method and pattern,
+    /// as `(earlier_index, later_index)` pairs in registration order.
+    ///
+    /// Parameter names don't distinguish patterns (`/u/:id` and `/u/:uid` are
+    /// duplicates); an overlap that is not an exact repeat (`/u/:id` then
+    /// `/u/me`) is not reported. The later route of each pair is never
+    /// dispatched. Meant for bootstrap to refuse such a route table rather
+    /// than let registration order decide which handler — and which guards —
+    /// answer a path.
+    pub fn duplicate_routes(&self) -> Vec<(usize, usize)> {
+        let mut first_seen: HashMap<(&str, Vec<SegmentShape<'_>>), usize> = HashMap::new();
+        let mut duplicates = Vec::new();
+        for (index, route) in self.routes.iter().enumerate() {
+            let key = (route.method.as_str(), route.compiled.shape());
+            match first_seen.get(&key) {
+                Some(&earlier) => duplicates.push((earlier, index)),
+                None => {
+                    first_seen.insert(key, index);
+                }
+            }
+        }
+        duplicates
     }
 
     /// Build an `OptimizedRouter` from a fully-populated linear [`Router`].
@@ -602,29 +714,12 @@ impl OptimizedRouter {
         let mut opt = Self::new();
 
         for route in &router.routes {
-            let compiled = CompiledRoute::compile(&route.path);
-            let route_index = opt.routes.len();
-
-            // Only take the O(1) static fast path when no earlier route shadows
-            // this concrete path. `matches` handles static, `:param`, and
-            // `*catch_all` earlier routes, so precedence is identical to the
-            // linear first-match scan.
-            if compiled.is_static {
-                let shadowed_by_earlier = opt.routes.iter().any(|earlier| {
-                    earlier.method == route.method && earlier.compiled.matches(&route.path)
-                });
-                if !shadowed_by_earlier {
-                    opt.static_routes
-                        .add(route.method.clone(), &route.path, route_index);
-                }
-            }
-
-            opt.routes.push(OptimizedRoute {
-                method: route.method.clone(),
-                compiled,
-                handler: route.handler.clone(),
-                constraints: route.constraints.clone(),
-            });
+            opt.push_route(
+                route.method.clone(),
+                &route.path,
+                route.handler.clone(),
+                route.constraints.clone(),
+            );
         }
 
         opt
@@ -700,6 +795,9 @@ impl OptimizedRouter {
         if let Some(params) = resolved.params {
             request.path_params = params;
         }
+        // Only routes without route-scoped layers still carry constraints
+        // here: `Router::layer_routes` moves a guarded route's constraints
+        // into the handler, behind its guards, so a guard answers first.
         if let Some(constraints) = &route.constraints {
             constraints.validate(&request.path_params)?;
         }
@@ -1047,6 +1145,9 @@ mod tests {
         assert!(StaticRoutes::is_static_path("/users"));
         assert!(!StaticRoutes::is_static_path("/users/:id"));
         assert!(!StaticRoutes::is_static_path("/files/*path"));
+        assert!(!StaticRoutes::is_static_path("/users/{id}"));
+        assert!(!StaticRoutes::is_static_path("/files/{*path}"));
+        assert!(StaticRoutes::is_static_path("/lit/a{b}c"));
     }
 
     #[test]
@@ -1179,6 +1280,27 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_from_router_double_star_is_catch_all() {
+        for pattern in ["/files/**", "/files/{**}"] {
+            let mut router = crate::routing::Router::new();
+            router.add_route(crate::routing::Route::new(
+                HttpMethod::GET,
+                pattern,
+                |_req: HttpRequest| async { Ok::<_, Error>(HttpResponse::ok()) },
+            ));
+            let opt = OptimizedRouter::from_router(&router);
+            for path in ["/files", "/files/a", "/files/a/b"] {
+                assert!(
+                    router.match_route("GET", path).is_some(),
+                    "{pattern} {path}"
+                );
+                let resp = opt.route(HttpRequest::new("GET", path)).await;
+                assert!(resp.is_ok(), "{pattern} {path}");
+            }
+        }
+    }
+
+    #[tokio::test]
     async fn test_from_router_validates_constraints() {
         let constraints =
             RouteConstraints::new().add("id", Box::new(crate::route_constraint::UIntConstraint));
@@ -1295,34 +1417,6 @@ mod tests {
             (HttpMethod::GET, "/files/*path"),
             (HttpMethod::POST, "/users"),
         ];
-
-        let mut router = crate::routing::Router::new();
-        for (method, pattern) in patterns {
-            // The body identifies which route answered and with which captures,
-            // so a disagreement about *which* route matched is caught too, not
-            // just a disagreement about whether anything matched.
-            let label = pattern.to_string();
-            router.add_route(crate::routing::Route::new(
-                method,
-                pattern,
-                move |req: HttpRequest| {
-                    let label = label.clone();
-                    async move {
-                        let mut captures: Vec<String> = req
-                            .path_params
-                            .iter()
-                            .map(|(k, v)| format!("{k}={}", String::from_utf8_lossy(v)))
-                            .collect();
-                        captures.sort();
-                        let body = format!("{label} {}", captures.join(","));
-                        Ok::<_, Error>(HttpResponse::ok().with_body(body.into_bytes()))
-                    }
-                },
-            ));
-        }
-
-        let opt = OptimizedRouter::from_router(&router);
-
         let targets = [
             ("GET", "/health"),
             ("GET", "/health/"),
@@ -1344,20 +1438,157 @@ mod tests {
             ("POST", "/health"),
             ("PROPFIND", "/health"),
         ];
+        assert_routers_agree(&patterns, &targets).await;
+    }
 
-        for (method, target) in targets {
-            let linear = router.route(HttpRequest::new(method, target)).await;
-            let compiled = opt.route(HttpRequest::new(method, target)).await;
-            match (linear, compiled) {
-                (Ok(a), Ok(b)) => assert_eq!(a.body, b.body, "{method} {target}"),
-                (Err(_), Err(_)) => {}
-                (a, b) => panic!(
-                    "{method} {target}: linear matched={}, compiled matched={}",
-                    a.is_ok(),
-                    b.is_ok()
-                ),
-            }
+    /// Register `patterns` on a linear `Router`, compile it, and require both
+    /// routers to give every target the same outcome: the same route (by
+    /// pattern) with the same captures, or a miss on both. Each target is
+    /// requested twice so a cached hit is compared as well as the first match.
+    ///
+    /// Returns the linear router's response bodies (`None` for a miss) so a
+    /// caller can also pin down *which* route answered.
+    async fn assert_routers_agree(
+        patterns: &[(HttpMethod, &str)],
+        targets: &[(&str, &str)],
+    ) -> Vec<Option<String>> {
+        let mut router = crate::routing::Router::new();
+        for (method, pattern) in patterns {
+            // The body identifies which route answered and with which captures,
+            // so a disagreement about *which* route matched is caught too, not
+            // just a disagreement about whether anything matched.
+            let label = pattern.to_string();
+            router.add_route(crate::routing::Route::new(
+                method.clone(),
+                *pattern,
+                move |req: HttpRequest| {
+                    let label = label.clone();
+                    async move {
+                        let mut captures: Vec<String> = req
+                            .path_params
+                            .iter()
+                            .map(|(k, v)| format!("{k}={}", String::from_utf8_lossy(v)))
+                            .collect();
+                        captures.sort();
+                        let body = format!("{label} {}", captures.join(","));
+                        Ok::<_, Error>(HttpResponse::ok().with_body(body.into_bytes()))
+                    }
+                },
+            ));
         }
+
+        let opt = OptimizedRouter::from_router(&router);
+
+        let mut answers = Vec::with_capacity(targets.len());
+        for &(method, target) in targets {
+            let linear = router.route(HttpRequest::new(method, target)).await;
+            // Twice: the first is a pattern match, the second may be a cache hit.
+            for pass in ["uncached", "cached"] {
+                let compiled = opt.route(HttpRequest::new(method, target)).await;
+                match (&linear, compiled) {
+                    (Ok(a), Ok(b)) => assert_eq!(a.body, b.body, "{method} {target} ({pass})"),
+                    (Err(_), Err(_)) => {}
+                    (a, b) => panic!(
+                        "{method} {target} ({pass}): linear matched={}, compiled matched={}",
+                        a.is_ok(),
+                        b.is_ok()
+                    ),
+                }
+            }
+            answers.push(
+                linear
+                    .ok()
+                    .map(|r| String::from_utf8_lossy(&r.body).into_owned()),
+            );
+        }
+        answers
+    }
+
+    /// `{name}` and `{*name}` are accepted by the route macros' validation, so
+    /// both routers must treat them exactly like `:name` and `*name`. They used
+    /// to disagree: the compiled router read `{id}` as a literal segment, and
+    /// the linear router's shadowing check missed it, so a later static
+    /// `/users/me` beat the earlier `/users/{id}` there — which handler (and
+    /// guards) answered depended on the router.
+    #[tokio::test]
+    async fn test_brace_syntax_routes_agree_and_keep_first_registered_wins() {
+        let patterns = [
+            (HttpMethod::GET, "/users/{id}"),
+            (HttpMethod::GET, "/users/me"),
+            (HttpMethod::GET, "/files/{*path}"),
+            (HttpMethod::GET, "/files/readme"),
+            (HttpMethod::GET, "/mixed/:a/{b}"),
+        ];
+        let targets = [
+            ("GET", "/users/42"),
+            ("GET", "/users/me"),
+            ("GET", "/users/42/"),
+            ("GET", "/files"),
+            ("GET", "/files/readme"),
+            ("GET", "/files/a/b/c.txt"),
+            ("GET", "/mixed/1/2"),
+            ("GET", "/mixed/1"),
+        ];
+        let answers = assert_routers_agree(&patterns, &targets).await;
+        assert_eq!(answers[0].as_deref(), Some("/users/{id} id=42"));
+        assert_eq!(
+            answers[1].as_deref(),
+            Some("/users/{id} id=me"),
+            "the earlier brace-syntax route must shadow the later static one"
+        );
+        assert_eq!(answers[3].as_deref(), Some("/files/{*path} path="));
+        assert_eq!(answers[4].as_deref(), Some("/files/{*path} path=readme"));
+        assert_eq!(answers[5].as_deref(), Some("/files/{*path} path=a/b/c.txt"));
+        assert_eq!(answers[6].as_deref(), Some("/mixed/:a/{b} a=1,b=2"));
+        assert_eq!(answers[7], None);
+    }
+
+    /// A brace that is not a whole `{name}` segment is literal text in both
+    /// routers rather than a `matchit` parameter in one and a literal in the
+    /// other.
+    #[tokio::test]
+    async fn test_partial_brace_segments_are_literal_in_both_routers() {
+        let patterns = [(HttpMethod::GET, "/lit/a{b}c"), (HttpMethod::GET, "/lit/{")];
+        let targets = [
+            ("GET", "/lit/a{b}c"),
+            ("GET", "/lit/aXc"),
+            ("GET", "/lit/{"),
+            ("GET", "/lit/x"),
+        ];
+        let answers = assert_routers_agree(&patterns, &targets).await;
+        assert_eq!(answers[0].as_deref(), Some("/lit/a{b}c "));
+        assert_eq!(answers[1], None);
+        assert_eq!(answers[2].as_deref(), Some("/lit/{ "));
+        assert_eq!(answers[3], None);
+    }
+
+    /// A catch-all ends a pattern: segments after it are never reached (the
+    /// linear router's rule). The cache used to record the *last* segment as
+    /// the catch-all, so `/a/*rest/b` captured `rest=x/y/z` on the first
+    /// request and `rest=x` on every cached one after it.
+    #[tokio::test]
+    async fn test_mid_pattern_catch_all_cached_extraction_matches_uncached() {
+        let compiled = CompiledRoute::compile("/a/*rest/b");
+        let cached = CachedRoute::from_compiled(0, &compiled);
+        for path in ["/a/x/y/z", "/a/x", "/a"] {
+            assert_eq!(
+                cached.extract_params(path).get_str("rest"),
+                compiled.extract_params(path).get_str("rest"),
+                "{path}"
+            );
+        }
+
+        let patterns = [(HttpMethod::GET, "/a/*rest/b")];
+        let targets = [
+            ("GET", "/a/x/y/z"),
+            ("GET", "/a/x"),
+            ("GET", "/a"),
+            ("GET", "/b"),
+        ];
+        let answers = assert_routers_agree(&patterns, &targets).await;
+        assert_eq!(answers[0].as_deref(), Some("/a/*rest/b rest=x/y/z"));
+        assert_eq!(answers[2].as_deref(), Some("/a/*rest/b rest="));
+        assert_eq!(answers[3], None);
     }
 
     #[tokio::test]
@@ -1473,5 +1704,44 @@ mod tests {
         assert!(cache.get(&key2).is_some());
         assert!(cache.get(&key3).is_some());
         assert_eq!(cache.len(), 3);
+    }
+
+    // ---- Duplicate registrations ------------------------------------------
+
+    fn status_handler(status: u16) -> BoxedHandler {
+        crate::handler::handler(move |_req: HttpRequest| async move {
+            Ok::<_, Error>(HttpResponse::new(status))
+        })
+    }
+
+    /// `add_route` must agree with `from_router` and the linear router: the
+    /// first registration of a method+path wins. The static fast path used to
+    /// overwrite its slot, handing the path to the *last* registration — so a
+    /// later, unguarded duplicate could take over a guarded route.
+    #[tokio::test]
+    async fn test_add_route_duplicate_static_first_wins() {
+        let mut router = OptimizedRouter::new();
+        router.add_route(HttpMethod::GET, "/admin", status_handler(200));
+        router.add_route(HttpMethod::GET, "/admin", status_handler(500));
+        let resp = router
+            .route(HttpRequest::new("GET", "/admin"))
+            .await
+            .unwrap();
+        assert_eq!(resp.status, 200, "the first registration must win");
+    }
+
+    /// Duplicate method+pattern registrations are reported so bootstrap can
+    /// refuse them; parameter names don't make two patterns different, and a
+    /// mere overlap (a param route shadowing a static one) is not a duplicate.
+    #[test]
+    fn test_duplicate_routes_reported() {
+        let mut router = OptimizedRouter::new();
+        router.add_route(HttpMethod::GET, "/admin", status_handler(200));
+        router.add_route(HttpMethod::GET, "/u/:id", status_handler(200));
+        router.add_route(HttpMethod::POST, "/admin", status_handler(200));
+        router.add_route(HttpMethod::GET, "admin/", status_handler(200));
+        router.add_route(HttpMethod::GET, "/u/:uid", status_handler(200));
+        router.add_route(HttpMethod::GET, "/u/me", status_handler(200));
+        assert_eq!(router.duplicate_routes(), vec![(0, 3), (1, 4)]);
     }
 }

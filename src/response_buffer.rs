@@ -55,9 +55,19 @@ pub const LARGE_RESPONSE_CAPACITY: usize = 65536;
 ///
 /// This provides a growable buffer that's pre-allocated to avoid
 /// reallocations for typical response sizes.
-#[derive(Debug)]
+///
+/// `Debug` prints length and capacity, never the buffered bytes.
 pub struct ResponseBuffer {
     inner: BytesMut,
+}
+
+impl std::fmt::Debug for ResponseBuffer {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ResponseBuffer")
+            .field("len", &self.inner.len())
+            .field("capacity", &self.inner.capacity())
+            .finish()
+    }
 }
 
 impl ResponseBuffer {
@@ -251,11 +261,30 @@ impl std::io::Write for ResponseBuffer {
 ///     .body_json(&data)?
 ///     .build();
 /// ```
-#[derive(Debug)]
+///
+/// `Debug` redacts sensitive header values and omits the body bytes.
 pub struct ResponseBuilder {
     status: u16,
     headers: Vec<(String, String)>,
     body: ResponseBuffer,
+}
+
+impl std::fmt::Debug for ResponseBuilder {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ResponseBuilder")
+            .field("status", &self.status)
+            .field(
+                "headers",
+                &crate::headers::RedactedHeaders(
+                    self.headers
+                        .iter()
+                        .map(|(k, v)| (k.as_str(), v.as_bytes()))
+                        .collect(),
+                ),
+            )
+            .field("body", &self.body)
+            .finish()
+    }
 }
 
 impl ResponseBuilder {
@@ -377,6 +406,20 @@ pub fn response_builder_with_capacity(capacity: usize) -> ResponseBuilder {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_builder_debug_redacts() {
+        let b = ResponseBuilder::new()
+            .header("Set-Cookie", "session=abc123")
+            .header("Content-Type", "text/plain")
+            .body(b"secret-body");
+        let dbg = format!("{b:?}");
+        assert!(
+            !dbg.contains("abc123") && !dbg.contains("secret-body"),
+            "{dbg}"
+        );
+        assert!(dbg.contains("text/plain"), "{dbg}");
+    }
 
     #[test]
     fn test_response_buffer_new() {

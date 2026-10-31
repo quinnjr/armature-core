@@ -4,6 +4,18 @@
 //! `HashMap<String, String>` on every request that had one, whether or not any
 //! handler read it. This parses on first access and memoizes, so a handler that
 //! ignores the query pays nothing beyond carrying the raw bytes it already had.
+//!
+//! # Repeated keys: the first one wins
+//!
+//! `?role=user&role=admin` is ambiguous, and if one layer (say, an auth check
+//! reading [`QueryView::get`]) took the first value while another (the handler's
+//! `Query<T>` or a `HashMap` copy) took the last, an attacker could show each
+//! layer a different value. Every single-value view of urlencoded input in this
+//! crate therefore resolves a repeated key to its **first** occurrence:
+//! [`QueryView::get`], [`QueryView::to_hash_map`], the `Query<T>` extractor,
+//! [`crate::form::parse_form`], [`crate::form::parse_form_map`], and
+//! [`crate::form::MultipartParser::to_map`]. Use [`QueryView::get_all`] when
+//! every value is wanted.
 
 use smallvec::SmallVec;
 use std::borrow::Cow;
@@ -18,9 +30,20 @@ pub type QueryPairs = SmallVec<[(String, String); 8]>;
 /// `&str` into the request's memoized pairs, never copies of them. The pairs
 /// themselves are owned — percent-decoding has to produce new bytes — but they
 /// are built once, on first access, not per lookup.
-#[derive(Debug, Clone, Copy)]
+///
+/// `Debug` prints the key names and each value's length, not the values: a
+/// query routinely carries tokens and reset codes.
+#[derive(Clone, Copy)]
 pub struct QueryView<'a> {
     pairs: &'a [(String, String)],
+}
+
+impl std::fmt::Debug for QueryView<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("QueryView")
+            .field("pairs", &crate::headers::RedactedPairs(self.pairs))
+            .finish()
+    }
 }
 
 impl<'a> QueryView<'a> {
@@ -74,10 +97,14 @@ impl<'a> QueryView<'a> {
     /// An owned copy, for the call sites that genuinely need one.
     ///
     /// This is the allocation the lazy path exists to avoid — reach for it only
-    /// when a `HashMap` is actually required. Repeated keys collapse to the last
-    /// one, matching `HashMap`'s own insert semantics.
+    /// when a `HashMap` is actually required. Repeated keys collapse to the
+    /// *first* one, agreeing with [`get`](Self::get) (see the module docs).
     pub fn to_hash_map(&self) -> HashMap<String, String> {
-        self.pairs.iter().cloned().collect()
+        let mut map = HashMap::with_capacity(self.pairs.len());
+        for (k, v) in self.pairs {
+            map.entry(k.clone()).or_insert_with(|| v.clone());
+        }
+        map
     }
 }
 
@@ -96,13 +123,97 @@ impl<'a> IntoIterator for QueryView<'a> {
     }
 }
 
+/// Reduce urlencoded `input` to the first occurrence of each key, so serde
+/// deserialization (whose `HashMap`s keep the last value and whose structs
+/// reject duplicates) agrees with the crate-wide first-wins rule.
+///
+/// Borrows `input` unchanged in the common case of no repeated key; only input
+/// that actually repeats a key (or whose keys need decoding to tell) is
+/// re-encoded. Errors carry serde's message, for the caller to log.
+pub(crate) fn first_wins_urlencoded(input: &[u8]) -> Result<Cow<'_, [u8]>, String> {
+    // Fast path on the raw keys. A key with an escape or `+` could equal
+    // another only after decoding, so those take the slow path. So does any
+    // non-ASCII byte: decoding is lossy, and two distinct invalid-UTF-8 keys
+    // (`\xff`, `\xfe`) both become U+FFFD -- one key to serde, two here.
+    let mut keys: SmallVec<[&[u8]; 16]> = SmallVec::new();
+    let mut needs_decode = false;
+    for pair in input.split(|&b| b == b'&') {
+        if pair.is_empty() {
+            continue;
+        }
+        let key = pair.split(|&b| b == b'=').next().unwrap_or(pair);
+        if key.iter().any(|&b| b == b'%' || b == b'+' || b >= 0x80) {
+            needs_decode = true;
+            break;
+        }
+        keys.push(key);
+    }
+    if !needs_decode {
+        keys.sort_unstable();
+        if keys.windows(2).all(|w| w[0] != w[1]) {
+            return Ok(Cow::Borrowed(input));
+        }
+    }
+
+    let pairs: Vec<(String, String)> =
+        serde_urlencoded::from_bytes(input).map_err(|e| e.to_string())?;
+    let mut seen = std::collections::HashSet::with_capacity(pairs.len());
+    let deduped: Vec<(String, String)> = pairs
+        .into_iter()
+        .filter(|(k, _)| seen.insert(k.clone()))
+        .collect();
+    serde_urlencoded::to_string(&deduped)
+        .map(|s| Cow::Owned(s.into_bytes()))
+        .map_err(|e| e.to_string())
+}
+
 /// Parse `query` into key/value pairs, percent-decoding both sides.
 ///
-/// Malformed input degrades rather than erroring: a bare key gets an empty
-/// value, and an escape that does not decode is preserved verbatim so the
-/// handler sees what the client sent. Rejecting a request over a stray `%` would
-/// break clients for no security gain — nothing downstream trusts these bytes.
+/// The semantics are exactly `application/x-www-form-urlencoded` parsing as
+/// the `form_urlencoded` crate (and so `serde_urlencoded`, behind `Query<T>`
+/// and `parse_form`) does it: empty `&`-separated pieces are skipped, a bare
+/// key gets an empty value, an **empty key is kept**, `+` is a space, an
+/// escape that is not `%` plus two hex digits stays literal, and bytes that
+/// decode to invalid UTF-8 become U+FFFD.
+///
+/// Matching is the point, not a nicety. The response caches key on these
+/// pairs while the handler reads the query through serde; any input the two
+/// read differently (`?q=1&=payload` with the empty key dropped here, or
+/// `%FF` kept raw here but replaced by serde) lets two requests the handler
+/// answers differently share one cache entry.
+///
+/// Malformed input degrades rather than erroring. Rejecting a request over a
+/// stray `%` would break clients for no security gain — nothing downstream
+/// trusts these bytes.
 pub(crate) fn parse(query: &str) -> QueryPairs {
+    parse_pairs(query)
+}
+
+/// The query string's `&`-separated segments exactly as sent, ordered by
+/// their (undecoded) name, for keying a cache.
+///
+/// Decoding is lossy — `%FF` and `%FE` both become U+FFFD, `+` and `%20` both
+/// a space — so a key built from decoded pairs merges requests that a handler
+/// reading [`HttpRequest::query_string`](crate::HttpRequest::query_string)
+/// tells apart, and one of them could be served the other's body. Raw
+/// segments never merge two requests that decode differently either: equal
+/// raw bytes decode equally. Only the order of differently named segments is
+/// normalized (`?a=1&b=2` and `?b=2&a=1` share an entry); the sort is stable,
+/// so repeated names keep their order and first-wins reads stay the same.
+/// Empty segments (`a=1&&b=2`) carry nothing for any reader and are dropped.
+pub(crate) fn raw_segments_sorted(query: &str) -> Vec<&str> {
+    let mut segments: Vec<&str> = query.split('&').filter(|s| !s.is_empty()).collect();
+    // Ordered by the *decoded* name, as readers see it: sorting raw names
+    // would put `a=1&%61=2` and `%61=2&a=1` in the same order although
+    // first-wins reads `a` as 1 in one and 2 in the other. Ties (the same
+    // decoded name) keep their order, since the sort is stable.
+    segments.sort_by_cached_key(|segment| {
+        decode(segment.split_once('=').map_or(segment, |(k, _)| k)).into_owned()
+    });
+    segments
+}
+
+fn parse_pairs(query: &str) -> QueryPairs {
     let mut out = QueryPairs::new();
     for pair in query.split('&') {
         if pair.is_empty() {
@@ -112,9 +223,6 @@ pub(crate) fn parse(query: &str) -> QueryPairs {
             Some((k, v)) => (k, v),
             None => (pair, ""),
         };
-        if raw_key.is_empty() {
-            continue;
-        }
         out.push((decode(raw_key).into_owned(), decode(raw_value).into_owned()));
     }
     out
@@ -141,8 +249,11 @@ fn decode(s: &str) -> Cow<'_, str> {
             b'%' => {
                 // `get` does the bounds check, so a truncated escape at the end
                 // of the input falls into the `None` arm rather than panicking.
+                // Both digits must be hex. `from_str_radix` alone would also
+                // take a sign (`%+1` as 0x01), which `form_urlencoded` doesn't.
                 match bytes
                     .get(i + 1..i + 3)
+                    .filter(|h| h.iter().all(u8::is_ascii_hexdigit))
                     .and_then(|h| std::str::from_utf8(h).ok())
                     .and_then(|h| u8::from_str_radix(h, 16).ok())
                 {
@@ -164,15 +275,60 @@ fn decode(s: &str) -> Cow<'_, str> {
         }
     }
 
+    // Lossy, as `form_urlencoded` is. Handing back the raw escaped text
+    // instead made `%FF` read as the three characters `%FF` here — the same
+    // pair `%25FF` decodes to — while the handler saw U+FFFD.
     match String::from_utf8(out) {
         Ok(decoded) => Cow::Owned(decoded),
-        // Decoded to non-UTF-8: hand back the raw form rather than lossy text.
-        Err(_) => Cow::Borrowed(s),
+        Err(e) => Cow::Owned(String::from_utf8_lossy(e.as_bytes()).into_owned()),
     }
 }
 
 #[cfg(test)]
 mod tests {
+    use super::raw_segments_sorted;
+
+    #[test]
+    fn debug_prints_keys_and_lengths_not_values() {
+        let req = HttpRequest::new("GET", "/s?token=s3cret&page=2");
+        let out = format!("{:?}", req.query());
+        assert!(!out.contains("s3cret"), "{out}");
+        assert!(out.contains("token") && out.contains("<6 bytes>"), "{out}");
+    }
+
+    #[test]
+    fn raw_segments_sort_by_name_and_keep_repeats_in_order() {
+        assert_eq!(
+            raw_segments_sorted("b=2&a=1&&a=0"),
+            vec!["a=1", "a=0", "b=2"]
+        );
+        // Distinct raw bytes stay distinct, even where decoding merges them.
+        assert_ne!(raw_segments_sorted("a=%FF"), raw_segments_sorted("a=%FE"));
+        assert_ne!(raw_segments_sorted("a=+"), raw_segments_sorted("a=%20"));
+        assert!(raw_segments_sorted("").is_empty());
+        // Differently spelled but equal names stay in request order, so the
+        // two orders below (which first-wins reads differently) differ.
+        assert_ne!(
+            raw_segments_sorted("a=1&%61=2"),
+            raw_segments_sorted("%61=2&a=1")
+        );
+    }
+
+    /// Distinct raw keys that decode to the same lossy string are one key to
+    /// serde, so they must be deduplicated (first wins) too.
+    #[test]
+    fn first_wins_dedups_keys_equal_only_after_lossy_decode() {
+        let out = super::first_wins_urlencoded(b"\xff=first&\xfe=second").unwrap();
+        let pairs: Vec<(String, String)> = serde_urlencoded::from_bytes(&out).unwrap();
+        assert_eq!(pairs, vec![("\u{FFFD}".to_string(), "first".to_string())]);
+
+        // Plain ASCII with distinct keys still borrows.
+        assert!(matches!(
+            super::first_wins_urlencoded(b"a=1&b=2").unwrap(),
+            std::borrow::Cow::Borrowed(_)
+        ));
+    }
+
     use crate::HttpRequest;
 
     #[test]
@@ -203,6 +359,38 @@ mod tests {
     }
 
     #[test]
+    fn to_hash_map_agrees_with_get_on_repeated_keys() {
+        let req = HttpRequest::new("GET", "/s?role=user&role=admin");
+        let q = req.query();
+        assert_eq!(q.get("role"), Some("user"));
+        assert_eq!(
+            q.to_hash_map().get("role").map(String::as_str),
+            Some("user")
+        );
+    }
+
+    #[test]
+    fn first_wins_urlencoded_borrows_when_unique_and_dedupes_otherwise() {
+        use super::first_wins_urlencoded;
+        use std::borrow::Cow;
+
+        let unique = b"a=1&b=2";
+        assert!(matches!(
+            first_wins_urlencoded(unique).unwrap(),
+            Cow::Borrowed(_)
+        ));
+        assert_eq!(
+            &*first_wins_urlencoded(b"role=user&x=1&role=admin").unwrap(),
+            b"role=user&x=1"
+        );
+        // Keys equal only after decoding are still duplicates.
+        assert_eq!(
+            &*first_wins_urlencoded(b"role=user&r%6Fle=admin").unwrap(),
+            b"role=user"
+        );
+    }
+
+    #[test]
     fn no_query_string_is_an_empty_view_not_a_panic() {
         let req = HttpRequest::new("GET", "/s");
         assert!(req.query().is_empty());
@@ -223,8 +411,35 @@ mod tests {
         // handler sees what the client actually sent.
         assert_eq!(q.get("bad"), Some("%zz"));
         assert_eq!(q.get("trunc"), Some("%2"));
-        // A pair with an empty key is dropped: there is nothing to look it up by.
-        assert_eq!(q.len(), 4);
+        // A pair with an empty key is kept, as serde's parser keeps it.
+        assert_eq!(q.get(""), Some("novalue"));
+        assert_eq!(q.len(), 5);
+    }
+
+    /// `QueryView` must read every query exactly as `serde_urlencoded` (and
+    /// so `Query<T>`) does, or a cache keyed on the view can be made to
+    /// share an entry between requests the handler answers differently.
+    #[test]
+    fn decoding_matches_serde_urlencoded() {
+        for raw in [
+            "q=1&=payload",
+            "=",
+            "q=%FF",
+            "q=%25FF",
+            "a=%+1&b=%2&c=%zz&d=x+y&e=%E2%9C%93&f",
+            "&&k=v&&",
+            "k=%C3",
+            "%FF=v",
+        ] {
+            let req = HttpRequest::new("GET", format!("/s?{raw}"));
+            let ours: Vec<(String, String)> = req
+                .query()
+                .iter()
+                .map(|(k, v)| (k.to_owned(), v.to_owned()))
+                .collect();
+            let serde: Vec<(String, String)> = serde_urlencoded::from_str(raw).unwrap();
+            assert_eq!(ours, serde, "{raw}");
+        }
     }
 
     #[test]

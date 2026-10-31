@@ -245,8 +245,18 @@ impl<T: DeserializeOwned> FromRequest for Query<T> {
         // Deserialize the raw query string. Going through the decoded pairs and
         // re-joining them on `&`/`=` corrupted any value that itself contained
         // one of those characters.
-        let value: T = serde_urlencoded::from_str(request.query_string().unwrap_or(""))
-            .map_err(|e| Error::Validation(format!("Invalid query parameters: {}", e)))?;
+        //
+        // A repeated key resolves to its first value, as `request.query().get`
+        // does (see `crate::query`); left to serde, a `HashMap` would keep the
+        // last and a struct would reject the request.
+        //
+        // Errors are `Deserialization`: serde's text names Rust types and
+        // fields, which `Error::client_message` keeps out of the response.
+        let raw = request.query_string().unwrap_or("").as_bytes();
+        let query = crate::query::first_wins_urlencoded(raw)
+            .map_err(|e| Error::Deserialization(format!("Invalid query parameters: {e}")))?;
+        let value: T = serde_urlencoded::from_bytes(&query)
+            .map_err(|e| Error::Deserialization(format!("Invalid query parameters: {}", e)))?;
 
         Ok(Query(value))
     }
@@ -295,8 +305,10 @@ where
             .param(name)
             .ok_or_else(|| Error::Validation(format!("Missing path parameter: {}", name)))?;
 
+        // The `FromStr` error is the type's own text (for a user type it may
+        // name internals), so it goes through the redacted variant.
         let value: T = value_str.parse().map_err(|e: T::Err| {
-            Error::Validation(format!("Invalid path parameter '{}': {}", name, e))
+            Error::Deserialization(format!("Invalid path parameter '{}': {}", name, e))
         })?;
 
         Ok(Path(value))
@@ -352,10 +364,10 @@ impl<T: DeserializeOwned> FromRequest for PathParams<T> {
             .filter_map(|(k, v)| std::str::from_utf8(v).ok().map(|v| (*k, v)))
             .collect();
         let params_string = serde_urlencoded::to_string(&pairs)
-            .map_err(|e| Error::Validation(format!("Invalid path parameters: {}", e)))?;
+            .map_err(|e| Error::Deserialization(format!("Invalid path parameters: {}", e)))?;
 
         let value: T = serde_urlencoded::from_str(&params_string)
-            .map_err(|e| Error::Validation(format!("Invalid path parameters: {}", e)))?;
+            .map_err(|e| Error::Deserialization(format!("Invalid path parameters: {}", e)))?;
 
         Ok(PathParams(value))
     }
@@ -365,6 +377,13 @@ impl<T: DeserializeOwned> FromRequest for PathParams<T> {
 
 /// Extracts a header value by name
 ///
+/// [`from_request`](FromRequestNamed::from_request) and
+/// [`optional`](Self::optional) take the **first** value of a repeated
+/// header, so with two `Authorization` fields (one from the client, one
+/// added by a proxy) the order decides which you get. For a header you treat
+/// as a credential or an authorization input, use [`unique`](Self::unique),
+/// which refuses the request instead.
+///
 /// # Example
 ///
 /// ```rust,ignore
@@ -373,8 +392,11 @@ impl<T: DeserializeOwned> FromRequest for PathParams<T> {
 ///
 /// // Or as optional
 /// let custom: Option<Header> = Header::optional(&request, "X-Custom-Header");
+///
+/// // A credential: absent is `None`, repeated is a 400.
+/// let key: Option<Header> = Header::unique(&request, "X-Api-Key")?;
 /// ```
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct Header {
     name: String,
     value: String,
@@ -410,6 +432,30 @@ impl Header {
         // lowercased retry was always redundant.
         request.headers.get(name).map(|v| Header::new(name, v))
     }
+
+    /// Extract a header that must appear at most once.
+    ///
+    /// `Ok(None)` when absent (or not UTF-8, as with
+    /// [`optional`](Self::optional)); `Err(Validation)` (400) when repeated,
+    /// since there is no telling which copy the client sent.
+    ///
+    /// ```
+    /// use armature_core::{Header, HttpRequest};
+    ///
+    /// let mut request = HttpRequest::new("GET", "/");
+    /// request.headers.append("x-api-key", "a");
+    /// request.headers.append("x-api-key", "b");
+    /// assert!(Header::unique(&request, "X-Api-Key").is_err());
+    /// ```
+    pub fn unique(request: &HttpRequest, name: &str) -> Result<Option<Self>, Error> {
+        let value = request
+            .headers
+            .get_unique(name)
+            .map_err(|_| Error::Validation(format!("Repeated header: {}", name)))?;
+        Ok(value
+            .and_then(|v| std::str::from_utf8(v).ok())
+            .map(|v| Header::new(name, v)))
+    }
 }
 
 impl FromRequestNamed for Header {
@@ -434,8 +480,40 @@ impl Deref for Header {
 // ========== Headers Extractor ==========
 
 /// Extracts all headers as a map
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct Headers(pub std::collections::HashMap<String, String>);
+
+// Hand-written so a `{:?}` of an extracted credential header (Authorization,
+// Cookie, API keys) cannot put the secret into a log line; the rule is the one
+// `HeaderMap`'s own `Debug` applies.
+impl std::fmt::Debug for Header {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let value: &str = if crate::headers::is_sensitive_header(&self.name) {
+            crate::headers::REDACTED
+        } else {
+            &self.value
+        };
+        f.debug_struct("Header")
+            .field("name", &self.name)
+            .field("value", &value)
+            .finish()
+    }
+}
+
+impl std::fmt::Debug for Headers {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_map()
+            .entries(self.0.iter().map(|(name, value)| {
+                let value: &str = if crate::headers::is_sensitive_header(name) {
+                    crate::headers::REDACTED
+                } else {
+                    value
+                };
+                (name, value)
+            }))
+            .finish()
+    }
+}
 
 impl Headers {
     /// Get a header value by name, case-insensitively.
@@ -493,8 +571,18 @@ impl Deref for Headers {
 /// let raw: RawBody = RawBody::from_request(&request)?;
 /// println!("Body length: {} bytes", raw.len());
 /// ```
-#[derive(Debug, Clone)]
+///
+/// `Debug` prints the length only: the body may carry credentials or PII.
+#[derive(Clone)]
 pub struct RawBody(pub Bytes);
+
+impl std::fmt::Debug for RawBody {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RawBody")
+            .field("len", &self.0.len())
+            .finish()
+    }
+}
 
 impl RawBody {
     /// Create a new RawBody
@@ -768,6 +856,30 @@ macro_rules! header {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn raw_body_debug_prints_length_only() {
+        let raw = crate::extractors::RawBody::new("password=hunter2");
+        let dbg = format!("{raw:?}");
+        assert!(!dbg.contains("hunter2"), "{dbg}");
+        assert!(dbg.contains("16"), "{dbg}");
+    }
+
+    #[test]
+    fn header_debug_redacts_credentials() {
+        let auth = Header::new("Authorization", "Bearer secret-token");
+        assert!(!format!("{auth:?}").contains("secret-token"));
+        let plain = Header::new("Accept", "text/html");
+        assert!(format!("{plain:?}").contains("text/html"));
+
+        let mut map = std::collections::HashMap::new();
+        map.insert("cookie".to_string(), "session=abc123".to_string());
+        map.insert("accept".to_string(), "*/*".to_string());
+        let rendered = format!("{:?}", Headers(map));
+        assert!(!rendered.contains("abc123"));
+        assert!(rendered.contains("*/*"));
+    }
+
     use super::*;
     use serde::Deserialize;
 
@@ -814,6 +926,21 @@ mod tests {
     }
 
     #[test]
+    fn header_unique_refuses_a_repeated_header() {
+        let mut request = create_request();
+        request.headers.append("x-api-key", "a");
+        request.headers.append("x-api-key", "b");
+
+        assert!(matches!(
+            Header::unique(&request, "X-Api-Key"),
+            Err(Error::Validation(_))
+        ));
+        let auth = Header::unique(&request, "Authorization").unwrap().unwrap();
+        assert_eq!(auth.value(), "Bearer token123");
+        assert!(Header::unique(&request, "X-Missing").unwrap().is_none());
+    }
+
+    #[test]
     fn test_headers_extraction() {
         let request = create_request();
         let headers: Headers = Headers::from_request(&request).unwrap();
@@ -853,6 +980,45 @@ mod tests {
         let query: Query<Filters> = Query::from_request(&request).unwrap();
         assert_eq!(query.note, "1&b=2");
         assert_eq!(query.name, "a=b&c");
+    }
+
+    #[test]
+    fn query_extractor_repeated_key_is_first_wins() {
+        let request = HttpRequest::new("GET", "/items?role=user&role=admin");
+
+        let map: Query<std::collections::HashMap<String, String>> =
+            Query::from_request(&request).unwrap();
+        assert_eq!(map.get("role").map(String::as_str), Some("user"));
+
+        // A struct used to reject the duplicate outright.
+        #[derive(Debug, Deserialize)]
+        struct Filters {
+            role: String,
+        }
+        let query: Query<Filters> = Query::from_request(&request).unwrap();
+        assert_eq!(query.role, "user");
+        assert_eq!(request.query().get("role"), Some("user"));
+    }
+
+    #[test]
+    fn query_and_path_errors_do_not_expose_serde_detail() {
+        #[derive(Debug, Deserialize)]
+        #[allow(dead_code)]
+        struct Filters {
+            page: u32,
+        }
+        let request = HttpRequest::new("GET", "/items?page=abc");
+        let err = Query::<Filters>::from_request(&request).unwrap_err();
+        assert!(matches!(err, Error::Deserialization(_)), "{err:?}");
+        assert!(!err.client_message().contains("u32"));
+
+        let mut request = HttpRequest::new("GET", "/items/x");
+        request.push_param("id", "x");
+        let err = Path::<u32>::from_request(&request, "id").unwrap_err();
+        assert!(matches!(err, Error::Deserialization(_)), "{err:?}");
+
+        let err = PathParams::<Filters>::from_request(&request).unwrap_err();
+        assert!(matches!(err, Error::Deserialization(_)), "{err:?}");
     }
 
     #[test]

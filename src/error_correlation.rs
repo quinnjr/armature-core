@@ -34,6 +34,7 @@ use crate::{Error, HttpRequest, HttpResponse};
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+use std::fmt;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -135,20 +136,20 @@ impl IdGenerationStrategy {
                 result
             }
             IdGenerationStrategy::Short => {
-                let random: [u8; 6] = rand_bytes::<6>();
                 let alphabet = b"0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz";
                 let mut result = String::with_capacity(8);
 
-                for b in random {
-                    result.push(alphabet[(b % 62) as usize] as char);
+                // Rejection sampling: `b % 62` over all 256 byte values would
+                // favor the first 8 symbols. Bytes >= 248 (= 4 * 62) are
+                // discarded so every symbol is equally likely.
+                while result.len() < 8 {
+                    let random: [u8; 16] = rand_bytes();
+                    for b in random {
+                        if b < 248 && result.len() < 8 {
+                            result.push(alphabet[(b % 62) as usize] as char);
+                        }
+                    }
                 }
-                // Add 2 more chars from timestamp
-                let ts = SystemTime::now()
-                    .duration_since(UNIX_EPOCH)
-                    .unwrap_or_default()
-                    .as_nanos() as u64;
-                result.push(alphabet[(ts % 62) as usize] as char);
-                result.push(alphabet[((ts / 62) % 62) as usize] as char);
 
                 result
             }
@@ -171,29 +172,28 @@ fn random_hex_id(hex_len: usize) -> String {
     s
 }
 
-/// Global counter mixed into every `rand_bytes` seed so that two calls can
-/// never derive the same PRNG state, even when they land on the same
-/// timestamp reading (e.g. concurrent calls from different threads, or a
-/// tight same-thread loop where clock resolution is coarser than call
-/// latency).
-static RAND_BYTES_COUNTER: AtomicU64 = AtomicU64::new(0);
-
+/// Fill an array from the OS CSPRNG.
+///
+/// IDs built from this (trace/span/correlation IDs, ULID/UUIDv7 randomness)
+/// are echoed to clients and used to look errors up, so they must not be
+/// predictable. `uuid`'s v4 generator draws from the OS CSPRNG (`getrandom`);
+/// its 6 fixed version/variant bits live in bytes 6 and 8, so only the other
+/// 14 bytes of each UUID are used.
 fn rand_bytes<const N: usize>() -> [u8; N] {
     let mut bytes = [0u8; N];
-    // Simple PRNG seeded from timestamp XORed with a constant, additionally
-    // mixed with a monotonically increasing atomic counter. The counter
-    // guarantees uniqueness of the seed (and therefore the output) across
-    // calls regardless of clock resolution or thread interleaving.
-    let seed = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_nanos() as u64;
-    let counter = RAND_BYTES_COUNTER.fetch_add(1, Ordering::Relaxed);
-
-    let mut state = seed ^ 0xDEADBEEF ^ counter.wrapping_mul(0x9E3779B97F4A7C15);
-    for b in bytes.iter_mut() {
-        state = state.wrapping_mul(6364136223846793005).wrapping_add(1);
-        *b = (state >> 33) as u8;
+    let mut filled = 0;
+    while filled < N {
+        let uuid = uuid::Uuid::new_v4().into_bytes();
+        for (i, b) in uuid.into_iter().enumerate() {
+            if i == 6 || i == 8 {
+                continue;
+            }
+            if filled == N {
+                break;
+            }
+            bytes[filled] = b;
+            filled += 1;
+        }
     }
     bytes
 }
@@ -227,7 +227,16 @@ pub mod headers {
 }
 
 /// Correlation context that can be propagated across services.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+///
+/// `Debug` redacts `session_id`, `user_id` and baggage values (baggage keys
+/// are kept): contexts end up in `{:?}` log lines and panic messages, and a
+/// session id there is a live credential. `Serialize` is an export for the
+/// same reason (registry records, [`ErrorTree`]s and
+/// [`CorrelatedError::to_json`] all go through it): it omits `session_id` and
+/// `user_id` and redacts baggage values. Propagation does not use serde;
+/// header propagation ([`inject_into_request`](Self::inject_into_request))
+/// sends the session id unchanged. `Deserialize` still reads every field.
+#[derive(Clone, Serialize, Deserialize)]
 pub struct CorrelationContext {
     /// Correlation ID - groups related requests/errors
     pub correlation_id: String,
@@ -245,8 +254,8 @@ pub struct CorrelationContext {
     /// Causation ID (what caused this request)
     #[serde(skip_serializing_if = "Option::is_none")]
     pub causation_id: Option<String>,
-    /// Session ID
-    #[serde(skip_serializing_if = "Option::is_none")]
+    /// Session ID (never serialized: a live credential)
+    #[serde(skip_serializing)]
     pub session_id: Option<String>,
     /// Service name
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -254,14 +263,20 @@ pub struct CorrelationContext {
     /// Service version
     #[serde(skip_serializing_if = "Option::is_none")]
     pub service_version: Option<String>,
-    /// User ID (if authenticated)
-    #[serde(skip_serializing_if = "Option::is_none")]
+    /// User ID (if authenticated; never serialized: personal data that
+    /// `Debug` redacts too)
+    #[serde(skip_serializing)]
     pub user_id: Option<String>,
     /// Tenant ID (for multi-tenant systems)
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tenant_id: Option<String>,
-    /// Custom baggage items
-    #[serde(skip_serializing_if = "HashMap::is_empty", default)]
+    /// Custom baggage items (values serialize as `[REDACTED]`: baggage is
+    /// free-form and often carries user data)
+    #[serde(
+        skip_serializing_if = "HashMap::is_empty",
+        default,
+        serialize_with = "serialize_redacted_baggage"
+    )]
     pub baggage: HashMap<String, String>,
     /// Sampling decision for traces
     pub sampled: bool,
@@ -272,6 +287,46 @@ pub struct CorrelationContext {
 impl Default for CorrelationContext {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+/// Stand-in for a value [`CorrelationContext`]'s `Debug` keeps out of logs.
+const REDACTED: &str = "[REDACTED]";
+
+/// Baggage keys with every value replaced by [`REDACTED`], so an exported
+/// context still shows which items were present.
+fn serialize_redacted_baggage<S: serde::Serializer>(
+    baggage: &HashMap<String, String>,
+    serializer: S,
+) -> Result<S::Ok, S::Error> {
+    serializer.collect_map(baggage.keys().map(|key| (key, REDACTED)))
+}
+
+impl fmt::Debug for CorrelationContext {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        // Presence still shows (`Some("[REDACTED]")`); the value does not.
+        let redact = |value: &Option<String>| value.as_ref().map(|_| REDACTED);
+        let baggage: HashMap<&str, &str> = self
+            .baggage
+            .keys()
+            .map(|key| (key.as_str(), REDACTED))
+            .collect();
+        f.debug_struct("CorrelationContext")
+            .field("correlation_id", &self.correlation_id)
+            .field("request_id", &self.request_id)
+            .field("trace_id", &self.trace_id)
+            .field("span_id", &self.span_id)
+            .field("parent_span_id", &self.parent_span_id)
+            .field("causation_id", &self.causation_id)
+            .field("session_id", &redact(&self.session_id))
+            .field("service", &self.service)
+            .field("service_version", &self.service_version)
+            .field("user_id", &redact(&self.user_id))
+            .field("tenant_id", &self.tenant_id)
+            .field("baggage", &baggage)
+            .field("sampled", &self.sampled)
+            .field("created_at", &self.created_at)
+            .finish()
     }
 }
 
@@ -400,23 +455,31 @@ impl CorrelationContext {
     }
 
     /// Extract correlation context from HTTP request headers.
+    ///
+    /// Every inbound ID is client-controlled and is later echoed into
+    /// response headers, logs and error bodies, so each is validated and a
+    /// malformed one is ignored (a fresh ID is kept instead):
+    ///
+    /// - correlation/request/causation IDs must match
+    ///   [`is_valid_request_id`](crate::headers::is_valid_request_id);
+    /// - `traceparent` must be well-formed per W3C Trace Context;
+    /// - B3 trace IDs must be 16 or 32 lowercase hex, span IDs 16.
+    ///
+    /// `X-Session-ID` is deliberately **not** read: a session identifier is
+    /// something the server establishes (see
+    /// [`with_session`](Self::with_session)), and adopting a client-supplied
+    /// one would let a caller attribute its errors and logs to another
+    /// user's session.
     pub fn from_request(req: &HttpRequest) -> Self {
         let mut ctx = Self::new();
+        let valid_id = |id: &&str| crate::headers::is_valid_request_id(id);
 
-        // Extract correlation ID
-        if let Some(id) = req.headers.get(headers::CORRELATION_ID).or_else(|| {
-            req.headers
-                .get(headers::CORRELATION_ID.to_lowercase().as_str())
-        }) {
+        // Header names are matched case-insensitively by `HeaderMap`.
+        if let Some(id) = req.headers.get(headers::CORRELATION_ID).filter(valid_id) {
             ctx.correlation_id = id.to_owned();
         }
 
-        // Extract request ID
-        if let Some(id) = req
-            .headers
-            .get(headers::REQUEST_ID)
-            .or_else(|| req.headers.get(headers::REQUEST_ID.to_lowercase().as_str()))
-        {
+        if let Some(id) = req.headers.get(headers::REQUEST_ID).filter(valid_id) {
             ctx.request_id = id.to_owned();
         }
 
@@ -427,31 +490,32 @@ impl CorrelationContext {
             ctx.trace_id = Some(trace_id);
             ctx.parent_span_id = Some(span_id);
             ctx.sampled = sampled;
-            // Generate new span ID for this service
-            ctx.span_id = Some(IdGenerationStrategy::Short.generate());
+            // New span for this service, in the W3C 16-hex form so it can be
+            // propagated in an outbound `traceparent`.
+            ctx.span_id = Some(random_hex_id(16));
         }
 
         // Fall back to B3 headers (Zipkin)
         if ctx.trace_id.is_none()
-            && let Some(id) = req.headers.get(headers::B3_TRACE_ID)
+            && let Some(id) = req
+                .headers
+                .get(headers::B3_TRACE_ID)
+                .filter(|id| is_trace_hex(id, 16) || is_trace_hex(id, 32))
         {
             ctx.trace_id = Some(id.to_owned());
         }
         if ctx.span_id.is_none()
-            && let Some(id) = req.headers.get(headers::B3_SPAN_ID)
+            && let Some(id) = req
+                .headers
+                .get(headers::B3_SPAN_ID)
+                .filter(|id| is_trace_hex(id, 16))
         {
             ctx.parent_span_id = Some(id.to_owned());
-            ctx.span_id = Some(IdGenerationStrategy::Short.generate());
+            ctx.span_id = Some(random_hex_id(16));
         }
 
-        // Extract causation ID
-        if let Some(id) = req.headers.get(headers::CAUSATION_ID) {
+        if let Some(id) = req.headers.get(headers::CAUSATION_ID).filter(valid_id) {
             ctx.causation_id = Some(id.to_owned());
-        }
-
-        // Extract session ID
-        if let Some(id) = req.headers.get(headers::SESSION_ID) {
-            ctx.session_id = Some(id.to_owned());
         }
 
         ctx
@@ -521,17 +585,38 @@ impl CorrelationContext {
     }
 }
 
-/// Parse W3C traceparent header.
+/// Whether `s` is exactly `len` lowercase hex digits and not all zeros (the
+/// all-zero trace/span ID is the W3C/B3 "invalid" value).
+fn is_trace_hex(s: &str, len: usize) -> bool {
+    s.len() == len
+        && s.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
+        && s.bytes().any(|b| b != b'0')
+}
+
+/// Parse a W3C `traceparent` header, rejecting anything malformed.
+///
+/// `version-traceid-parentid-flags`: version is 2 lowercase hex and not `ff`
+/// (version `00` has exactly these four fields; later versions may append
+/// more), trace-id is 32 lowercase hex and parent-id 16, neither all zeros,
+/// and flags is 2 lowercase hex whose low bit is "sampled".
 fn parse_traceparent(value: &str) -> Option<(String, String, bool)> {
-    let parts: Vec<&str> = value.split('-').collect();
-    if parts.len() >= 4 && parts[0] == "00" {
-        let trace_id = parts[1].to_string();
-        let span_id = parts[2].to_string();
-        let sampled = parts[3] == "01";
-        Some((trace_id, span_id, sampled))
-    } else {
-        None
+    let mut parts = value.trim().split('-');
+    let version = parts.next()?;
+    let trace_id = parts.next()?;
+    let span_id = parts.next()?;
+    let flags = parts.next()?;
+    let has_more = parts.next().is_some();
+
+    let is_hex2 =
+        |s: &str| s.len() == 2 && s.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'));
+    if !is_hex2(version) || version == "ff" || (version == "00" && has_more) {
+        return None;
     }
+    if !is_trace_hex(trace_id, 32) || !is_trace_hex(span_id, 16) || !is_hex2(flags) {
+        return None;
+    }
+    let sampled = u8::from_str_radix(flags, 16).ok()? & 0x01 == 1;
+    Some((trace_id.to_string(), span_id.to_string(), sampled))
 }
 
 // ============================================================================
@@ -637,7 +722,10 @@ impl CorrelatedError {
         Self {
             error_id: IdGenerationStrategy::UuidV4.generate(),
             context,
-            message: error.to_string(),
+            // The log-safe rendering: this message is retained in the
+            // ErrorRegistry and exported by to_json, and a Deserialization
+            // error's Display quotes the request input that failed to parse.
+            message: error.log_display().to_string(),
             code: None,
             error_type: Some(error_type.to_string()),
             status,
@@ -735,12 +823,22 @@ impl CorrelatedError {
     }
 
     /// Convert to JSON.
+    ///
+    /// This is an export (to logs, error stores, other services), so the
+    /// context's session id and user id are omitted and its baggage values
+    /// are redacted. That redaction lives in [`CorrelationContext`]'s
+    /// `Serialize`, so serializing a `CorrelatedError` (or an [`ErrorTree`])
+    /// any other way exports the same thing.
     pub fn to_json(&self) -> String {
         serde_json::to_string_pretty(self).unwrap_or_else(|_| {
-            format!(
-                r#"{{"error_id":"{}","message":"{}","status":{}}}"#,
-                self.error_id, self.message, self.status
-            )
+            // Built with `json!` so a quote or backslash in the message cannot
+            // break out of its string and forge fields.
+            serde_json::json!({
+                "error_id": self.error_id,
+                "message": self.message,
+                "status": self.status,
+            })
+            .to_string()
         })
     }
 }
@@ -910,12 +1008,31 @@ impl Default for ErrorRegistry {
 }
 
 /// Tree structure for error causation.
+///
+/// Serializing it redacts every node's context as
+/// [`CorrelatedError::to_json`] does (see [`CorrelationContext`]).
 #[derive(Debug, Clone, Serialize)]
 pub struct ErrorTree {
     /// The error at this node
     pub error: CorrelatedError,
     /// Child errors (caused by this error)
     pub children: Vec<ErrorTree>,
+}
+
+impl ErrorTree {
+    /// Convert the whole tree to JSON, with every node's context redacted.
+    pub fn to_json(&self) -> String {
+        serde_json::to_string_pretty(self).unwrap_or_else(|_| {
+            // Same shape-safe fallback as `CorrelatedError::to_json`, for the
+            // root only.
+            serde_json::json!({
+                "error_id": self.error.error_id,
+                "message": self.error.message,
+                "status": self.error.status,
+            })
+            .to_string()
+        })
+    }
 }
 
 // ============================================================================
@@ -1098,12 +1215,19 @@ impl CorrelatedRequest for HttpRequest {
 
     fn correlation_id(&self) -> Option<String> {
         // One lookup: header names intern case-insensitively, so the
-        // lowercased retry was always redundant.
-        self.headers.get(headers::CORRELATION_ID).map(str::to_owned)
+        // lowercased retry was always redundant. Malformed client values are
+        // treated as absent, matching `CorrelationContext::from_request`.
+        self.headers
+            .get(headers::CORRELATION_ID)
+            .filter(|id| crate::headers::is_valid_request_id(id))
+            .map(str::to_owned)
     }
 
     fn request_id(&self) -> Option<String> {
-        self.headers.get(headers::REQUEST_ID).map(str::to_owned)
+        self.headers
+            .get(headers::REQUEST_ID)
+            .filter(|id| crate::headers::is_valid_request_id(id))
+            .map(str::to_owned)
     }
 
     fn trace_id(&self) -> Option<String> {
@@ -1114,7 +1238,10 @@ impl CorrelatedRequest for HttpRequest {
             return Some(trace_id);
         }
         // Fall back to B3
-        self.headers.get(headers::B3_TRACE_ID).map(str::to_owned)
+        self.headers
+            .get(headers::B3_TRACE_ID)
+            .filter(|id| is_trace_hex(id, 16) || is_trace_hex(id, 32))
+            .map(str::to_owned)
     }
 
     fn span_id(&self) -> Option<String> {
@@ -1125,7 +1252,10 @@ impl CorrelatedRequest for HttpRequest {
             return Some(span_id);
         }
         // Fall back to B3
-        self.headers.get(headers::B3_SPAN_ID).map(str::to_owned)
+        self.headers
+            .get(headers::B3_SPAN_ID)
+            .filter(|id| is_trace_hex(id, 16))
+            .map(str::to_owned)
     }
 }
 
@@ -1155,6 +1285,21 @@ impl CorrelatedErrorExt for Error {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A Deserialization error's serde text quotes request input; the
+    /// correlated record (registry + to_json export) keeps only its log-safe
+    /// form.
+    #[test]
+    fn test_from_error_does_not_retain_deserialization_input() {
+        let error = Error::Deserialization(
+            "invalid type: string \"hunter2\", expected u32 at line 1 column 17".to_string(),
+        );
+        let correlated = CorrelatedError::from_error(&error, CorrelationContext::new());
+        assert!(!correlated.message.contains("hunter2"));
+        let json = correlated.to_json();
+        assert!(!json.contains("hunter2"), "{json}");
+        assert!(json.contains("invalid type"), "{json}");
+    }
 
     #[test]
     fn test_id_generation_uuid_v4() {
@@ -1348,6 +1493,133 @@ mod tests {
         let (_, _, sampled) =
             parse_traceparent("00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-00").unwrap();
         assert!(!sampled);
+    }
+
+    #[test]
+    fn test_parse_traceparent_rejects_malformed() {
+        let ok = "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01";
+        assert!(parse_traceparent(ok).is_some());
+        for bad in [
+            "00-00000000000000000000000000000000-00f067aa0ba902b7-01",
+            "00-4bf92f3577b34da6a3ce929d0e0e4736-0000000000000000-01",
+            "00-4BF92F3577B34DA6A3CE929D0E0E4736-00f067aa0ba902b7-01",
+            "00-4bf92f3577b34da6a3ce929d0e0e473-00f067aa0ba902b7-01",
+            "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01-extra",
+            "ff-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01",
+            "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-zz",
+            "00-<script>-00f067aa0ba902b7-01",
+        ] {
+            assert!(parse_traceparent(bad).is_none(), "{bad}");
+        }
+        // Sampled is the low bit of the flags, not a literal "01".
+        let (_, _, sampled) =
+            parse_traceparent("00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-03").unwrap();
+        assert!(sampled);
+    }
+
+    #[test]
+    fn test_from_request_rejects_malformed_inbound_ids() {
+        let mut req = HttpRequest::new("GET", "/".to_string());
+        req.headers
+            .insert(headers::CORRELATION_ID, "evil\u{1b}[31m id");
+        req.headers.insert(headers::REQUEST_ID, "x".repeat(200));
+        req.headers.insert(headers::CAUSATION_ID, "a b");
+        req.headers.insert(headers::SESSION_ID, "victim-session");
+        req.headers.insert(headers::B3_TRACE_ID, "not-hex");
+        let ctx = CorrelationContext::from_request(&req);
+
+        assert!(crate::headers::is_valid_request_id(&ctx.correlation_id));
+        assert_ne!(ctx.correlation_id, "evil\u{1b}[31m id");
+        assert!(ctx.request_id.len() <= 128);
+        assert_eq!(ctx.causation_id, None);
+        assert_eq!(ctx.session_id, None, "session id is never client-supplied");
+        assert_eq!(ctx.trace_id, None);
+        assert_eq!(req.correlation_id(), None);
+
+        let mut req = HttpRequest::new("GET", "/".to_string());
+        req.headers.insert(
+            headers::TRACE_PARENT,
+            "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01",
+        );
+        let ctx = CorrelationContext::from_request(&req);
+        assert!(is_trace_hex(ctx.span_id.as_deref().unwrap(), 16));
+        assert_eq!(ctx.parent_span_id.as_deref(), Some("00f067aa0ba902b7"));
+    }
+
+    #[test]
+    fn test_short_ids_use_full_alphabet_and_length() {
+        for _ in 0..100 {
+            let id = IdGenerationStrategy::Short.generate();
+            assert_eq!(id.len(), 8);
+            assert!(id.bytes().all(|b| b.is_ascii_alphanumeric()));
+        }
+        let a: [u8; 32] = rand_bytes();
+        let b: [u8; 32] = rand_bytes();
+        assert_ne!(a, b);
+    }
+
+    /// Session ids, user ids and baggage values never reach a Debug
+    /// rendering or the `to_json` export; outbound propagation (server-set
+    /// data) is unchanged.
+    #[test]
+    fn test_session_and_baggage_are_not_exported() {
+        let ctx = CorrelationContext::new()
+            .with_session("sess-s3cr3t")
+            .with_user_id("user-s3cr3t")
+            .with_baggage("tenant_hint", "bag-s3cr3t");
+
+        let debug = format!("{ctx:?}");
+        assert!(!debug.contains("s3cr3t"), "{debug}");
+        assert!(debug.contains("tenant_hint"), "{debug}");
+        assert!(debug.contains(&ctx.correlation_id), "{debug}");
+
+        let error = CorrelatedError::new("boom").with_context(ctx.clone());
+        let debug = format!("{error:?}");
+        assert!(!debug.contains("s3cr3t"), "{debug}");
+        let json = error.to_json();
+        assert!(!json.contains("s3cr3t"), "{json}");
+        assert!(json.contains("tenant_hint"), "{json}");
+        assert!(json.contains(&ctx.correlation_id), "{json}");
+
+        // The derived `Serialize` is an export too: a caller serializing a
+        // registry record directly gets the same redaction.
+        let json = serde_json::to_string(&error).unwrap();
+        assert!(!json.contains("s3cr3t"), "{json}");
+        assert!(json.contains("tenant_hint"), "{json}");
+        let json = serde_json::to_string(&ctx).unwrap();
+        assert!(!json.contains("s3cr3t"), "{json}");
+
+        let mut req = HttpRequest::new("GET", "/".to_string());
+        ctx.inject_into_request(&mut req);
+        assert_eq!(req.headers.get(headers::SESSION_ID), Some("sess-s3cr3t"));
+    }
+
+    /// A causation tree is built from registry records, and every node's
+    /// context is redacted on export, not just the root's.
+    #[tokio::test]
+    async fn test_causation_tree_export_is_redacted() {
+        let registry = ErrorRegistry::new(10);
+        let secret_ctx = || {
+            CorrelationContext::new()
+                .with_session("sess-s3cr3t")
+                .with_user_id("user-s3cr3t")
+                .with_baggage("hint", "bag-s3cr3t")
+        };
+        let child = CorrelatedError::new("child").with_context(secret_ctx());
+        let root = CorrelatedError::new("root")
+            .with_context(secret_ctx())
+            .related_to(child.error_id.clone());
+        let root_id = root.error_id.clone();
+        registry.register(child).await;
+        registry.register(root).await;
+
+        let tree = registry.build_causation_tree(&root_id).await.unwrap();
+        assert_eq!(tree.children.len(), 1);
+        for json in [tree.to_json(), serde_json::to_string(&tree).unwrap()] {
+            assert!(!json.contains("s3cr3t"), "{json}");
+            assert!(json.contains("child"), "{json}");
+            assert!(json.contains("hint"), "{json}");
+        }
     }
 
     #[test]

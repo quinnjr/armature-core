@@ -184,7 +184,16 @@ impl BodyLimitConfig {
     }
 
     /// Gets the limit for a specific path.
+    ///
+    /// A pattern matches the path itself and anything below it on a segment
+    /// boundary: `/api/upload` covers `/api/upload` and `/api/upload/123` but
+    /// not `/api/uploadX`, which would otherwise inherit a large upload limit
+    /// it was never granted. A query string or fragment on `path` is ignored.
     pub fn get_limit_for_path(&self, path: &str) -> usize {
+        // Callers may hand over the raw request target; `?x=1` is not part of
+        // the route and must not defeat the exact or boundary match.
+        let path = path.split(['?', '#']).next().unwrap_or(path);
+
         // Check for exact match first
         if let Some(limit) = self.route_limits.get(path) {
             return *limit;
@@ -194,7 +203,7 @@ impl BodyLimitConfig {
         // pattern so overlapping patterns resolve deterministically.
         self.route_limits
             .iter()
-            .filter(|(pattern, _)| path.starts_with(pattern.as_str()))
+            .filter(|(pattern, _)| path_has_prefix(path, pattern))
             .max_by_key(|(pattern, _)| pattern.len())
             .map(|(_, limit)| *limit)
             .unwrap_or(self.default_limit)
@@ -437,6 +446,14 @@ impl BodyLimitBuilder {
     }
 }
 
+/// Whether `pattern` is `path` or one of its ancestors on a `/` boundary.
+fn path_has_prefix(path: &str, pattern: &str) -> bool {
+    match path.strip_prefix(pattern) {
+        Some(rest) => rest.is_empty() || rest.starts_with('/') || pattern.ends_with('/'),
+        None => false,
+    }
+}
+
 /// Formats a byte count into a human-readable string.
 pub fn format_bytes(bytes: usize) -> String {
     if bytes >= sizes::GB {
@@ -531,6 +548,28 @@ mod tests {
             config.get_limit_for_path("/api/upload/123"),
             100 * sizes::MB
         );
+    }
+
+    #[test]
+    fn route_limit_prefix_requires_a_segment_boundary() {
+        let config = BodyLimitConfig::new()
+            .default_limit_mb(1)
+            .route_limit_mb("/api/upload", 100)
+            .route_limit_mb("/files/", 50);
+
+        // A sibling route sharing the prefix does not inherit the limit.
+        assert_eq!(config.get_limit_for_path("/api/uploadX"), sizes::MB);
+        assert_eq!(config.get_limit_for_path("/api/upload-all"), sizes::MB);
+        // The route itself, its children, and the route with a query do.
+        assert_eq!(config.get_limit_for_path("/api/upload"), 100 * sizes::MB);
+        assert_eq!(config.get_limit_for_path("/api/upload/"), 100 * sizes::MB);
+        assert_eq!(
+            config.get_limit_for_path("/api/upload?x=1"),
+            100 * sizes::MB
+        );
+        // A pattern ending in `/` already marks the boundary.
+        assert_eq!(config.get_limit_for_path("/files/a"), 50 * sizes::MB);
+        assert_eq!(config.get_limit_for_path("/filesX"), sizes::MB);
     }
 
     #[test]

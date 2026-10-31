@@ -158,7 +158,9 @@ impl CoalesceConfig {
 // ============================================================================
 
 /// A write buffer that coalesces small writes into larger batches.
-#[derive(Debug)]
+///
+/// `Debug` prints the buffered length, not the bytes: the buffer holds
+/// serialized responses, `Set-Cookie` lines and all.
 pub struct WriteCoalescer {
     /// Internal buffer
     buffer: BytesMut,
@@ -170,6 +172,18 @@ pub struct WriteCoalescer {
     first_write_time: Option<Instant>,
     /// Total bytes written to this coalescer
     total_bytes: usize,
+}
+
+impl std::fmt::Debug for WriteCoalescer {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("WriteCoalescer")
+            .field("buffer", &crate::headers::RedactedLen(self.buffer.len()))
+            .field("config", &self.config)
+            .field("writes_coalesced", &self.writes_coalesced)
+            .field("first_write_time", &self.first_write_time)
+            .field("total_bytes", &self.total_bytes)
+            .finish()
+    }
 }
 
 impl WriteCoalescer {
@@ -404,7 +418,8 @@ impl WriteCoalescer {
 }
 
 /// Result of a write operation.
-#[derive(Debug)]
+///
+/// `Debug` prints a bypassed write's length, not its bytes.
 pub enum WriteResult {
     /// Data was buffered, no action needed
     Buffered,
@@ -412,6 +427,19 @@ pub enum WriteResult {
     ShouldFlush,
     /// Data bypassed coalescing (too large), write directly
     Bypass(Bytes),
+}
+
+impl std::fmt::Debug for WriteResult {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Buffered => f.write_str("Buffered"),
+            Self::ShouldFlush => f.write_str("ShouldFlush"),
+            Self::Bypass(data) => f
+                .debug_tuple("Bypass")
+                .field(&crate::headers::RedactedLen(data.len()))
+                .finish(),
+        }
+    }
 }
 
 impl WriteResult {
@@ -579,7 +607,8 @@ impl MultiBufferCoalescer {
 // ============================================================================
 
 /// Per-connection write buffer with coalescing and flush management.
-#[derive(Debug)]
+///
+/// `Debug` prints buffered lengths, not the serialized responses.
 pub struct ConnectionWriteBuffer {
     /// Main coalescer
     coalescer: WriteCoalescer,
@@ -590,6 +619,22 @@ pub struct ConnectionWriteBuffer {
     connection_id: u64,
     /// Total flushes
     flushes: usize,
+}
+
+impl std::fmt::Debug for ConnectionWriteBuffer {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let pending: Vec<_> = self
+            .pending_large
+            .iter()
+            .map(|b| crate::headers::RedactedLen(b.len()))
+            .collect();
+        f.debug_struct("ConnectionWriteBuffer")
+            .field("coalescer", &self.coalescer)
+            .field("pending_large", &pending)
+            .field("connection_id", &self.connection_id)
+            .field("flushes", &self.flushes)
+            .finish()
+    }
 }
 
 impl ConnectionWriteBuffer {
@@ -836,6 +881,26 @@ pub fn coalesce_stats() -> &'static CoalesceStats {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Buffered bytes are serialized responses, `Set-Cookie` and all; `Debug`
+    /// must print their length only.
+    #[test]
+    fn debug_does_not_print_buffered_bytes() {
+        let secret = b"Set-Cookie: sid=s3cret\r\n";
+        let mut buf = ConnectionWriteBuffer::new(1, CoalesceConfig::default());
+        buf.write(secret);
+        buf.write(&vec![b'x'; 1 << 20]);
+        let mut big = secret.to_vec();
+        big.resize(1 << 20, b'y');
+        let bypass = WriteResult::Bypass(Bytes::from(big));
+        for out in [format!("{buf:?}"), format!("{bypass:?}")] {
+            assert!(!out.contains("s3cret"), "{out}");
+            assert!(out.contains("bytes>"), "{out}");
+        }
+        let mut c = WriteCoalescer::new(CoalesceConfig::default());
+        let _ = c.write(secret);
+        assert!(!format!("{c:?}").contains("s3cret"));
+    }
 
     #[test]
     fn test_coalesce_config_default() {

@@ -1,6 +1,5 @@
 # Rust
 target/
-Cargo.lock
 **/*.rs.bk
 *.pdb
 
@@ -56,16 +55,13 @@ pnpm-debug.log*
 .pnpm-store/
 
 # Environment & Secrets
-.env
-.env.local
-.env.*.local
-.env.development
-.env.production
+# Every env file (`.env.staging`, `.env.test`, ...), not a list of known ones.
+.env*
+!.env.example
 *.pem
 *.key
 *.crt
 *.p12
-!armature-jwt/tests/fixtures/*.pem
 *.pfx
 secrets/
 credentials/

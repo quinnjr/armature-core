@@ -141,7 +141,7 @@ pub fn get_routes_by_type_id(type_id: TypeId) -> Vec<&'static RouteEntry> {
 
 /// Macro to register a route handler with the inventory (legacy)
 ///
-/// This is used internally by the route macros (#[get], #[post], etc.)
+/// This is used internally by the route macros (`#[get]`, `#[post]`, etc.)
 /// for backwards compatibility.
 #[macro_export]
 macro_rules! register_route {

@@ -51,8 +51,23 @@ impl RouteParamsExt for RouteParams {
 /// `OnceLock` rather than `OnceCell` because `HttpRequest` must stay `Sync`:
 /// extractors hold `&HttpRequest` across an `await` inside a `Send` future, and
 /// `&T: Send` requires `T: Sync`.
-#[derive(Debug, Default)]
+///
+/// `Debug` prints key names and value lengths only (see
+/// [`QueryView`]).
+#[derive(Default)]
 pub struct QueryCache(OnceLock<QueryPairs>);
+
+impl std::fmt::Debug for QueryCache {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self.0.get() {
+            Some(pairs) => f
+                .debug_tuple("QueryCache")
+                .field(&crate::headers::RedactedPairs(pairs))
+                .finish(),
+            None => f.write_str("QueryCache(<unparsed>)"),
+        }
+    }
+}
 
 impl Clone for QueryCache {
     /// A clone starts cold.
@@ -69,7 +84,11 @@ impl Clone for QueryCache {
 ///
 /// The path and body are `Bytes`-backed, so cloning a request is a handful of
 /// refcount bumps rather than a deep copy of the target and payload.
-#[derive(Debug, Clone)]
+///
+/// `Debug` is hand-written so a `{:?}` in an error log cannot leak secrets:
+/// it prints the path without its query string and the body's length rather
+/// than its bytes (headers are redacted by [`HeaderMap`]'s own `Debug`).
+#[derive(Clone)]
 pub struct HttpRequest {
     /// The request method.
     ///
@@ -127,6 +146,79 @@ pub struct HttpRequest {
     pub peer: Option<SocketAddr>,
     /// Parsed lazily by [`HttpRequest::query`].
     query_cache: QueryCache,
+}
+
+impl std::fmt::Debug for HttpRequest {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("HttpRequest")
+            .field("method", &self.method)
+            .field("path", &self.path_only())
+            .field("has_query", &self.path.contains('?'))
+            .field("headers", &self.headers)
+            .field("body_len", &self.body.len())
+            .field("path_params", &self.path_params)
+            .field("peer", &self.peer)
+            .finish_non_exhaustive()
+    }
+}
+
+/// The `X-Forwarded-For` chain, one element per comma-separated hop across
+/// every field line, or `None` if the chain cannot be read faithfully.
+///
+/// Every field line counts, not just the first. A repeated field is one list
+/// (RFC 9110 §5.3), and a proxy that adds its own line instead of extending
+/// the client's puts the only entries worth believing on a line `get` would
+/// never reach. Splitting each line and chaining them is the same sequence
+/// joining them with commas would produce, without the intermediate `String`.
+///
+/// Empty elements are kept rather than filtered, which looks like sloppiness
+/// and is the opposite. Discarding them shortens the list, and since the entry
+/// is chosen by counting from the *right*, a shorter list slides the index one
+/// position further left — onto an entry the client supplied. A malformed or
+/// empty hop means the chain is not the one the deployment was configured for,
+/// and the safe answer to that is no answer: the empty string fails to parse
+/// and the callers return `None`.
+///
+/// A line that is not valid UTF-8 makes the whole chain `None` for the same
+/// reason. Skipping it (as `HeaderMap::get_all` does) would drop exactly the
+/// line a proxy appended to when the client's line ahead of it carried a stray
+/// byte, leaving only client-written hops to count from.
+fn forwarded_for_hops(headers: &HeaderMap) -> Option<Vec<&str>> {
+    let mut hops = Vec::new();
+    for line in headers.get_all_bytes("X-Forwarded-For") {
+        let line = std::str::from_utf8(line).ok()?;
+        hops.extend(line.split(',').map(str::trim));
+    }
+    Some(hops)
+}
+
+/// Parse one `X-Forwarded-For` element into a canonical address.
+///
+/// Accepts a bare address (`203.0.113.7`, `2001:db8::1`) and the forms some
+/// proxies emit with the client's port attached (`203.0.113.7:4711`,
+/// `[2001:db8::1]:443`, `[2001:db8::1]`). Rejecting those would make every
+/// request through such a proxy anonymous. Anything else — empty, garbage, a
+/// bracketed IPv4, a bad port — is `None`, so the callers still fail closed.
+fn parse_forwarded_hop(hop: &str) -> Option<IpAddr> {
+    if let Ok(ip) = hop.parse::<IpAddr>() {
+        return Some(ip.to_canonical());
+    }
+    if let Some(rest) = hop.strip_prefix('[') {
+        let (inner, after) = rest.split_once(']')?;
+        if !(after.is_empty() || after.strip_prefix(':')?.parse::<u16>().is_ok()) {
+            return None;
+        }
+        return inner
+            .parse::<std::net::Ipv6Addr>()
+            .ok()
+            .map(|ip| IpAddr::V6(ip).to_canonical());
+    }
+    // `a.b.c.d:port`. An unbracketed IPv6 with a port is ambiguous and was
+    // already handled (or rejected) by the plain parse above.
+    hop.parse::<SocketAddr>()
+        .ok()
+        .filter(SocketAddr::is_ipv4)
+        .map(|sa| sa.ip().to_canonical())
 }
 
 impl HttpRequest {
@@ -191,6 +283,14 @@ impl HttpRequest {
     /// ignored entirely and the socket peer is used. That is the correct default
     /// for a process reachable directly.
     ///
+    /// **Caveat:** with a non-zero depth the header is believed whatever the
+    /// socket peer is. If the process can also be reached *without* going
+    /// through the proxy (an exposed port, a misrouted load balancer), a client
+    /// connecting directly controls the whole header and can claim any
+    /// address. When that cannot be ruled out, use
+    /// [`client_address_trusted`](Self::client_address_trusted), which only
+    /// honours the header when the peer is a known proxy.
+    ///
     /// Returns `None` when the address is genuinely unknown: no peer and no
     /// usable header, or a `depth` deeper than the chain actually present, which
     /// means the deployment does not match the configuration and no entry in the
@@ -223,37 +323,96 @@ impl HttpRequest {
     /// assert_eq!(req.client_address(0), Some(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1))));
     /// ```
     pub fn client_address(&self, trusted_proxy_depth: usize) -> Option<IpAddr> {
+        // Canonical, like every other address this returns: a dual-stack
+        // listener reports IPv4 clients as `::ffff:a.b.c.d`, and an allowlist,
+        // rate-limit key or audit line comparing against `a.b.c.d` would
+        // otherwise miss them.
         if trusted_proxy_depth == 0 {
-            return self.peer.map(|peer| peer.ip());
+            return self.peer.map(|peer| peer.ip().to_canonical());
         }
 
-        // Across every field line, not just the first. A repeated field is one
-        // list (RFC 9110 §5.3), and a proxy that adds its own line instead of
-        // extending the client's puts the only entries worth believing on a
-        // line `get` would never reach. Splitting each line and chaining them is
-        // the same sequence joining them with commas would produce, without the
-        // intermediate `String`.
-        // Empty elements are kept rather than filtered, which looks like
-        // sloppiness and is the opposite. Discarding them shortens the list,
-        // and since the entry is chosen by counting from the *right*, a shorter
-        // list slides the index one position further left — onto an entry the
-        // client supplied. A malformed or empty hop means the chain is not the
-        // one the deployment was configured for, and the safe answer to that is
-        // no answer: the empty string fails `parse` below and the function
-        // returns `None`.
-        let hops: Vec<&str> = self
-            .headers
-            .get_all("X-Forwarded-For")
-            .into_iter()
-            .flat_map(|line| line.split(','))
-            .map(str::trim)
-            .collect();
+        let hops = forwarded_for_hops(&self.headers)?;
 
         // Counting from the right. A depth deeper than the chain present means
         // the request did not traverse the proxies it was configured to, so
         // there is no entry here anyone put there on purpose.
         let index = hops.len().checked_sub(trusted_proxy_depth)?;
-        hops.get(index)?.parse().ok()
+        parse_forwarded_hop(hops.get(index)?)
+    }
+
+    /// The client address, honouring `X-Forwarded-For` only when the request
+    /// actually arrived from one of `trusted_proxies`.
+    ///
+    /// Unlike [`client_address`](Self::client_address), which trusts a fixed
+    /// number of hops regardless of who connected, this checks the socket peer
+    /// first: a request from any address not in `trusted_proxies` is
+    /// attributed to that peer and its header is ignored, so a client that
+    /// bypasses the proxy cannot spoof its address. When the peer is trusted,
+    /// the forwarded chain is walked from the right, skipping hops that are
+    /// themselves trusted proxies; the first untrusted hop is the client.
+    ///
+    /// Returns `None` when the peer is unknown, or when the chain contains a
+    /// malformed entry before an untrusted hop is found (the chain is not one
+    /// the deployment produced, so nothing in it can be believed). If every hop
+    /// is a trusted proxy, the leftmost one is returned.
+    ///
+    /// For CIDR ranges or other rules, use
+    /// [`client_address_trusted_by`](Self::client_address_trusted_by).
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use armature_core::HttpRequest;
+    /// use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+    ///
+    /// let proxy = IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1));
+    /// let mut req = HttpRequest::new("GET", "/")
+    ///     .with_peer(Some(SocketAddr::new(proxy, 5555)));
+    /// req.headers.insert("X-Forwarded-For", "198.51.100.9, 203.0.113.7");
+    /// assert_eq!(
+    ///     req.client_address_trusted(&[proxy]),
+    ///     Some(IpAddr::V4(Ipv4Addr::new(203, 0, 113, 7)))
+    /// );
+    ///
+    /// // Same header, but straight from an untrusted peer: ignored.
+    /// let direct = SocketAddr::from(([192, 0, 2, 50], 4444));
+    /// let req = req.with_peer(Some(direct));
+    /// assert_eq!(req.client_address_trusted(&[proxy]), Some(direct.ip()));
+    /// ```
+    pub fn client_address_trusted(&self, trusted_proxies: &[IpAddr]) -> Option<IpAddr> {
+        self.client_address_trusted_by(|ip| trusted_proxies.iter().any(|p| p.to_canonical() == ip))
+    }
+
+    /// [`client_address_trusted`](Self::client_address_trusted) with an
+    /// arbitrary trust predicate (e.g. a CIDR membership test). Addresses are
+    /// passed in canonical form, so an IPv4-mapped IPv6 peer is seen as IPv4.
+    ///
+    /// Only `X-Forwarded-For` is read; the standard `Forwarded` header is not.
+    /// Each trusted proxy must therefore *append to* (or overwrite) the
+    /// `X-Forwarded-For` it received. A proxy that records the client only in
+    /// `Forwarded:` leaves the client-written `X-Forwarded-For` as the sole
+    /// chain here, and its rightmost entry would be believed. A chain with a
+    /// line that is not valid UTF-8 is treated as malformed (`None`).
+    pub fn client_address_trusted_by(&self, is_trusted: impl Fn(IpAddr) -> bool) -> Option<IpAddr> {
+        let peer = self.peer?.ip().to_canonical();
+        if !is_trusted(peer) {
+            return Some(peer);
+        }
+
+        // Same joining rule as `client_address`: every field line, in order,
+        // empty elements and unreadable lines making the chain malformed.
+        let hops = forwarded_for_hops(&self.headers)?;
+
+        let mut leftmost = None;
+        for hop in hops.iter().rev() {
+            let ip = parse_forwarded_hop(hop)?;
+            if !is_trusted(ip) {
+                return Some(ip);
+            }
+            leftmost = Some(ip);
+        }
+        // No header at all: the trusted proxy itself is the only address known.
+        Some(leftmost.unwrap_or(peer))
     }
 
     /// Create a new request with pre-allocated extensions capacity.
@@ -562,9 +721,28 @@ impl HttpRequest {
 ///
 /// This provides the same API as HashMap but with zero allocation cost
 /// for empty maps.
-#[derive(Debug, Clone, Default)]
+///
+/// `Debug` redacts sensitive values (`Set-Cookie`, `Authorization`, ...) the
+/// way [`HeaderMap`]'s does: a `{:?}` of a response is the kind of thing that
+/// ends up in an error log.
+#[derive(Clone, Default)]
 pub struct LazyHeaders {
     inner: Option<HashMap<String, String>>,
+}
+
+impl std::fmt::Debug for LazyHeaders {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_map()
+            .entries(self.inner.iter().flatten().map(|(name, value)| {
+                let value = if crate::headers::is_sensitive_header(name) {
+                    crate::headers::REDACTED
+                } else {
+                    value.as_str()
+                };
+                (name, value)
+            }))
+            .finish()
+    }
 }
 
 impl LazyHeaders {
@@ -696,7 +874,11 @@ impl<'a> IntoIterator for &'a LazyHeaders {
 /// - `headers` uses `LazyHeaders` which doesn't allocate until first insert
 /// - `body` is an empty `Bytes` until set, which doesn't allocate
 /// - Use `FastResponse` from `armature_core::fast_response` for even faster creation
-#[derive(Debug)]
+///
+/// `Debug` is hand-written, like [`HttpRequest`]'s: it prints sensitive
+/// headers redacted, how many cookies are set rather than their values (each
+/// is a session token or similar), and the body's length rather than its
+/// bytes (a body is user data, often a token or a page of PII).
 pub struct HttpResponse {
     pub status: u16,
     /// Response headers with lazy allocation.
@@ -708,6 +890,17 @@ pub struct HttpResponse {
     /// Was a `Vec<u8>` shadowed by an optional `Bytes`. One field, always
     /// authoritative.
     pub body: Bytes,
+}
+
+impl std::fmt::Debug for HttpResponse {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("HttpResponse")
+            .field("status", &self.status)
+            .field("headers", &self.headers)
+            .field("cookies", &self.cookies.len())
+            .field("body_len", &self.body.len())
+            .finish()
+    }
 }
 
 /// Default pre-allocated response buffer size (512 bytes).
@@ -1062,6 +1255,38 @@ impl HttpResponse {
     /// ```
     pub fn see_other(url: impl Into<String>) -> Self {
         Self::new(303).with_header("Location".to_string(), url.into())
+    }
+
+    /// Create a 302 redirect to a same-origin path, rejecting anything that
+    /// could send the client to another site.
+    ///
+    /// [`redirect`](Self::redirect) takes any URL, so passing it a
+    /// user-supplied `?next=` value is an open redirect. This accepts only a
+    /// path that starts with a single `/`; protocol-relative (`//evil.com`) and
+    /// backslash (`/\evil.com`, which browsers normalize to `//`) forms, and
+    /// any control character (header injection, or a tab/newline browsers
+    /// strip to reveal `//`), are rejected with [`crate::Error::BadRequest`].
+    ///
+    /// # Example
+    /// ```
+    /// use armature_core::HttpResponse;
+    /// assert_eq!(HttpResponse::redirect_local("/dashboard").unwrap().status, 302);
+    /// assert!(HttpResponse::redirect_local("//evil.example").is_err());
+    /// assert!(HttpResponse::redirect_local("/\\evil.example").is_err());
+    /// assert!(HttpResponse::redirect_local("https://evil.example").is_err());
+    /// ```
+    pub fn redirect_local(path: impl Into<String>) -> Result<Self, crate::Error> {
+        let path = path.into();
+        let bytes = path.as_bytes();
+        let safe = bytes.first() == Some(&b'/')
+            && !matches!(bytes.get(1), Some(b'/' | b'\\'))
+            && !path.chars().any(char::is_control);
+        if !safe {
+            return Err(crate::Error::BadRequest(
+                "redirect target must be a local path".to_string(),
+            ));
+        }
+        Ok(Self::redirect(path))
     }
 
     /// Alias for no_content() - returns 204 with empty body.
@@ -1540,6 +1765,15 @@ fn is_cookie_value(value: &str) -> bool {
 mod tests {
     use super::*;
 
+    #[test]
+    fn query_cache_debug_prints_keys_and_lengths_only() {
+        let req = HttpRequest::new("GET", "/s?token=s3cret");
+        let _ = req.query();
+        let out = format!("{:?}", req.query_cache);
+        assert!(!out.contains("s3cret"), "{out}");
+        assert!(out.contains("token") && out.contains("<6 bytes>"), "{out}");
+    }
+
     /// M12: attribute injection through a cookie value or path is refused.
     #[test]
     fn cookie_rejects_attribute_injection() {
@@ -1678,6 +1912,77 @@ mod tests {
             HttpRequest::with_extensions_capacity("GET", "/", 4).peer,
             None
         );
+    }
+
+    /// A client line carrying a non-UTF-8 byte, to which the proxy appended
+    /// the real address: the whole last line is unreadable. Skipping it would
+    /// leave the client's earlier line as the "proxy-observed" hop; the chain
+    /// must instead be rejected.
+    #[test]
+    fn client_address_rejects_non_utf8_forwarded_line() {
+        let mut req = HttpRequest::new("GET", "/").with_peer(Some(proxy()));
+        req.headers.append("X-Forwarded-For", "198.51.100.9");
+        req.headers
+            .append("X-Forwarded-For", &b"\xff, 203.0.113.7"[..]);
+
+        assert_eq!(req.client_address(1), None);
+        assert_eq!(req.client_address_trusted(&[proxy().ip()]), None);
+        // Peer not trusted: the header is never read, so it cannot matter.
+        assert_eq!(req.client_address_trusted(&[]), Some(proxy().ip()));
+    }
+
+    #[test]
+    fn client_address_trusted_ignores_header_from_untrusted_peer() {
+        let trusted = [proxy().ip()];
+        let mut req = HttpRequest::new("GET", "/").with_peer(Some(proxy()));
+        req.headers
+            .insert("X-Forwarded-For", "198.51.100.9, 203.0.113.7, 10.0.0.1");
+        // Trusted hops on the right are skipped.
+        assert_eq!(
+            req.client_address_trusted(&trusted),
+            Some("203.0.113.7".parse().unwrap())
+        );
+
+        let direct: SocketAddr = "192.0.2.50:4444".parse().unwrap();
+        let req = req.with_peer(Some(direct));
+        assert_eq!(req.client_address_trusted(&trusted), Some(direct.ip()));
+
+        let mut req = HttpRequest::new("GET", "/").with_peer(Some(proxy()));
+        req.headers.insert("X-Forwarded-For", "garbage, ");
+        assert_eq!(req.client_address_trusted(&trusted), None);
+
+        let req = HttpRequest::new("GET", "/").with_peer(Some(proxy()));
+        assert_eq!(req.client_address_trusted(&trusted), Some(proxy().ip()));
+        assert_eq!(
+            HttpRequest::new("GET", "/").client_address_trusted(&trusted),
+            None
+        );
+    }
+
+    #[test]
+    fn redirect_local_rejects_off_site_targets() {
+        assert!(HttpResponse::redirect_local("/a/b?c=d").is_ok());
+        for bad in [
+            "",
+            "evil.example",
+            "//evil.example",
+            "/\\evil.example",
+            "/\t/evil.example",
+            "/x\r\nSet-Cookie: a=b",
+            "https://evil.example",
+        ] {
+            assert!(HttpResponse::redirect_local(bad).is_err(), "{bad:?}");
+        }
+    }
+
+    #[test]
+    fn request_debug_omits_query_and_body() {
+        let mut req = HttpRequest::new("POST", "/login?token=s3cret");
+        req.body = Bytes::from_static(b"password=hunter2");
+        let dbg = format!("{req:?}");
+        assert!(!dbg.contains("s3cret"), "{dbg}");
+        assert!(!dbg.contains("hunter2"), "{dbg}");
+        assert!(dbg.contains("/login"));
     }
 
     #[test]
@@ -2187,5 +2492,67 @@ mod tests {
 
         let res = HttpResponse::ok().with_json(&data);
         assert!(res.is_ok());
+    }
+
+    /// A `{:?}` of a response must not print cookie values, credential
+    /// headers, or the body.
+    #[test]
+    fn response_debug_redacts_cookies_headers_and_body() {
+        let mut r = HttpResponse::ok()
+            .cookie("sid", "s3cret-session")
+            .with_body(b"account-number-42".to_vec());
+        r.headers
+            .insert("Set-Cookie".to_string(), "other=hdr-cookie".to_string());
+        r.headers
+            .insert("X-Auth-Token".to_string(), "tok-123".to_string());
+        r.headers
+            .insert("Content-Type".to_string(), "text/plain".to_string());
+        let out = format!("{r:?}");
+        for secret in [
+            "s3cret-session",
+            "hdr-cookie",
+            "tok-123",
+            "account-number-42",
+        ] {
+            assert!(!out.contains(secret), "{secret} leaked: {out}");
+        }
+        assert!(out.contains("text/plain"), "{out}");
+        assert!(out.contains("body_len: 17"), "{out}");
+    }
+
+    /// `client_address(0)` canonicalizes an IPv4-mapped peer like every other
+    /// path does.
+    #[test]
+    fn client_address_zero_depth_is_canonical() {
+        let mapped: SocketAddr = "[::ffff:192.0.2.9]:1234".parse().unwrap();
+        let req = HttpRequest::new("GET", "/").with_peer(Some(mapped));
+        assert_eq!(req.client_address(0), Some("192.0.2.9".parse().unwrap()));
+    }
+
+    /// Forwarded entries with a port (or brackets) are understood; garbage
+    /// still fails closed.
+    #[test]
+    fn forwarded_entries_with_ports_parse_and_garbage_fails_closed() {
+        let proxy: IpAddr = "10.0.0.1".parse().unwrap();
+        let peer = SocketAddr::new(proxy, 5555);
+        for (xff, want) in [
+            ("203.0.113.7:4711", Some("203.0.113.7")),
+            ("[2001:db8::1]:443", Some("2001:db8::1")),
+            ("[2001:db8::1]", Some("2001:db8::1")),
+            ("[::ffff:198.51.100.1]:80", Some("198.51.100.1")),
+            ("2001:db8::1", Some("2001:db8::1")),
+            ("203.0.113.7:99999", None),
+            ("[2001:db8::1]:x", None),
+            ("[203.0.113.7]:80", None),
+            ("[2001:db8::1]junk", None),
+            ("garbage", None),
+            ("", None),
+        ] {
+            let mut req = HttpRequest::new("GET", "/").with_peer(Some(peer));
+            req.headers.insert("X-Forwarded-For", xff);
+            let want = want.map(|w| w.parse::<IpAddr>().unwrap());
+            assert_eq!(req.client_address_trusted(&[proxy]), want, "{xff}");
+            assert_eq!(req.client_address(1), want, "{xff}");
+        }
     }
 }

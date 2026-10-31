@@ -15,37 +15,47 @@ jobs:
   fuzz:
     name: fuzz ${{ matrix.target }}
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     strategy:
       fail-fast: false
       matrix:
         target: [http_request, http_response, routing, json, url_parsing, headers, query_params, path_params]
     steps:
-      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+        with:
+          persist-credentials: false
       # cargo-fuzz needs nightly: the sanitizer and coverage instrumentation
       # libFuzzer relies on are nightly-only. `clippy` is requested explicitly
       # because this action installs the minimal profile, which omits it.
-        with:
-          persist-credentials: false
       - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
         with:
           components: clippy
           toolchain: nightly
-      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
+          # A cached binary would satisfy `cargo install` without rebuilding
+          # the pinned version below.
+          cache-bin: false
           workspaces: fuzz
-      - run: cargo install cargo-fuzz --locked
+      - run: cargo install cargo-fuzz --locked --version 0.13.2
       # `fuzz/` is its own workspace, so the crate's own clippy run never sees
       # it. Without this the harnesses are the one part of the tree outside the
-      # lint gate.
-      - run: cargo clippy --manifest-path fuzz/Cargo.toml --all-targets -- -D warnings
+      # lint gate. cargo-fuzz has no `--locked`, so this step is also what
+      # enforces the lockfile.
+      # It fails on a stale `fuzz/Cargo.lock`, so the fuzz build below resolves
+      # the same locked graph.
+      - run: cargo clippy --locked --manifest-path fuzz/Cargo.toml --all-targets -- -D warnings
       - name: Fuzz ${{ matrix.target }} for 60s
         run: cargo fuzz run ${{ matrix.target }} -- -max_total_time=60 -print_final_stats=1
       # The crash file is the reproducer. Without it the log line naming the
       # input is all that survives the runner, and re-finding it costs a run.
       - name: Upload crash artifacts
         if: failure()
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: fuzz-artifacts-${{ matrix.target }}
           path: fuzz/artifacts/
           if-no-files-found: ignore
+          # A crash file is a working denial-of-service input until the fix
+          # ships; on a public repository it should not outlive the triage.
+          retention-days: 7

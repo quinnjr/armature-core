@@ -206,9 +206,16 @@ impl QueryParams {
 }
 
 impl fmt::Debug for QueryParams {
+    // Values are redacted: query strings routinely carry tokens, signatures
+    // and other secrets, and a `{:?}` is exactly what ends up in a log. The
+    // keys alone are still enough to debug which parameters arrived.
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_map()
-            .entries(self.inner.iter().map(|(k, v)| (k, v)))
+            .entries(
+                self.inner
+                    .iter()
+                    .map(|(k, _)| (k, crate::headers::REDACTED)),
+            )
             .finish()
     }
 }
@@ -386,10 +393,16 @@ impl FormFields {
     }
 }
 
+/// Form values are user input — passwords, card numbers, tokens — so `Debug`
+/// lists only the field names, as [`QueryParams`]' does.
 impl fmt::Debug for FormFields {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_map()
-            .entries(self.inner.iter().map(|(k, v)| (k, v)))
+            .entries(
+                self.inner
+                    .iter()
+                    .map(|(k, _)| (k, crate::headers::REDACTED)),
+            )
             .finish()
     }
 }
@@ -627,5 +640,16 @@ mod tests {
         // Verify reasonable stack sizes
         assert!(SmallVec::<[(String, String); QUERY_PARAM_INLINE]>::stack_size() < 512);
         assert!(SmallVec::<[(String, String); PATH_PARAM_INLINE]>::stack_size() < 256);
+    }
+
+    #[test]
+    fn form_fields_debug_hides_values() {
+        let mut fields = FormFields::new();
+        fields.push("password".to_string(), "hunter2".to_string());
+        let out = format!("{fields:?}");
+        assert!(
+            out.contains("password") && !out.contains("hunter2"),
+            "{out}"
+        );
     }
 }

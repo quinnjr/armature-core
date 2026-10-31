@@ -1,6 +1,6 @@
 //! Copy-on-Write State Management
 //!
-//! This module provides efficient state management patterns using Arc<T>
+//! This module provides efficient state management patterns using `Arc<T>`
 //! that avoid cloning data on read operations. Writes create new versions,
 //! while reads simply clone the Arc pointer.
 //!

@@ -97,6 +97,14 @@ impl TlsConfig {
     pub fn self_signed(domains: &[&str]) -> Result<Self, Error> {
         use rcgen::{CertificateParams, KeyPair};
 
+        // Logged every time so a self-signed config that slips into a
+        // production deployment shows up in its logs.
+        tracing::warn!(
+            ?domains,
+            "using a self-signed TLS certificate; clients cannot verify this \
+             server's identity -- never use this in production"
+        );
+
         // Generate key pair
         let key_pair = KeyPair::generate()
             .map_err(|e| Error::Internal(format!("Failed to generate key pair: {}", e)))?;
@@ -132,10 +140,41 @@ fn load_certs(path: &Path) -> Result<Vec<CertificateDer<'static>>, Error> {
 
 /// Load private key from a PEM file
 fn load_private_key(path: &Path) -> Result<PrivateKeyDer<'static>, Error> {
+    warn_if_key_file_exposed(path);
     PrivateKeyDer::from_pem_file(path).map_err(|e| match e {
         PemError::NoItemsFound => Error::Internal("No private key found in file".to_string()),
         e => Error::Internal(format!("Failed to read private key: {}", e)),
     })
+}
+
+/// Warn when a private-key file is readable or writable by group or others.
+///
+/// Not a hard error: containers and secret mounts commonly present keys with
+/// broad modes that the deployment controls by other means. The warning is
+/// there so an accidentally world-readable key is noticed.
+#[cfg(unix)]
+fn warn_if_key_file_exposed(path: &Path) {
+    use std::os::unix::fs::PermissionsExt;
+    if let Ok(meta) = std::fs::metadata(path) {
+        let mode = meta.permissions().mode();
+        if key_mode_is_exposed(mode) {
+            tracing::warn!(
+                path = %path.display(),
+                mode = format_args!("{:o}", mode & 0o777),
+                "TLS private key file is accessible by group/other users; \
+                 restrict it to the owner (chmod 600)"
+            );
+        }
+    }
+}
+
+#[cfg(not(unix))]
+fn warn_if_key_file_exposed(_path: &Path) {}
+
+/// Whether a Unix file mode grants any permission to group or others.
+#[cfg(unix)]
+fn key_mode_is_exposed(mode: u32) -> bool {
+    mode & 0o077 != 0
 }
 
 /// Parse certificates from PEM bytes
@@ -193,6 +232,16 @@ impl HttpsConfig {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    #[test]
+    fn test_key_mode_exposure() {
+        assert!(!key_mode_is_exposed(0o100600));
+        assert!(!key_mode_is_exposed(0o400));
+        assert!(key_mode_is_exposed(0o644));
+        assert!(key_mode_is_exposed(0o640));
+        assert!(key_mode_is_exposed(0o602));
+    }
 
     #[test]
     #[cfg(feature = "self-signed-certs")]

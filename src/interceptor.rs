@@ -1,11 +1,18 @@
-// Interceptors for transforming requests and responses
+//! Interceptors for transforming requests and responses.
+//!
+//! [`CacheInterceptor`] is a shared response cache. It stores a response only
+//! when the handler explicitly marks it shareable (`Cache-Control: public` or
+//! `s-maxage`); anything else passes through uncached. It must sit inside
+//! every guard and authentication layer, since a hit answers the request
+//! without running anything it wraps.
 
 use crate::{Error, HttpRequest, HttpResponse};
 use async_trait::async_trait;
+use lru::LruCache;
 use parking_lot::RwLock;
-use std::collections::HashMap;
 use std::fmt::Write as _;
 use std::future::Future;
+use std::num::NonZeroUsize;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -44,22 +51,34 @@ impl Interceptor for LoggingInterceptor {
     ) -> Result<HttpResponse, Error> {
         let start = std::time::Instant::now();
         let method = context.request.method.clone();
-        let path = context.request.path.clone();
+        // The path alone: the query string routinely carries tokens, reset
+        // codes and API keys (`?token=...`), and a log line outlives the
+        // request by months in places the secret was never meant to reach.
+        let path = context.request.path_only().to_owned();
 
-        println!("→ {} {}", method, path);
+        tracing::info!(method = %method, path = %path, "request started");
 
         let result = next.await;
 
-        let duration = start.elapsed();
+        let duration_ms = start.elapsed().as_secs_f64() * 1000.0;
         match &result {
             Ok(response) => {
-                println!(
-                    "← {} {} - {} ({:?})",
-                    method, path, response.status, duration
+                tracing::info!(
+                    method = %method,
+                    path = %path,
+                    status = response.status,
+                    duration_ms,
+                    "request completed"
                 );
             }
             Err(e) => {
-                println!("← {} {} - Error: {} ({:?})", method, path, e, duration);
+                tracing::error!(
+                    method = %method,
+                    path = %path,
+                    error = %e.log_display(),
+                    duration_ms,
+                    "request failed"
+                );
             }
         }
 
@@ -101,13 +120,31 @@ where
 
 /// Response-cache interceptor.
 ///
-/// Caches successful **GET/HEAD** responses keyed by `METHOD:path?sorted-query`
-/// for `ttl_seconds`. Query parameters are folded into the key (sorted by name)
-/// so that requests differing only in the query string — e.g. `?q=cats` vs
-/// `?q=dogs` — never collide. On a fresh hit the cached response is returned
-/// without invoking the downstream handler; otherwise the handler runs and its
-/// response is stored. Expired entries are pruned lazily whenever a new response
-/// is inserted.
+/// **Opt-in per response.** Only a response that carries an explicit
+/// `Cache-Control: public` or `s-maxage` directive is stored; a response
+/// without one passes through uncached. Whether a request is credentialed is
+/// judged from header names (see below), and no name list covers every
+/// gateway's identity header, so absent an explicit statement from the
+/// handler that the body is the same for every caller, it is not shared.
+///
+/// Caches successful **GET/HEAD** responses keyed by
+/// `METHOD:host:path?sorted-query` for `ttl_seconds`. Query parameters are
+/// folded into the key (sorted by name) so that requests differing only in the
+/// query string — e.g. `?q=cats` vs `?q=dogs` — never collide, and the `Host`
+/// is folded in so two virtual hosts never share an entry. On a fresh hit the
+/// cached response is returned without invoking the downstream handler;
+/// otherwise the handler runs and its response is stored.
+///
+/// The store holds at most `max_entries` responses
+/// ([`DEFAULT_MAX_ENTRIES`](Self::DEFAULT_MAX_ENTRIES) unless set with
+/// [`with_capacity`](Self::with_capacity)); past that the oldest is evicted.
+/// An expired entry is dropped when a lookup finds it, or evicted by capacity.
+///
+/// Bytes are bounded too, since an entry count alone lets a handful of large
+/// responses pin arbitrary memory: a body over
+/// [`max_body_bytes`](Self::with_max_body_bytes) is never stored, and the
+/// bodies held together never exceed
+/// [`max_total_bytes`](Self::with_max_total_bytes) (oldest evicted first).
 ///
 /// The cache is process-local and shared across clones of the interceptor via
 /// an `Arc`, so a single `CacheInterceptor` value serves every request routed
@@ -118,12 +155,21 @@ where
 /// This is a **shared, unkeyed-by-identity** cache: it does not discriminate on
 /// `Authorization`, `Cookie`, or any other per-user dimension. Placing it on a
 /// route whose response depends on the caller's identity would serve one user's
-/// body to another. To reduce that blast radius it will **not store** a response
-/// that:
+/// body to another. To reduce that blast radius a *credentialed* request
+/// bypasses the cache entirely — it is never served a hit and its response is
+/// never stored. Credentialed means it carries any credential header
+/// (`Authorization`, `Cookie`, `X-Api-Key`, `X-Auth-Token`, `X-Session-*`, ...
+/// — every [sensitive](crate::headers::is_sensitive_header) header except
+/// anti-CSRF tokens) or an authentication layer has attached a
+/// [`VerifiedIdentity`](crate::VerifiedIdentity) /
+/// [`RequestRoles`](crate::RequestRoles). A request with more than one `Host`
+/// bypasses it too. Otherwise the cache will **not store** a response that:
 ///
+/// - lacks an explicit `Cache-Control: public` or `s-maxage` directive, or
 /// - was produced by a method other than `GET` or `HEAD`, or
 /// - carries a `Set-Cookie` header (session/user state), or
-/// - carries `Cache-Control: private` or `Cache-Control: no-store`, or
+/// - carries `Cache-Control: private`, `no-store` or `no-cache` (this cache
+///   never revalidates, so `no-cache` can't be honoured), or
 /// - carries a non-empty `Vary` header, or
 /// - carries a non-empty `Content-Encoding` header.
 ///
@@ -137,32 +183,139 @@ where
 /// These guards are defensive, not a substitute for correct placement: only
 /// attach this interceptor to routes whose responses are identical for every
 /// caller.
+///
+/// **Ordering.** The verified-identity check only sees what has already been
+/// attached, so the cache must run *after* every middleware that authenticates
+/// the request and inserts a [`VerifiedIdentity`](crate::VerifiedIdentity) /
+/// [`RequestRoles`](crate::RequestRoles) — in particular one that
+/// authenticates from something the header check cannot see (mTLS, or a
+/// gateway header it strips). Register the authentication middleware so it
+/// wraps the handler this interceptor is attached to.
+///
+/// **A hit short-circuits everything inside the cache.** A fresh entry is
+/// returned without running the downstream future, so any guard, interceptor
+/// or middleware wrapped *by* this one never sees the request. Place it
+/// inside every guard and authorization check, never around one; otherwise a
+/// response cached for an admitted caller is served to a caller the guard
+/// would have rejected.
 pub struct CacheInterceptor {
     /// Freshness window, in seconds. A cached entry is served only while its
     /// age is strictly less than this. `0` disables caching (nothing is ever
     /// fresh).
     pub ttl_seconds: u64,
-    /// Backing store: `method:path` -> (stored-at instant, response).
-    store: Arc<RwLock<HashMap<String, (Instant, HttpResponse)>>>,
+    /// Backing store: cache key -> (stored-at instant, response).
+    ///
+    /// Bounded, so the number of distinct URLs a client can mint (every query
+    /// value is a new key) can't grow it without limit. Reads use `peek`,
+    /// which leaves recency alone, so lookups share the read lock and
+    /// eviction is oldest-stored-first.
+    store: Arc<RwLock<Store>>,
+    /// Largest body stored; bigger responses pass through uncached.
+    max_body_bytes: usize,
+    /// Budget for the bodies (and keys) held together.
+    max_total_bytes: usize,
+}
+
+/// The LRU plus a running total of the bytes it holds, kept under one lock so
+/// the total can't drift from the entries it counts.
+struct Store {
+    entries: LruCache<String, (Instant, HttpResponse)>,
+    bytes: usize,
+}
+
+/// What an entry counts against the byte budget: its body and its key (the
+/// key carries the attacker-chosen path and query, so it is not free either).
+fn entry_cost(key: &str, response: &HttpResponse) -> usize {
+    key.len() + response.body.len()
+}
+
+impl Store {
+    fn pop(&mut self, key: &str) {
+        if let Some((_, response)) = self.entries.pop(key) {
+            self.bytes -= entry_cost(key, &response);
+        }
+    }
+
+    /// Insert, evicting oldest entries until both the count and the byte
+    /// budget hold.
+    fn insert(&mut self, key: String, response: HttpResponse, max_total_bytes: usize) {
+        let cost = entry_cost(&key, &response);
+        // Something that can never fit must not flush the whole cache trying.
+        if cost > max_total_bytes {
+            return;
+        }
+        // A re-store replaces the old entry; take its bytes off first so the
+        // eviction loop below doesn't count it twice.
+        self.pop(&key);
+        while self.bytes + cost > max_total_bytes {
+            match self.entries.pop_lru() {
+                Some((k, (_, r))) => self.bytes -= entry_cost(&k, &r),
+                None => break,
+            }
+        }
+        // `push` hands back what the count bound evicted.
+        if let Some((k, (_, r))) = self.entries.push(key, (Instant::now(), response)) {
+            self.bytes -= entry_cost(&k, &r);
+        }
+        self.bytes += cost;
+    }
 }
 
 impl CacheInterceptor {
+    /// Entries held by [`new`](Self::new) before the oldest is evicted.
+    pub const DEFAULT_MAX_ENTRIES: usize = 1024;
+    /// Default largest body stored: 1 MiB.
+    pub const DEFAULT_MAX_BODY_BYTES: usize = 1024 * 1024;
+    /// Default budget for all stored bodies together: 64 MiB.
+    pub const DEFAULT_MAX_TOTAL_BYTES: usize = 64 * 1024 * 1024;
+
     pub fn new(ttl_seconds: u64) -> Self {
+        Self::with_capacity(ttl_seconds, Self::DEFAULT_MAX_ENTRIES)
+    }
+
+    /// A cache holding at most `max_entries` responses (at least one).
+    pub fn with_capacity(ttl_seconds: u64, max_entries: usize) -> Self {
+        let capacity = NonZeroUsize::new(max_entries).unwrap_or(NonZeroUsize::MIN);
         Self {
             ttl_seconds,
-            store: Arc::new(RwLock::new(HashMap::new())),
+            store: Arc::new(RwLock::new(Store {
+                entries: LruCache::new(capacity),
+                bytes: 0,
+            })),
+            max_body_bytes: Self::DEFAULT_MAX_BODY_BYTES,
+            max_total_bytes: Self::DEFAULT_MAX_TOTAL_BYTES,
         }
+    }
+
+    /// Never store a response whose body is larger than `bytes`
+    /// (default [`DEFAULT_MAX_BODY_BYTES`](Self::DEFAULT_MAX_BODY_BYTES)).
+    pub fn with_max_body_bytes(mut self, bytes: usize) -> Self {
+        self.max_body_bytes = bytes;
+        self
+    }
+
+    /// Hold at most `bytes` of bodies and keys in total, evicting the oldest
+    /// entries to make room (default
+    /// [`DEFAULT_MAX_TOTAL_BYTES`](Self::DEFAULT_MAX_TOTAL_BYTES)).
+    pub fn with_max_total_bytes(mut self, bytes: usize) -> Self {
+        self.max_total_bytes = bytes;
+        self
+    }
+
+    /// Bytes currently held (bodies plus keys).
+    pub fn total_bytes(&self) -> usize {
+        self.store.read().bytes
     }
 
     /// Number of entries currently held (including any not-yet-pruned expired
     /// ones). Primarily useful for tests and diagnostics.
     pub fn len(&self) -> usize {
-        self.store.read().len()
+        self.store.read().entries.len()
     }
 
     /// Whether the cache currently holds no entries.
     pub fn is_empty(&self) -> bool {
-        self.store.read().is_empty()
+        self.store.read().entries.is_empty()
     }
 }
 
@@ -180,7 +333,9 @@ fn clone_response(response: &HttpResponse) -> HttpResponse {
     copy.with_bytes_body(response.body.clone())
 }
 
-/// Build the cache key for a request: `METHOD:{path.len()}:path` — where
+/// Build the cache key for a request: `METHOD:` then, when the request has a
+/// `Host`, `@{len}:{host}:` (normalized as the response cache does it), then
+/// `{path.len()}:path` — where
 /// `path` is the target with the query stripped off — with a canonicalized
 /// query string appended, sorted by parameter name. Sorting
 /// means logically-identical requests with different parameter orderings map
@@ -217,31 +372,37 @@ fn cache_key(request: &HttpRequest) -> String {
     // Cheap upper-bound capacity pass so the common case (few short params)
     // needs no reallocation while building the key below.
     let mut capacity = method.len() + 1 + 20 + 1 + path.len() + 1;
-    for (k, v) in request.query().iter() {
-        capacity += 20 + 1 + k.len() + 1 + 20 + 1 + v.len() + 1;
+    let segments = crate::query::raw_segments_sorted(request.query_string().unwrap_or(""));
+    for segment in &segments {
+        capacity += 20 + 1 + segment.len() + 1;
     }
+    let authority = request
+        .headers
+        .get("host")
+        .map(crate::response_cache::normalize_authority);
+    capacity += authority.as_ref().map_or(0, |a| a.len() + 23);
     let mut key = String::with_capacity(capacity);
 
     key.push_str(method);
     key.push(':');
+    // `@` can't start the path's (numeric) length prefix, so a keyed host can
+    // never render the same as a hostless key.
+    if let Some(authority) = authority {
+        let _ = write!(key, "@{}:{}:", authority.len(), authority);
+    }
     let _ = write!(key, "{}", path.len());
     key.push(':');
     key.push_str(path);
 
-    if request.query().is_empty() {
+    if segments.is_empty() {
         return key;
     }
-    let mut params: Vec<(&str, &str)> = request.query().iter().collect();
-    params.sort_by(|a, b| a.0.cmp(b.0));
+    // Raw segments, not decoded pairs: see `query::raw_segments_sorted`.
     key.push('?');
-    for (k, v) in params {
-        let _ = write!(key, "{}", k.len());
+    for segment in segments {
+        let _ = write!(key, "{}", segment.len());
         key.push(':');
-        key.push_str(k);
-        key.push('=');
-        let _ = write!(key, "{}", v.len());
-        key.push(':');
-        key.push_str(v);
+        key.push_str(segment);
         key.push('&');
     }
     key
@@ -252,11 +413,25 @@ fn is_cacheable_method(method: &str) -> bool {
     method.eq_ignore_ascii_case("GET") || method.eq_ignore_ascii_case("HEAD")
 }
 
+/// Whether a request must skip the cache in both directions.
+///
+/// A credential — any credential header, not just `Authorization`/`Cookie`
+/// (an `X-Api-Key` identifies the caller just as well), or a verified
+/// identity an auth middleware attached — means the handler is likely
+/// answering *this* caller; the key has no identity in it, so a hit would
+/// hand them someone else's body and a store would hand theirs to everyone.
+/// Two `Host` lines leave which site the response is for a guess, so it
+/// isn't keyed on either.
+fn must_bypass(request: &HttpRequest) -> bool {
+    crate::guard::is_credentialed_request(request) || request.headers.get_unique("host").is_err()
+}
+
 /// Whether a response must not be stored in this shared, identity-agnostic
 /// cache: it carries a `Set-Cookie` (per-user session state), a
 /// `Cache-Control` directive that forbids shared storage
-/// (`private`/`no-store`), a non-empty `Vary` header, or a non-empty
-/// `Content-Encoding` header.
+/// (`private`/`no-store`) or requires revalidation this cache can't do
+/// (`no-cache`), a non-empty `Vary` header, or a non-empty `Content-Encoding`
+/// header.
 ///
 /// The `Vary`/`Content-Encoding` checks exist because [`cache_key`] never
 /// folds in request headers (there is no `Accept-Encoding`, `Accept-Language`,
@@ -278,7 +453,6 @@ fn must_not_cache(response: &HttpResponse) -> bool {
     if !response.cookies.is_empty() {
         return true;
     }
-    let mut cache_control: Option<&str> = None;
     for (name, value) in response.headers.iter() {
         if name.eq_ignore_ascii_case("set-cookie") {
             return true;
@@ -289,17 +463,41 @@ fn must_not_cache(response: &HttpResponse) -> bool {
         if name.eq_ignore_ascii_case("content-encoding") && !value.trim().is_empty() {
             return true;
         }
-        if name.eq_ignore_ascii_case("cache-control") {
-            cache_control = Some(value.as_str());
+        // Every Cache-Control line, not just the last one iterated: the map is
+        // case-sensitive, so `Cache-Control: public` and `cache-control:
+        // private` can both be present, and either line forbidding storage
+        // is enough.
+        if name.eq_ignore_ascii_case("cache-control")
+            && value.split(',').any(|directive| {
+                // `private="Set-Cookie"` and `no-cache="..."` are still the
+                // directive; only the name decides.
+                let name = directive.split('=').next().unwrap_or("").trim();
+                name.eq_ignore_ascii_case("private")
+                    || name.eq_ignore_ascii_case("no-store")
+                    || name.eq_ignore_ascii_case("no-cache")
+            })
+        {
+            return true;
         }
     }
-    if let Some(cc) = cache_control {
-        return cc.split(',').any(|directive| {
-            let directive = directive.trim();
-            directive.eq_ignore_ascii_case("private") || directive.eq_ignore_ascii_case("no-store")
-        });
-    }
     false
+}
+
+/// Whether the handler explicitly declared `response` storable by a shared
+/// cache: some `Cache-Control` line carries `public` or `s-maxage`.
+///
+/// Required for every store, not just a tie-breaker: the credential check
+/// works from header names, and an identity header it doesn't know would
+/// otherwise let a per-caller body into the shared store. Every line is
+/// walked, case-insensitively, for the same reason as in [`must_not_cache`].
+fn is_explicitly_shareable(response: &HttpResponse) -> bool {
+    response.headers.iter().any(|(name, value)| {
+        name.eq_ignore_ascii_case("cache-control")
+            && value.split(',').any(|directive| {
+                let name = directive.split('=').next().unwrap_or("").trim();
+                name.eq_ignore_ascii_case("public") || name.eq_ignore_ascii_case("s-maxage")
+            })
+    })
 }
 
 #[async_trait]
@@ -314,16 +512,33 @@ impl Interceptor for CacheInterceptor {
         // Build the key only when it will actually be used: for the (common)
         // case of a non-GET/HEAD request, this skips the allocation and
         // length-prefixing work entirely.
-        let cache_key =
-            is_cacheable_method(context.request.method_str()).then(|| cache_key(&context.request));
+        let cache_key = (is_cacheable_method(context.request.method_str())
+            && !must_bypass(&context.request))
+        .then(|| cache_key(&context.request));
 
         // Lookup: serve a fresh hit without touching the handler.
         if let Some(key) = cache_key.as_deref() {
-            let store = self.store.read();
-            if let Some((stored_at, cached)) = store.get(key)
-                && stored_at.elapsed() < ttl
-            {
-                return Ok(clone_response(cached));
+            let expired = {
+                let store = self.store.read();
+                match store.entries.peek(key) {
+                    Some((stored_at, cached)) if stored_at.elapsed() < ttl => {
+                        return Ok(clone_response(cached));
+                    }
+                    Some(_) => true,
+                    None => false,
+                }
+            };
+            // Drop an expired entry now rather than let it hold a slot until
+            // capacity pushes it out.
+            if expired {
+                let mut store = self.store.write();
+                if store
+                    .entries
+                    .peek(key)
+                    .is_some_and(|(at, _)| at.elapsed() >= ttl)
+                {
+                    store.pop(key);
+                }
             }
         }
 
@@ -331,20 +546,23 @@ impl Interceptor for CacheInterceptor {
         let response = next.await?;
 
         // Store only when: the method is safe, caching is enabled, the response
-        // is a success (2xx), and it is safe to share — i.e. it does not carry a
-        // Set-Cookie, a private/no-store Cache-Control, a Vary header, or a
-        // Content-Encoding header. This keeps per-user bodies, session cookies,
-        // and negotiated/encoded representations from bleeding across callers.
+        // is a success (2xx), the handler marked it `public`/`s-maxage`, and
+        // nothing contradicts that — no Set-Cookie, private/no-store/no-cache
+        // Cache-Control, Vary, or Content-Encoding. This keeps per-user bodies,
+        // session cookies, and negotiated/encoded representations from
+        // bleeding across callers.
         if let Some(key) = cache_key
             && self.ttl_seconds > 0
             && (200..300).contains(&response.status)
+            && is_explicitly_shareable(&response)
             && !must_not_cache(&response)
+            && response.body.len() <= self.max_body_bytes
         {
-            let mut store = self.store.write();
-            // Prune expired entries so a full-of-stale cache cannot grow without
-            // bound on the insert path.
-            store.retain(|_, (stored_at, _)| stored_at.elapsed() < ttl);
-            store.insert(key, (Instant::now(), clone_response(&response)));
+            // Amortized O(1): the count and byte bounds, not a full sweep under
+            // the write lock, are what keep the store from growing.
+            self.store
+                .write()
+                .insert(key, clone_response(&response), self.max_total_bytes);
         }
 
         Ok(response)
@@ -402,6 +620,15 @@ mod tests {
     }
 
     #[test]
+    fn cache_key_keeps_raw_query_bytes_apart() {
+        // Both decode to U+FFFD / a space; a handler reading the raw query
+        // tells them apart, so the cache must too.
+        let key = |t| cache_key(&crate::HttpRequest::new("GET", t));
+        assert_ne!(key("/s?a=%FF"), key("/s?a=%FE"));
+        assert_ne!(key("/s?a=+"), key("/s?a=%20"));
+    }
+
+    #[test]
     fn cache_key_is_order_insensitive_across_query_orderings() {
         let a = crate::HttpRequest::new("GET", "/search?a=1&b=2");
         let b = crate::HttpRequest::new("GET", "/search?b=2&a=1");
@@ -436,6 +663,8 @@ mod tests {
             calls.fetch_add(1, Ordering::SeqCst);
             let mut resp = HttpResponse::new(status);
             resp.body = Bytes::copy_from_slice(body);
+            resp.headers
+                .insert("Cache-Control".to_string(), "public".to_string());
             Ok(resp)
         })
     }
@@ -566,6 +795,8 @@ mod tests {
             let n = calls.fetch_add(1, Ordering::SeqCst);
             let mut resp = HttpResponse::ok();
             resp.body = Bytes::from(format!("user-{n}").into_bytes());
+            resp.headers
+                .insert("Cache-Control".to_string(), "public".to_string());
             resp.cookies.push(format!("session=secret-{n}; HttpOnly"));
             Ok(resp)
         })
@@ -643,6 +874,10 @@ mod tests {
             let n = calls.fetch_add(1, Ordering::SeqCst);
             let mut resp = HttpResponse::ok();
             resp.body = Bytes::from(format!("body-{n}").into_bytes());
+            // Explicitly shareable, so a refusal is down to the header under
+            // test (which overwrites this line when it is `Cache-Control`).
+            resp.headers
+                .insert("Cache-Control".to_string(), "public".to_string());
             resp.headers
                 .insert(header_name.to_string(), header_value.to_string());
             Ok(resp)
@@ -855,5 +1090,355 @@ mod tests {
             "a path containing a literal '?' must not collide with a distinct path+query"
         );
         assert_eq!(interceptor.len(), 2);
+    }
+
+    // ---- Security hardening ------------------------------------------------
+
+    fn with_header(mut request: HttpRequest, name: &str, value: &str) -> HttpRequest {
+        request.headers.append(name, value.to_string());
+        request
+    }
+
+    /// A request carrying credentials gets a per-caller answer the key can't
+    /// tell apart, so it must neither be served from nor populate the cache.
+    #[tokio::test]
+    async fn test_cache_interceptor_bypasses_credentialed_requests() {
+        for header in ["Authorization", "Cookie"] {
+            let interceptor = CacheInterceptor::new(60);
+            let calls = Arc::new(AtomicUsize::new(0));
+
+            let alice = with_header(HttpRequest::new("GET", "/me"), header, "alice");
+            let first = interceptor
+                .intercept(
+                    ExecutionContext::new(alice),
+                    counting_next(calls.clone(), 200, b"alice"),
+                )
+                .await
+                .unwrap();
+            assert_eq!(first.body_ref(), b"alice");
+            assert!(interceptor.is_empty(), "{header}: must not store");
+
+            // Even with something already cached for the path, a credentialed
+            // request goes to the handler.
+            interceptor
+                .intercept(
+                    ExecutionContext::new(HttpRequest::new("GET", "/me")),
+                    counting_next(calls.clone(), 200, b"anon"),
+                )
+                .await
+                .unwrap();
+            let bob = with_header(HttpRequest::new("GET", "/me"), header, "bob");
+            let second = interceptor
+                .intercept(
+                    ExecutionContext::new(bob),
+                    counting_next(calls.clone(), 200, b"bob"),
+                )
+                .await
+                .unwrap();
+            assert_eq!(
+                second.body_ref(),
+                b"bob",
+                "{header}: must not be served a hit"
+            );
+            assert_eq!(calls.load(Ordering::SeqCst), 3);
+        }
+    }
+
+    /// `no-cache` means "revalidate before every reuse"; this cache never
+    /// revalidates, so it must not store such a response.
+    #[tokio::test]
+    async fn test_cache_interceptor_refuses_no_cache() {
+        let interceptor = CacheInterceptor::new(60);
+        let calls = Arc::new(AtomicUsize::new(0));
+        for _ in 0..2 {
+            interceptor
+                .intercept(
+                    ExecutionContext::new(HttpRequest::new("GET", "/nc")),
+                    header_next(calls.clone(), "Cache-Control", "no-cache"),
+                )
+                .await
+                .unwrap();
+        }
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+        assert!(interceptor.is_empty());
+    }
+
+    /// Differently-cased Cache-Control lines coexist in the response map; a
+    /// `private` on either must win over a `public` on the other, whatever
+    /// order the map iterates them in.
+    #[test]
+    fn test_must_not_cache_sees_every_cache_control_line() {
+        for (a, b) in [("public", "private"), ("private", "public")] {
+            let mut resp = HttpResponse::ok();
+            resp.headers
+                .insert("Cache-Control".to_string(), a.to_string());
+            resp.headers
+                .insert("cache-control".to_string(), b.to_string());
+            assert!(must_not_cache(&resp), "{a} / {b}");
+        }
+        let mut resp = HttpResponse::ok();
+        resp.headers
+            .insert("Cache-Control".to_string(), "public".to_string());
+        resp.headers
+            .insert("CACHE-CONTROL".to_string(), "max-age=60".to_string());
+        assert!(!must_not_cache(&resp));
+    }
+
+    /// Different virtual hosts must not share an entry for the same path.
+    #[tokio::test]
+    async fn test_cache_interceptor_keys_on_host() {
+        let interceptor = CacheInterceptor::new(60);
+        let calls = Arc::new(AtomicUsize::new(0));
+
+        let a = with_header(HttpRequest::new("GET", "/"), "Host", "a.example");
+        interceptor
+            .intercept(
+                ExecutionContext::new(a),
+                counting_next(calls.clone(), 200, b"a"),
+            )
+            .await
+            .unwrap();
+        let b = with_header(HttpRequest::new("GET", "/"), "Host", "b.example");
+        let resp = interceptor
+            .intercept(
+                ExecutionContext::new(b),
+                counting_next(calls.clone(), 200, b"b"),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.body_ref(), b"b");
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+
+        // Two `Host` lines: neither served nor stored.
+        let dup = with_header(
+            with_header(HttpRequest::new("GET", "/"), "Host", "a.example"),
+            "Host",
+            "b.example",
+        );
+        let resp = interceptor
+            .intercept(
+                ExecutionContext::new(dup),
+                counting_next(calls.clone(), 200, b"dup"),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.body_ref(), b"dup");
+        assert_eq!(interceptor.len(), 2);
+    }
+
+    /// The store is bounded: distinct keys past capacity evict the oldest
+    /// instead of growing the map without limit.
+    #[tokio::test]
+    async fn test_cache_interceptor_is_bounded() {
+        let interceptor = CacheInterceptor::with_capacity(60, 2);
+        let calls = Arc::new(AtomicUsize::new(0));
+        for path in ["/1", "/2", "/3"] {
+            interceptor
+                .intercept(
+                    ExecutionContext::new(HttpRequest::new("GET", path)),
+                    counting_next(calls.clone(), 200, b"x"),
+                )
+                .await
+                .unwrap();
+        }
+        assert_eq!(interceptor.len(), 2);
+
+        // `/1` was the oldest, so it is the one that went.
+        interceptor
+            .intercept(
+                ExecutionContext::new(HttpRequest::new("GET", "/1")),
+                counting_next(calls.clone(), 200, b"x"),
+            )
+            .await
+            .unwrap();
+        assert_eq!(calls.load(Ordering::SeqCst), 4);
+    }
+
+    /// Every credential header — not just `Authorization`/`Cookie` — and a
+    /// verified identity attached by middleware make the request bypass the
+    /// cache in both directions. Anti-CSRF tokens alone do not.
+    #[tokio::test]
+    async fn test_cache_interceptor_bypasses_all_credentials() {
+        let credentialed: Vec<Box<dyn Fn() -> HttpRequest>> = vec![
+            Box::new(|| with_header(HttpRequest::new("GET", "/me"), "X-Api-Key", "k")),
+            Box::new(|| with_header(HttpRequest::new("GET", "/me"), "X-Auth-Token", "t")),
+            Box::new(|| with_header(HttpRequest::new("GET", "/me"), "X-Session-Id", "s")),
+            Box::new(|| {
+                let mut r = HttpRequest::new("GET", "/me");
+                r.extensions.insert(crate::VerifiedIdentity::new("alice"));
+                r
+            }),
+            Box::new(|| {
+                let mut r = HttpRequest::new("GET", "/me");
+                r.extensions.insert(crate::RequestRoles::new(["admin"]));
+                r
+            }),
+            // Authenticated, no roles, no `VerifiedIdentity`: still per-user.
+            Box::new(|| {
+                let mut r = HttpRequest::new("GET", "/me");
+                r.extensions.insert(crate::RequestRoles::default());
+                r
+            }),
+        ];
+        for make in credentialed {
+            let interceptor = CacheInterceptor::new(60);
+            let calls = Arc::new(AtomicUsize::new(0));
+            // Seed an anonymous entry, then make sure the credentialed request
+            // is neither served it nor stores its own.
+            interceptor
+                .intercept(
+                    ExecutionContext::new(HttpRequest::new("GET", "/me")),
+                    counting_next(calls.clone(), 200, b"anon"),
+                )
+                .await
+                .unwrap();
+            let resp = interceptor
+                .intercept(
+                    ExecutionContext::new(make()),
+                    counting_next(calls.clone(), 200, b"mine"),
+                )
+                .await
+                .unwrap();
+            assert_eq!(resp.body_ref(), b"mine", "{:?}", make());
+            assert_eq!(calls.load(Ordering::SeqCst), 2);
+            assert_eq!(interceptor.len(), 1);
+        }
+
+        let interceptor = CacheInterceptor::new(60);
+        let calls = Arc::new(AtomicUsize::new(0));
+        for _ in 0..2 {
+            let req = with_header(HttpRequest::new("GET", "/p"), "X-CSRF-Token", "c");
+            interceptor
+                .intercept(
+                    ExecutionContext::new(req),
+                    counting_next(calls.clone(), 200, b"x"),
+                )
+                .await
+                .unwrap();
+        }
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            1,
+            "CSRF token alone is cacheable"
+        );
+    }
+
+    /// `host:443` and `host` may be different origins (`http://host:443` is
+    /// not `http://host`), so they must not share an entry.
+    #[tokio::test]
+    async fn test_cache_interceptor_keeps_port_in_key() {
+        let interceptor = CacheInterceptor::new(60);
+        let calls = Arc::new(AtomicUsize::new(0));
+        for (host, body) in [("h.example:443", &b"tls"[..]), ("h.example", b"plain")] {
+            let resp = interceptor
+                .intercept(
+                    ExecutionContext::new(with_header(HttpRequest::new("GET", "/"), "Host", host)),
+                    counting_next(calls.clone(), 200, body),
+                )
+                .await
+                .unwrap();
+            assert_eq!(resp.body_ref(), body);
+        }
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+    }
+
+    /// Bodies over the per-entry limit pass through uncached, and the total
+    /// byte budget evicts the oldest entries.
+    #[tokio::test]
+    async fn test_cache_interceptor_is_byte_bounded() {
+        let interceptor = CacheInterceptor::new(60)
+            .with_max_body_bytes(8)
+            .with_max_total_bytes(64);
+        let calls = Arc::new(AtomicUsize::new(0));
+        interceptor
+            .intercept(
+                ExecutionContext::new(HttpRequest::new("GET", "/big")),
+                counting_next(calls.clone(), 200, b"0123456789"),
+            )
+            .await
+            .unwrap();
+        assert!(interceptor.is_empty(), "oversized body must not be stored");
+
+        // Each entry costs key (~12 bytes) + 8 body bytes; 64 bytes holds ~3.
+        for i in 0..10 {
+            let path = format!("/s{i}");
+            interceptor
+                .intercept(
+                    ExecutionContext::new(HttpRequest::new("GET", path)),
+                    counting_next(calls.clone(), 200, b"01234567"),
+                )
+                .await
+                .unwrap();
+            assert!(interceptor.total_bytes() <= 64);
+        }
+        assert!(interceptor.len() < 10 && !interceptor.is_empty());
+
+        // Re-storing the same key doesn't double-count.
+        let mut store = Store {
+            entries: LruCache::new(NonZeroUsize::new(4).unwrap()),
+            bytes: 0,
+        };
+        for _ in 0..3 {
+            let mut r = HttpResponse::new(200);
+            r.body = Bytes::from_static(b"abcd");
+            store.insert("k".to_string(), r, 1024);
+        }
+        assert_eq!(store.bytes, 5);
+        store.pop("k");
+        assert_eq!(store.bytes, 0);
+    }
+
+    /// The key must tell apart queries the handler's `Query<T>` reads
+    /// differently: an extra empty-key pair, and `%FF` vs a literal `%FF`.
+    #[test]
+    fn cache_key_distinguishes_empty_keys_and_invalid_utf8() {
+        let key = |p: &str| cache_key(&HttpRequest::new("GET", p.to_string()));
+        assert_ne!(key("/s?q=1&=x"), key("/s?q=1"));
+        assert_ne!(key("/s?q=%FF"), key("/s?q=%25FF"));
+    }
+
+    /// Only a response the handler explicitly marked `public` / `s-maxage`
+    /// is stored; one without a Cache-Control statement passes through, since
+    /// an identity header the credential check doesn't know would otherwise
+    /// let a per-caller body into the shared store.
+    #[tokio::test]
+    async fn test_cache_interceptor_stores_only_explicitly_public_responses() {
+        fn next_with(
+            calls: Arc<AtomicUsize>,
+            cache_control: Option<&'static str>,
+        ) -> Pin<Box<dyn Future<Output = Result<HttpResponse, Error>> + Send>> {
+            Box::pin(async move {
+                calls.fetch_add(1, Ordering::SeqCst);
+                let mut resp = HttpResponse::ok();
+                resp.body = Bytes::from_static(b"x");
+                if let Some(cc) = cache_control {
+                    resp.headers
+                        .insert("cache-control".to_string(), cc.to_string());
+                }
+                Ok(resp)
+            })
+        }
+        for (cc, stored) in [
+            (None, false),
+            (Some("max-age=60"), false),
+            (Some("public"), true),
+            (Some("Public, max-age=60"), true),
+            (Some("s-maxage=60"), true),
+            (Some("public, private"), false),
+        ] {
+            let interceptor = CacheInterceptor::new(60);
+            let calls = Arc::new(AtomicUsize::new(0));
+            for _ in 0..2 {
+                // An unknown gateway identity header: not caught by name.
+                let mut req = HttpRequest::new("GET", "/me");
+                req.headers.insert("x-acme-gateway-user", "alice");
+                interceptor
+                    .intercept(ExecutionContext::new(req), next_with(calls.clone(), cc))
+                    .await
+                    .unwrap();
+            }
+            assert_eq!(!interceptor.is_empty(), stored, "{cc:?}");
+            assert_eq!(calls.load(Ordering::SeqCst), if stored { 1 } else { 2 });
+        }
     }
 }

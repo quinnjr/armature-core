@@ -6,7 +6,7 @@
 //! - Configuration types ([`IoUringConfig`], [`TcpOptions`]) and statistics
 //!   counters ([`IoUringStats`]) — available on all platforms.
 //! - A [`BufferPool`] of reusable byte buffers — available on all platforms.
-//! - [`IoUringRuntime`]: a real `io_uring` ring (built on the
+//! - `IoUringRuntime`: a real `io_uring` ring (built on the
 //!   [`io-uring`](https://docs.rs/io-uring) crate) with synchronous
 //!   `read_at`/`write_at` submission helpers for file/socket file
 //!   descriptors. Only available on Linux with the `io-uring` Cargo feature

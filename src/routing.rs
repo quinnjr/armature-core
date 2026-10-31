@@ -22,7 +22,7 @@ use std::sync::{Arc, OnceLock};
 /// A route handler function type (legacy - for backwards compatibility)
 ///
 /// **Deprecated**: Use `BoxedHandler` for better performance via monomorphization.
-/// This type uses double dynamic dispatch (dyn Fn + Box<dyn Future>) which
+/// This type uses double dynamic dispatch (`dyn Fn` + `Box<dyn Future>`) which
 /// prevents the compiler from inlining handler code.
 ///
 /// Prefer using the optimized handler system:
@@ -261,7 +261,12 @@ impl Router {
     /// inlined by the compiler.
     #[inline]
     pub async fn route(&self, mut request: HttpRequest) -> Result<HttpResponse, Error> {
-        debug!("Routing request: {} {}", request.method, request.path);
+        // Path only: the query string may carry secrets.
+        debug!(
+            "Routing request: {} {}",
+            request.method,
+            request.path_only()
+        );
 
         // Match on the path alone; the query is parsed on demand by
         // `HttpRequest::query`, and only if a handler asks for it.
@@ -314,6 +319,10 @@ impl Router {
     /// controllers registered, and by [`RouteGroup`](crate::RouteGroup) to
     /// enforce a group's guards and middleware.
     ///
+    /// A layered route's [`RouteConstraints`] move into the innermost layer
+    /// (its [`Route::constraints`] becomes `None`), so they are validated after
+    /// these guards and middleware rather than before them.
+    ///
     /// # Panics
     ///
     /// Panics if `range` is out of bounds for [`Router::routes`], like slice
@@ -328,11 +337,40 @@ impl Router {
             return;
         }
         for route in &mut self.routes[range] {
-            route.handler = layer_handler(route.handler.clone(), middleware, guards);
+            // Both routers validate `route.constraints` *before* calling the
+            // handler, i.e. before any layer bound here. A guarded route would
+            // then answer 400 for a malformed parameter and 401/403 for a
+            // well-formed one, letting an unauthenticated caller map guarded
+            // routes and their parameter shapes. Moving the check into the
+            // innermost layer makes the guards (and middleware) answer first,
+            // and keeps both routers identical: each sees no route-level
+            // constraints and the same validating handler. Re-layering later
+            // nests new layers outside this one, so it stays innermost.
+            let mut handler = route.handler.clone();
+            if let Some(constraints) = route.constraints.take() {
+                handler = constrained_handler(handler, constraints);
+            }
+            route.handler = layer_handler(handler, middleware, guards);
         }
         // The index holds positions and parameter names, not handlers, so it
         // stays valid; no rebuild is needed.
     }
+}
+
+/// Wrap `handler` so `constraints` are validated against the request's path
+/// parameters (already set by the router) just before it runs, with the same
+/// error the routers produce for a route-level constraint.
+fn constrained_handler(handler: BoxedHandler, constraints: RouteConstraints) -> BoxedHandler {
+    let constraints = Arc::new(constraints);
+    crate::handler::from_legacy_handler(Arc::new(move |req: HttpRequest| {
+        let constraints = Arc::clone(&constraints);
+        let inner = handler.clone();
+        Box::pin(async move {
+            trace!("Validating route constraints");
+            constraints.validate(&req.path_params)?;
+            inner.call(req).await
+        })
+    }))
 }
 
 /// The `403` a guard that returns `Ok(false)` produces, on every transport and
@@ -389,6 +427,8 @@ pub fn layer_handler(
                 match run_guards(&guards, req).await? {
                     Ok(req) => inner.call(req).await,
                     Err(forbidden) => {
+                        // Counted toward the auth-rejection summary by its
+                        // 403 status where the request is dispatched.
                         debug!("Request rejected by a route-scoped guard");
                         Ok(forbidden)
                     }
@@ -585,6 +625,72 @@ fn split_segments(path: &str) -> impl Iterator<Item = &str> {
     path.split('/').filter(|s| !s.is_empty())
 }
 
+/// What one segment of a route pattern is.
+///
+/// The single reading of pattern syntax shared by the linear [`Router`], its
+/// `matchit` index, and [`OptimizedRouter`](crate::OptimizedRouter), so the
+/// routers cannot disagree about what a pattern means. Both spellings the route
+/// macros accept are recognized: `:name` / `{name}` for a parameter and
+/// `*name` / `{*name}` for a catch-all. A brace anywhere else (`a{b}c`, `{`,
+/// `{}`) is literal text.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum PatternSegment<'a> {
+    /// Matched byte-for-byte.
+    Static(&'a str),
+    /// One path segment, captured under this name.
+    Param(&'a str),
+    /// Every remaining segment (zero or more), captured under this name; `*`
+    /// when the pattern left it unnamed.
+    CatchAll(&'a str),
+}
+
+impl<'a> PatternSegment<'a> {
+    /// Classify one non-empty pattern segment.
+    #[inline]
+    pub(crate) fn parse(segment: &'a str) -> Self {
+        // A name holding pattern syntax itself (`:*x`, `*{a}`) would mean one
+        // thing here and another once translated for `matchit` (`{*x}` is a
+        // catch-all there), so such a segment is literal text everywhere.
+        let plain = |name: &str| !name.contains(['{', '}', '*', ':']);
+        // `**` (and `{**}`) is the glob spelling of an unnamed catch-all, the
+        // same `CatchAll("*")` a bare `*` yields, so every reading agrees.
+        let catch_all_name = |name: &str| name == "*" || plain(name);
+        let catch_all = |name: &'a str| Self::CatchAll(if name.is_empty() { "*" } else { name });
+        if let Some(name) = segment.strip_prefix(':') {
+            if !name.is_empty() && plain(name) {
+                return Self::Param(name);
+            }
+            return Self::Static(segment);
+        }
+        if let Some(name) = segment.strip_prefix('*') {
+            if catch_all_name(name) {
+                return catch_all(name);
+            }
+            return Self::Static(segment);
+        }
+        if let Some(inner) = segment
+            .strip_prefix('{')
+            .and_then(|rest| rest.strip_suffix('}'))
+            && !inner.contains(['{', '}'])
+        {
+            if let Some(name) = inner.strip_prefix('*') {
+                if catch_all_name(name) {
+                    return catch_all(name);
+                }
+            } else if !inner.is_empty() && plain(inner) {
+                return Self::Param(inner);
+            }
+        }
+        Self::Static(segment)
+    }
+
+    /// Whether this segment captures anything.
+    #[inline]
+    fn is_param(self) -> bool {
+        !matches!(self, Self::Static(_))
+    }
+}
+
 /// Rewrite an armature route pattern into `matchit` syntax.
 ///
 /// How many parameters one route may carry before `matchit` refuses it.
@@ -604,27 +710,42 @@ fn split_segments(path: &str) -> impl Iterator<Item = &str> {
 /// is kept on the safe side rather than tightened to match.
 const MATCHIT_MAX_PARAMS: usize = 25;
 
-/// `:id` becomes `{id}` and `*rest` becomes `{*rest}`. User-facing pattern
-/// syntax does not change — this is the seam that keeps it from having to.
-/// Segments that are already braced pass through untouched.
+/// `:id` and `{id}` become `{id}`; `*rest` and `{*rest}` become `{*rest}`.
+/// User-facing pattern syntax does not change — this is the seam that keeps it
+/// from having to. A brace in a static segment is escaped (`{{`, `}}`), so
+/// `matchit` reads it as the literal text every other matcher sees rather than
+/// as a parameter only the tree knows about.
 pub(crate) fn translate_pattern(pattern: &str) -> String {
     let mut out = String::with_capacity(pattern.len() + 8);
     for (i, segment) in pattern.split('/').enumerate() {
         if i > 0 {
             out.push('/');
         }
-        match segment.as_bytes().first() {
-            Some(b':') => {
+        if segment.is_empty() {
+            continue;
+        }
+        match PatternSegment::parse(segment) {
+            PatternSegment::Param(name) => {
                 out.push('{');
-                out.push_str(&segment[1..]);
+                out.push_str(name);
                 out.push('}');
             }
-            Some(b'*') => {
+            // An unnamed catch-all keeps the spelling it always had here.
+            PatternSegment::CatchAll(name) => {
                 out.push_str("{*");
-                out.push_str(&segment[1..]);
+                if name != "*" {
+                    out.push_str(name);
+                }
                 out.push('}');
             }
-            _ => out.push_str(segment),
+            PatternSegment::Static(text) => {
+                for c in text.chars() {
+                    if matches!(c, '{' | '}') {
+                        out.push(c);
+                    }
+                    out.push(c);
+                }
+            }
         }
     }
     out
@@ -650,17 +771,11 @@ fn normalize_target(path: &str) -> &str {
 type ParamNames = SmallVec<[&'static str; 4]>;
 
 /// Intern a pattern's parameter names once, at index-build time.
-///
-/// Patterns already written in `matchit` brace syntax are not recognized here;
-/// `MethodIndex::find` interns those on demand instead.
 fn param_names(pattern: &str) -> ParamNames {
     split_segments(pattern)
-        .filter_map(|segment| {
-            segment.strip_prefix(':').or_else(|| {
-                segment
-                    .strip_prefix('*')
-                    .map(|name| if name.is_empty() { "*" } else { name })
-            })
+        .filter_map(|segment| match PatternSegment::parse(segment) {
+            PatternSegment::Param(name) | PatternSegment::CatchAll(name) => Some(name),
+            PatternSegment::Static(_) => None,
         })
         .map(param_intern::intern)
         .collect()
@@ -694,15 +809,24 @@ fn method_slot(method: &Method) -> Option<usize> {
 /// while a false no would put two overlapping routes in the same tree and let
 /// `matchit`'s specificity order override registration order.
 fn patterns_overlap(a: &str, b: &str) -> bool {
-    fn is_param(segment: &str) -> bool {
-        segment.starts_with(':') || segment.starts_with('*') || segment.starts_with('{')
+    // Truncated after a catch-all: whatever follows one is unreachable (see
+    // `match_path_spans`), so the catch-all is effectively the last segment.
+    fn segments(pattern: &str) -> SmallVec<[PatternSegment<'_>; 8]> {
+        let mut out = SmallVec::new();
+        for segment in split_segments(pattern).map(PatternSegment::parse) {
+            out.push(segment);
+            if matches!(segment, PatternSegment::CatchAll(_)) {
+                break;
+            }
+        }
+        out
     }
 
-    let pa: SmallVec<[&str; 8]> = split_segments(a).collect();
-    let pb: SmallVec<[&str; 8]> = split_segments(b).collect();
+    let pa = segments(a);
+    let pb = segments(b);
 
-    let a_catch = pa.last().is_some_and(|s| s.starts_with('*'));
-    let b_catch = pb.last().is_some_and(|s| s.starts_with('*'));
+    let a_catch = matches!(pa.last(), Some(PatternSegment::CatchAll(_)));
+    let b_catch = matches!(pb.last(), Some(PatternSegment::CatchAll(_)));
 
     // A catch-all absorbs any number of trailing segments; without one on
     // either side the two patterns describe paths of exactly one length.
@@ -725,7 +849,7 @@ fn patterns_overlap(a: &str, b: &str) -> bool {
     // Two static segments in the same position that differ are the only thing
     // that can rule an overlap out; a parameter on either side accepts
     // whatever the other names.
-    (0..fixed_a.min(fixed_b)).all(|i| is_param(pa[i]) || is_param(pb[i]) || pa[i] == pb[i])
+    (0..fixed_a.min(fixed_b)).all(|i| pa[i].is_param() || pb[i].is_param() || pa[i] == pb[i])
 }
 
 /// One `matchit` tree per routable method, plus a linear fallback.
@@ -759,7 +883,7 @@ impl MethodIndex {
                 continue;
             };
 
-            if route.path.contains(':') || route.path.contains('*') {
+            if split_segments(&route.path).any(|s| PatternSegment::parse(s).is_param()) {
                 // A parameterized pattern that overlaps an earlier one must not
                 // share the tree with it. Inside a single `matchit` tree the
                 // winner is decided by specificity — static beats parameter
@@ -812,10 +936,9 @@ impl MethodIndex {
             // should cost a linear scan, not abort the process.
             //
             // Counted on the *translated* pattern rather than on
-            // `param_names`, which sees only this crate's `:name` and `*name`
-            // spellings. A pattern written with braces directly is passed
-            // through untouched, so it is a parameter to `matchit` while being
-            // invisible here — and 26 of those panic just the same.
+            // `param_names`: every `{` that reaches `matchit` is counted,
+            // escaped literal braces included, so the figure can only
+            // over-count — the safe side, as `MATCHIT_MAX_PARAMS` explains.
             let translated = translate_pattern(&route.path);
             let tree = trees[slot].get_or_insert_with(matchit::Router::new);
             if translated.bytes().filter(|&b| b == b'{').count() > MATCHIT_MAX_PARAMS {
@@ -847,8 +970,8 @@ impl MethodIndex {
             for (name, value) in m.params.iter() {
                 // The names were interned when this very pattern was indexed,
                 // so the lookup hits and no process-global lock is taken on the
-                // request path. Brace-syntax patterns are the exception
-                // `param_names` does not cover; they intern here instead.
+                // request path. The `intern` arm is a safety net only (an
+                // unnamed catch-all reaches `matchit` as `{*}`).
                 let interned = names
                     .iter()
                     .copied()
@@ -927,20 +1050,27 @@ fn match_path_spans(pattern: &str, path_parts: &[&str]) -> Option<RouteParams> {
     let mut seen = 0usize;
     let mut param_count = 0usize;
     let mut catch_all_at: Option<usize> = None;
-    for (i, pattern_part) in split_segments(pattern).enumerate() {
-        if pattern_part.starts_with('*') {
-            catch_all_at = Some(i);
-            param_count += 1;
-            break;
-        }
+    for (i, pattern_part) in split_segments(pattern)
+        .map(PatternSegment::parse)
+        .enumerate()
+    {
+        let literal = match pattern_part {
+            PatternSegment::CatchAll(_) => {
+                catch_all_at = Some(i);
+                param_count += 1;
+                break;
+            }
+            PatternSegment::Param(_) => None,
+            PatternSegment::Static(text) => Some(text),
+        };
 
         // Pattern has more segments than the request path
         let path_part = path_parts.get(i)?;
-        if pattern_part.starts_with(':') {
-            param_count += 1;
-        } else if pattern_part != *path_part {
+        match literal {
+            None => param_count += 1,
             // Static segment doesn't match
-            return None;
+            Some(text) if text != *path_part => return None,
+            Some(_) => {}
         }
         seen = i + 1;
     }
@@ -969,21 +1099,25 @@ fn match_path_spans(pattern: &str, path_parts: &[&str]) -> Option<RouteParams> {
     // fast path: both `MethodIndex` and `CompiledRoute` intern at build time.
     let mut params = RouteParams::new();
     if param_count > 0 {
-        for (i, pattern_part) in split_segments(pattern).enumerate() {
-            if let Some(name) = pattern_part.strip_prefix('*') {
-                // Catch-all: join all remaining path segments, matching
-                // `CompiledRoute::extract_params`'s joining convention.
-                let name = if name.is_empty() { "*" } else { name };
-                params.push((
-                    param_intern::intern(name),
-                    Bytes::from(path_parts[i..].join("/")),
-                ));
-                break;
-            } else if let Some(param_name) = pattern_part.strip_prefix(':') {
-                params.push((
+        for (i, pattern_part) in split_segments(pattern)
+            .map(PatternSegment::parse)
+            .enumerate()
+        {
+            match pattern_part {
+                PatternSegment::CatchAll(name) => {
+                    // Catch-all: join all remaining path segments, matching
+                    // `CompiledRoute::extract_params`'s joining convention.
+                    params.push((
+                        param_intern::intern(name),
+                        Bytes::from(path_parts[i..].join("/")),
+                    ));
+                    break;
+                }
+                PatternSegment::Param(param_name) => params.push((
                     param_intern::intern(param_name),
                     Bytes::copy_from_slice(path_parts[i].as_bytes()),
-                ));
+                )),
+                PatternSegment::Static(_) => {}
             }
         }
     }
@@ -993,6 +1127,31 @@ fn match_path_spans(pattern: &str, path_parts: &[&str]) -> Option<RouteParams> {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn names_holding_pattern_syntax_are_literal_in_every_reading() {
+        for segment in [":*x", "*{a}", ":{a}", "{*{a}}", "{:a}", ":"] {
+            assert!(
+                matches!(PatternSegment::parse(segment), PatternSegment::Static(_)),
+                "{segment}"
+            );
+        }
+        // `**` is the glob spelling of the unnamed catch-all, not literal.
+        for segment in ["**", "{**}"] {
+            assert_eq!(
+                PatternSegment::parse(segment),
+                PatternSegment::CatchAll("*")
+            );
+        }
+        // So `matchit` and the segment matcher agree: `/files/:*x` matches
+        // only its literal text, never `/files/a/b`.
+        let mut router = Router::new();
+        router.get("/files/:*x", |_req: HttpRequest| async {
+            Ok(crate::HttpResponse::ok())
+        });
+        assert!(router.match_route("GET", "/files/a/b").is_none());
+    }
+
     use super::*;
     use crate::RouteParamsExt;
     use bytes::Bytes;
@@ -1075,9 +1234,13 @@ mod tests {
             translate_pattern("/users/:id/files/*path"),
             "/users/{id}/files/{*path}"
         );
-        // Already-braced patterns pass through, so a user who wrote matchit
-        // syntax directly is not broken by the translation.
+        // Brace spellings are parameters too, and translate to themselves.
         assert_eq!(translate_pattern("/users/{id}"), "/users/{id}");
+        assert_eq!(translate_pattern("/files/{*path}"), "/files/{*path}");
+        // A brace that is not a whole parameter segment is literal, so it is
+        // escaped rather than handed to `matchit` as a parameter.
+        assert_eq!(translate_pattern("/lit/a{b}c"), "/lit/a{{b}}c");
+        assert_eq!(translate_pattern("/lit/{"), "/lit/{{");
     }
 
     #[tokio::test]
@@ -1207,6 +1370,26 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(resp.body_slice(), b"param:me");
+    }
+
+    /// The same rule for the `{id}` spelling the route macros also accept. The
+    /// index used to file a brace pattern as static, so it never shadowed the
+    /// later `/users/me` and `matchit`'s static-first preference won instead.
+    #[tokio::test]
+    async fn an_earlier_brace_param_route_shadows_a_later_static_one() {
+        let mut router = Router::new();
+        router.get("/users/{id}", |req: HttpRequest| async move {
+            let id = req.param("id").unwrap_or("-").to_owned();
+            Ok::<_, Error>(HttpResponse::ok().with_body(format!("param:{id}").into_bytes()))
+        });
+        router.get("/users/me", |_req: HttpRequest| async {
+            Ok::<_, Error>(HttpResponse::ok().with_body(b"static".to_vec()))
+        });
+
+        for (target, body) in [("/users/me", &b"param:me"[..]), ("/users/42", b"param:42")] {
+            let resp = router.route(HttpRequest::new("GET", target)).await.unwrap();
+            assert_eq!(resp.body_slice(), body, "{target}");
+        }
     }
 
     /// The other order is unambiguous: the static route is both earlier and the
@@ -1685,26 +1868,28 @@ mod tests {
     }
 
     /// The same ceiling, reached through brace syntax instead of `:name`.
-    /// `translate_pattern` passes an already-braced segment through untouched,
-    /// so those parameters never appear in `param_names` — counting there
-    /// rather than on the translated pattern leaves the panic reachable.
     ///
-    /// Only the absence of a panic is asserted. Such a route is answered by the
-    /// linear scan, and `match_path_spans` understands `:name` and `*name` but
-    /// not braces, so it does not match — brace spelling has only ever worked
-    /// by reaching `matchit`. Turning a process-killing panic into a route that
-    /// does not match is the fix; making brace syntax work in the fallback is a
-    /// separate question about whether it is a supported spelling at all.
+    /// Brace parameters are counted on the translated pattern, so a route past
+    /// the ceiling stays out of the tree and is answered by the linear scan —
+    /// which reads `{name}` exactly as it reads `:name`, so it still matches.
     #[tokio::test]
     async fn brace_spelled_parameters_do_not_panic_past_the_ceiling() {
+        async fn last_handler(req: HttpRequest) -> Result<HttpResponse, Error> {
+            let last = req.param("p29").unwrap_or_default().to_owned();
+            Ok(HttpResponse::ok().with_body(last.into_bytes()))
+        }
+
         let pattern: String = (0..30).map(|i| format!("/{{p{i}}}")).collect();
         let target: String = (0..30).map(|i| format!("/v{i}")).collect();
 
         let mut router = Router::new();
-        router.get(&pattern, test_handler);
+        router.get(&pattern, last_handler);
 
-        // `route` returning `Err(RouteNotFound)` is a result; a panic is not.
-        let _ = router.route(HttpRequest::new("GET", target)).await;
+        let response = router
+            .route(HttpRequest::new("GET", target))
+            .await
+            .expect("a 30-parameter brace route must match");
+        assert_eq!(response.body, Bytes::from_static(b"v29"));
     }
 
     #[tokio::test]
@@ -1739,5 +1924,65 @@ mod tests {
         let req = HttpRequest::new("GET", "/nonexistent".to_string());
         let result = router.route(req).await;
         assert!(matches!(result, Err(Error::RouteNotFound(_))));
+    }
+
+    struct FixedGuard(bool);
+
+    #[async_trait::async_trait]
+    impl Guard for FixedGuard {
+        async fn can_activate(&self, _ctx: &GuardContext) -> Result<bool, Error> {
+            Ok(self.0)
+        }
+    }
+
+    fn guarded_constrained_router(allow: bool) -> Router {
+        let mut router = Router::new();
+        router.add_route(
+            Route::new(HttpMethod::GET, "/admin/users/:id", test_handler).with_constraints(
+                RouteConstraints::new()
+                    .add("id", Box::new(crate::route_constraint::UIntConstraint)),
+            ),
+        );
+        let guards: Vec<Arc<dyn Guard>> = vec![Arc::new(FixedGuard(allow))];
+        router.layer_routes(0..1, &[], &guards);
+        router
+    }
+
+    /// A route-scoped guard must answer before the route's parameter
+    /// constraints are checked: otherwise an unauthenticated caller gets 400
+    /// for a malformed id and 403 for a well-formed one, which maps the
+    /// guarded routes and their parameter shapes without ever passing a
+    /// guard. Both routers must agree.
+    #[tokio::test]
+    async fn guards_run_before_route_constraints() {
+        let router = guarded_constrained_router(false);
+        let optimized = crate::route_cache::OptimizedRouter::from_router(&router);
+        for path in ["/admin/users/abc", "/admin/users/1"] {
+            let linear = router
+                .route(HttpRequest::new("GET", path.to_string()))
+                .await;
+            assert_eq!(linear.unwrap().status, 403, "Router {path}");
+            let fast = optimized
+                .route(HttpRequest::new("GET", path.to_string()))
+                .await;
+            assert_eq!(fast.unwrap().status, 403, "OptimizedRouter {path}");
+        }
+
+        // Past the guard, the constraint still rejects a malformed id.
+        let router = guarded_constrained_router(true);
+        let optimized = crate::route_cache::OptimizedRouter::from_router(&router);
+        let linear = router
+            .route(HttpRequest::new("GET", "/admin/users/abc".to_string()))
+            .await;
+        assert!(matches!(linear, Err(Error::BadRequest(_))), "{linear:?}");
+        let fast = optimized
+            .route(HttpRequest::new("GET", "/admin/users/abc".to_string()))
+            .await;
+        assert!(matches!(fast, Err(Error::BadRequest(_))), "{fast:?}");
+        let ok = optimized
+            .route(HttpRequest::new("GET", "/admin/users/7".to_string()))
+            .await
+            .unwrap();
+        assert_eq!(ok.status, 200);
     }
 }

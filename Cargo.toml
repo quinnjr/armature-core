@@ -68,7 +68,7 @@ tokio-stream = "0.1"
 regex = "1.13"
 
 # Resilience patterns
-parking_lot = "0.12"
+parking_lot = "0.13"
 
 # Bounded caches
 lru = "0.18"

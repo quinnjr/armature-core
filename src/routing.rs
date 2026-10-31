@@ -652,6 +652,9 @@ impl<'a> PatternSegment<'a> {
         // thing here and another once translated for `matchit` (`{*x}` is a
         // catch-all there), so such a segment is literal text everywhere.
         let plain = |name: &str| !name.contains(['{', '}', '*', ':']);
+        // `**` (and `{**}`) is the glob spelling of an unnamed catch-all, the
+        // same `CatchAll("*")` a bare `*` yields, so every reading agrees.
+        let catch_all_name = |name: &str| name == "*" || plain(name);
         let catch_all = |name: &'a str| Self::CatchAll(if name.is_empty() { "*" } else { name });
         if let Some(name) = segment.strip_prefix(':') {
             if !name.is_empty() && plain(name) {
@@ -660,7 +663,7 @@ impl<'a> PatternSegment<'a> {
             return Self::Static(segment);
         }
         if let Some(name) = segment.strip_prefix('*') {
-            if plain(name) {
+            if catch_all_name(name) {
                 return catch_all(name);
             }
             return Self::Static(segment);
@@ -671,7 +674,7 @@ impl<'a> PatternSegment<'a> {
             && !inner.contains(['{', '}'])
         {
             if let Some(name) = inner.strip_prefix('*') {
-                if plain(name) {
+                if catch_all_name(name) {
                     return catch_all(name);
                 }
             } else if !inner.is_empty() && plain(inner) {
@@ -1131,6 +1134,13 @@ mod tests {
             assert!(
                 matches!(PatternSegment::parse(segment), PatternSegment::Static(_)),
                 "{segment}"
+            );
+        }
+        // `**` is the glob spelling of the unnamed catch-all, not literal.
+        for segment in ["**", "{**}"] {
+            assert_eq!(
+                PatternSegment::parse(segment),
+                PatternSegment::CatchAll("*")
             );
         }
         // So `matchit` and the segment matcher agree: `/files/:*x` matches

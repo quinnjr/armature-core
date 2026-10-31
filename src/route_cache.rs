@@ -1280,6 +1280,27 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_from_router_double_star_is_catch_all() {
+        for pattern in ["/files/**", "/files/{**}"] {
+            let mut router = crate::routing::Router::new();
+            router.add_route(crate::routing::Route::new(
+                HttpMethod::GET,
+                pattern,
+                |_req: HttpRequest| async { Ok::<_, Error>(HttpResponse::ok()) },
+            ));
+            let opt = OptimizedRouter::from_router(&router);
+            for path in ["/files", "/files/a", "/files/a/b"] {
+                assert!(
+                    router.match_route("GET", path).is_some(),
+                    "{pattern} {path}"
+                );
+                let resp = opt.route(HttpRequest::new("GET", path)).await;
+                assert!(resp.is_ok(), "{pattern} {path}");
+            }
+        }
+    }
+
+    #[tokio::test]
     async fn test_from_router_validates_constraints() {
         let constraints =
             RouteConstraints::new().add("id", Box::new(crate::route_constraint::UIntConstraint));

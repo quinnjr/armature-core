@@ -65,21 +65,62 @@ async fn dummy_handler(_req: HttpRequest) -> Result<HttpResponse, Error> {
 /// is known to describe.
 const PLACEHOLDER: &str = "x";
 
-/// The parameter names a pattern declares, in this crate's own spelling.
-///
-/// Mirrors the router's own reading of a pattern: `:name` and `*name`, with a
-/// bare `*` named `*`. Patterns written directly in `matchit`'s brace syntax
-/// are deliberately not covered here - see the `braces` guard below.
+/// How the router reads one non-empty pattern segment.
+enum Segment<'a> {
+    Static,
+    Param(&'a str),
+    CatchAll(&'a str),
+}
+
+/// Mirrors `PatternSegment::parse` (crate-private, so it cannot be called from
+/// here): `:name` / `{name}` is a parameter and `*name` / `{*name}` a
+/// catch-all, `*` when unnamed. `**` / `{**}` is the glob spelling of that
+/// unnamed catch-all. Any other name holding pattern syntax (`{ } * :`), and a
+/// bare `:`, is literal text.
+fn segment(segment: &str) -> Segment<'_> {
+    let plain = |name: &str| !name.contains(['{', '}', '*', ':']);
+    let catch_all_name = |name: &str| name == "*" || plain(name);
+    fn catch_all(name: &str) -> Segment<'_> {
+        Segment::CatchAll(if name.is_empty() { "*" } else { name })
+    }
+    if let Some(name) = segment.strip_prefix(':') {
+        return if !name.is_empty() && plain(name) {
+            Segment::Param(name)
+        } else {
+            Segment::Static
+        };
+    }
+    if let Some(name) = segment.strip_prefix('*') {
+        return if catch_all_name(name) {
+            catch_all(name)
+        } else {
+            Segment::Static
+        };
+    }
+    if let Some(inner) = segment
+        .strip_prefix('{')
+        .and_then(|rest| rest.strip_suffix('}'))
+        && !inner.contains(['{', '}'])
+    {
+        if let Some(name) = inner.strip_prefix('*') {
+            if catch_all_name(name) {
+                return catch_all(name);
+            }
+        } else if !inner.is_empty() && plain(inner) {
+            return Segment::Param(inner);
+        }
+    }
+    Segment::Static
+}
+
+/// The parameter names a pattern declares, in pattern order.
 fn declared_names(pattern: &str) -> Vec<&str> {
     pattern
         .split('/')
-        .filter(|segment| !segment.is_empty())
-        .filter_map(|segment| {
-            segment.strip_prefix(':').or_else(|| {
-                segment
-                    .strip_prefix('*')
-                    .map(|name| if name.is_empty() { "*" } else { name })
-            })
+        .filter(|s| !s.is_empty())
+        .filter_map(|s| match segment(s) {
+            Segment::Param(name) | Segment::CatchAll(name) => Some(name),
+            Segment::Static => None,
         })
         .collect()
 }
@@ -89,16 +130,16 @@ fn declared_names(pattern: &str) -> Vec<&str> {
 /// catch-all, which is where pattern validation ends.
 fn concrete_path(pattern: &str) -> String {
     let mut out = String::with_capacity(pattern.len() + 8);
-    for segment in pattern.split('/').filter(|segment| !segment.is_empty()) {
+    for s in pattern.split('/').filter(|s| !s.is_empty()) {
         out.push('/');
-        if segment.starts_with(':') {
-            out.push_str(PLACEHOLDER);
-        } else if segment.starts_with('*') {
-            out.push_str(PLACEHOLDER);
-            // Anything after a catch-all is unreachable for the matcher too.
-            break;
-        } else {
-            out.push_str(segment);
+        match segment(s) {
+            Segment::Param(_) => out.push_str(PLACEHOLDER),
+            Segment::CatchAll(_) => {
+                out.push_str(PLACEHOLDER);
+                // Anything after a catch-all is unreachable for the matcher too.
+                break;
+            }
+            Segment::Static => out.push_str(s),
         }
     }
     if out.is_empty() {
